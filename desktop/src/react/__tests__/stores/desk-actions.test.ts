@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useStore } from '../../stores';
 
-const mockHanaFetch = vi.fn();
+// vi.hoisted: the mock factory below is hoisted above this file's imports, and
+// importing the store now reaches use-hana-fetch during that hoisted phase.
+const mockHanaFetch = vi.hoisted(() => vi.fn());
 
 vi.mock('../../hooks/use-hana-fetch', () => ({
   hanaFetch: mockHanaFetch,
@@ -13,6 +15,10 @@ vi.mock('../../stores/agent-actions', () => ({
 
 function jsonResponse(body: unknown): Response {
   return { json: async () => body } as unknown as Response;
+}
+
+function jsonStatusResponse(body: unknown, status: number): Response {
+  return { status, json: async () => body } as unknown as Response;
 }
 
 function deferred<T>() {
@@ -43,6 +49,9 @@ describe('desk-actions workspace roots', () => {
     };
     useStore.setState({
       serverPort: 62950,
+      activeServerConnection: null,
+      activeServerConnectionId: null,
+      serverConnections: {},
       deskBasePath: '',
       deskWorkspaceMountId: null,
       deskWorkspaceLabel: null,
@@ -67,7 +76,7 @@ describe('desk-actions workspace roots', () => {
       workspaceFolders: [],
       pendingNewSession: true,
       currentSessionPath: null,
-      currentAgentId: null,
+      currentAgentId: 'hana',
       selectedAgentId: null,
     } as never);
   });
@@ -106,6 +115,56 @@ describe('desk-actions workspace roots', () => {
     );
   });
 
+  it('prunes a stale local workspace history entry when the selected local root is missing', async () => {
+    useStore.setState({
+      selectedFolder: '/workspace/Missing',
+      deskBasePath: '/workspace/Missing',
+      cwdHistory: ['/workspace/Missing', '/workspace/Keep'],
+      deskFiles: [{ name: 'old.md', isDir: false }],
+      deskTreeFilesByPath: { '': [{ name: 'old.md', isDir: false }] },
+    } as never);
+    mockHanaFetch
+      .mockResolvedValueOnce(jsonStatusResponse({ error: { code: 'resource_not_found', message: 'missing' } }, 404))
+      .mockResolvedValueOnce(jsonResponse({ cwd_history: ['/workspace/Keep'] }));
+
+    const { loadDeskFiles } = await import('../../stores/desk-actions');
+    await loadDeskFiles();
+
+    expect(useStore.getState().selectedFolder).toBeNull();
+    expect(useStore.getState().deskBasePath).toBe('');
+    expect(useStore.getState().deskFiles).toEqual([]);
+    expect(useStore.getState().deskTreeFilesByPath).toEqual({});
+    expect(useStore.getState().cwdHistory).toEqual(['/workspace/Keep']);
+    expect(mockHanaFetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/config/workspaces/recent?agentId=hana',
+      expect.objectContaining({
+        method: 'DELETE',
+        body: JSON.stringify({ path: '/workspace/Missing' }),
+      }),
+    );
+  });
+
+  it('keeps local workspace history on permission errors', async () => {
+    useStore.setState({
+      selectedFolder: '/workspace/Private',
+      deskBasePath: '/workspace/Private',
+      cwdHistory: ['/workspace/Private', '/workspace/Keep'],
+      deskFiles: [{ name: 'private.md', isDir: false }],
+    } as never);
+    mockHanaFetch.mockResolvedValueOnce(jsonStatusResponse({
+      error: { code: 'insufficient_scope', message: 'forbidden' },
+    }, 403));
+
+    const { loadDeskFiles } = await import('../../stores/desk-actions');
+    await loadDeskFiles();
+
+    expect(useStore.getState().selectedFolder).toBe('/workspace/Private');
+    expect(useStore.getState().deskBasePath).toBe('/workspace/Private');
+    expect(useStore.getState().cwdHistory).toEqual(['/workspace/Private', '/workspace/Keep']);
+    expect(mockHanaFetch).toHaveBeenCalledTimes(1);
+  });
+
   it('loads files through the workbench mount route when a Studio workspace is active', async () => {
     useStore.setState({
       deskBasePath: 'studio:mount_docs',
@@ -129,6 +188,31 @@ describe('desk-actions workspace roots', () => {
     );
     expect(useStore.getState().deskFiles).toEqual([{ name: 'remote.md', isDir: false }]);
     expect(useStore.getState().deskBasePath).toBe('studio:mount_docs');
+  });
+
+  it('does not prune local workspace history when a Studio mount load returns 404', async () => {
+    const existingFiles = [{ name: 'remote.md', isDir: false }];
+    useStore.setState({
+      selectedFolder: '/workspace/Local',
+      deskBasePath: 'studio:mount_docs',
+      deskWorkspaceMountId: 'mount_docs',
+      deskWorkspaceLabel: 'Docs',
+      cwdHistory: ['/workspace/Local'],
+      deskFiles: existingFiles,
+      deskTreeFilesByPath: { '': existingFiles },
+    } as never);
+    mockHanaFetch.mockResolvedValueOnce(jsonStatusResponse({
+      error: { code: 'resource_not_found', message: 'missing' },
+    }, 404));
+
+    const { loadDeskFiles } = await import('../../stores/desk-actions');
+    await loadDeskFiles();
+
+    expect(useStore.getState().selectedFolder).toBe('/workspace/Local');
+    expect(useStore.getState().cwdHistory).toEqual(['/workspace/Local']);
+    expect(useStore.getState().deskBasePath).toBe('studio:mount_docs');
+    expect(useStore.getState().deskFiles).toBe(existingFiles);
+    expect(mockHanaFetch).toHaveBeenCalledTimes(1);
   });
 
   it('stores the disclosed native root of a local_fs workspace from the workbench files response', async () => {
@@ -303,12 +387,31 @@ describe('desk-actions workspace roots', () => {
 
     expect(useStore.getState().cwdHistory).toEqual(['/workspace/Novel']);
     expect(mockHanaFetch).toHaveBeenCalledWith(
-      '/api/config/workspaces/recent',
+      '/api/config/workspaces/recent?agentId=hana',
       expect.objectContaining({
         method: 'DELETE',
         body: JSON.stringify({ path: '/workspace/Desktop' }),
       }),
     );
+  });
+
+  it('does not record recent-workspace changes against a guessed agent when none is current', async () => {
+    // Recent workspaces live in one agent's own config. With no current agent
+    // there is nobody to attribute the change to, and asking the server to pick
+    // is how the wrong agent's history gets edited — so no request goes out.
+    useStore.setState({
+      currentAgentId: null,
+      cwdHistory: ['/workspace/Desktop', '/workspace/Novel'],
+    } as never);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const { removeRecentWorkspace, clearRecentWorkspaces } = await import('../../stores/desk-actions');
+    await removeRecentWorkspace('/workspace/Desktop');
+    await clearRecentWorkspaces();
+
+    expect(mockHanaFetch.mock.calls.some(([url]) => String(url).includes('/api/config/workspaces/recent'))).toBe(false);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it('removes a Studio workspace mount and clears the selected mount when it was active', async () => {
@@ -360,7 +463,7 @@ describe('desk-actions workspace roots', () => {
 
     expect(useStore.getState().cwdHistory).toEqual([]);
     expect(mockHanaFetch).toHaveBeenCalledWith(
-      '/api/config/workspaces/recent/all',
+      '/api/config/workspaces/recent/all?agentId=hana',
       expect.objectContaining({ method: 'DELETE' }),
     );
   });
@@ -386,7 +489,7 @@ describe('desk-actions workspace roots', () => {
     );
     expect(mockHanaFetch).toHaveBeenNthCalledWith(
       2,
-      '/api/config/workspaces/recent',
+      '/api/config/workspaces/recent?agentId=hana',
       expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({ path: '/workspace/Desktop' }),
@@ -1002,6 +1105,55 @@ describe('desk-actions workspace roots', () => {
     const ok = await deskTrashTreeItems([{ sourceSubdir: 'notes', name: 'chapter.md', isDirectory: false }]);
 
     expect(ok).toBe(true);
+    expect(mockHanaFetch).toHaveBeenCalledWith('/api/workbench/actions', expect.objectContaining({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'safeDelete',
+        mountId: 'default',
+        subdir: 'notes',
+        name: 'chapter.md',
+      }),
+    }));
+    expect(useStore.getState().deskTreeFilesByPath.notes).toEqual([]);
+  });
+
+  it('safe-deletes default workspace tree items through ResourceIO for remote desktop clients', async () => {
+    const trashItem = vi.fn(async () => true);
+    window.platform = { trashItem } as unknown as typeof window.platform;
+    useStore.setState({
+      activeServerConnection: {
+        connectionId: 'browser:server_lan',
+        kind: 'lan',
+        serverId: 'server_lan',
+        userId: 'user_lan',
+        studioId: 'studio_lan',
+        label: 'LAN Hana',
+        baseUrl: 'http://hana.local:14500',
+        wsUrl: 'ws://hana.local:14500',
+        token: null,
+        authState: 'paired',
+        trustState: 'lan',
+        credentialKind: 'device_credential',
+        platformAccountId: null,
+        officialServiceKind: null,
+        capabilities: ['resources', 'files'],
+      },
+      deskBasePath: '/server/workspace',
+      deskTreeFilesByPath: {
+        notes: [{ name: 'chapter.md', isDir: false }],
+      },
+    } as never);
+    mockHanaFetch.mockResolvedValueOnce(jsonResponse({
+      ok: true,
+      files: [],
+    }));
+
+    const { deskTrashTreeItems } = await import('../../stores/desk-actions');
+    const ok = await deskTrashTreeItems([{ sourceSubdir: 'notes', name: 'chapter.md', isDirectory: false }]);
+
+    expect(ok).toBe(true);
+    expect(trashItem).not.toHaveBeenCalled();
     expect(mockHanaFetch).toHaveBeenCalledWith('/api/workbench/actions', expect.objectContaining({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

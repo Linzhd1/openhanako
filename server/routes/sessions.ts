@@ -6,8 +6,9 @@ import fs from "fs/promises";
 import path from "path";
 import { Hono } from "hono";
 import { safeJson } from "../hono-helpers.ts";
+import { bodyFromRouteError, routeError, statusFromRouteError } from "./route-errors.ts";
 import { t } from "../../lib/i18n.ts";
-import { extractBlocks, resolveMediaGenerationBlocks } from "../block-extractors.ts";
+import { dropUninstalledPluginCards, extractBlocks, pluginInstalledPredicate, resolveMediaGenerationBlocks } from "../block-extractors.ts";
 import { normalizePluginChatSurfaceBlocks } from "../plugin-chat-surface.ts";
 import { buildDeferredResultInterludeBlock, resolveDeferredReceiverName } from "../deferred-result-interlude.ts";
 import { BrowserManager } from "../../lib/browser/browser-manager.ts";
@@ -22,6 +23,8 @@ import {
 import {
   TURN_INPUT_CONSUMPTION_EVENT_TYPE,
   TURN_INPUT_PRESENTATION_EVENT_TYPE,
+  isCustomTurnInputHistoryMessage,
+  isHiddenTurnInputMessage,
   parseTurnInputConsumptionRecord,
   parseTurnInputPresentationRecord,
 } from "../../lib/turn-input-presentation.ts";
@@ -39,15 +42,25 @@ import {
   isValidSessionPath,
   isActiveDesktopSessionPath,
   isArchivedDesktopSessionPath,
+  annotateOriginMessages,
+  collectSessionCollabDecisions,
+  overlaySessionCollabDecision,
 } from "../../core/message-utils.ts";
+import {
+  AGENT_REVIEW_RECORD_TYPE,
+  MESSAGE_ORIGIN_RECORD_TYPE,
+  MESSAGE_PRESENTATION_RECORD_TYPE,
+} from "../../core/desktop-session-submit.ts";
+import { stripSessionReminderBlocks } from "../../core/session-reminders.ts";
 import { sessionFileRevision } from "../../core/session-list-projection-cache.ts";
 import {
+  extractLatestTodoSnapshot,
   extractLatestTodos,
-  loadLatestTodoSnapshotFromSessionFile,
 } from "../../lib/tools/todo-compat.ts";
 import { SessionManager } from "../../lib/pi-sdk/index.ts";
 import { TODO_STATE_CUSTOM_TYPE } from "../../lib/tools/todo-constants.ts";
 import { mergeWorkspaceHistory } from "../../shared/workspace-history.ts";
+import { sanitizeBridgeVisibleText } from "../../shared/bridge-visible-text.ts";
 import {
   deleteSessionFileSidecarSync,
   moveSessionFileSidecarSync,
@@ -64,13 +77,15 @@ import {
   resolveModelAudioInputTransport,
   resolveModelVideoInputTransport,
 } from "../../shared/model-capabilities.ts";
-import { replayLatestUserTurn } from "../../core/session-turn-actions.ts";
+import { replayLatestUserTurn, retrySessionTurn } from "../../core/session-turn-actions.ts";
 import { createRequestContext } from "../http/boundary.ts";
 import { createModuleLogger } from "../../lib/debug-log.ts";
 import { searchSessions } from "../../lib/search/session-search.ts";
+import { findInSessionMessages } from "../../lib/search/session-find.ts";
 import { SessionSearchTokenizerUnavailableError } from "../../lib/search/session-search-tokenizer.ts";
 import { MountAwareFileError, MountAwareFileService } from "../../core/mount-aware-file-service.ts";
 import { isAssistantCommentaryTextBlock } from "../../shared/text-signature.ts";
+import { collectToolOutcomesByCallId } from "../../shared/tool-outcome.ts";
 
 const log = createModuleLogger("sessions");
 const lifecycleLog = createModuleLogger("sessions/lifecycle");
@@ -101,6 +116,9 @@ function completeTodoItems(todos) {
 function getWritableSessionManager(engine, sessionPath) {
   const liveSession = engine.getSessionByPath?.(sessionPath);
   if (liveSession?.sessionManager) return liveSession.sessionManager;
+  if (typeof engine.openSessionManagerAtCurrentBranch === "function") {
+    return engine.openSessionManagerAtCurrentBranch(sessionPath, path.dirname(sessionPath));
+  }
   return SessionManager.open(sessionPath, path.dirname(sessionPath));
 }
 
@@ -154,13 +172,30 @@ function sessionWorkspaceMountFields(engine, sessionPath, fallback = null) {
   };
 }
 
-function routeError(message, code, status) {
-  const err: any = new Error(message);
-  err.code = code;
-  err.status = status;
-  return err;
+async function resumeBrowserForSessionSwitch(bm, sessionPath) {
+  if (typeof bm.resumeForSessionIfAvailable === "function") {
+    return await bm.resumeForSessionIfAvailable(sessionPath);
+  }
+  await bm.resumeForSession(sessionPath);
+  return {
+    status: "resumed",
+    canResume: true,
+    reason: null,
+    hostConnected: null,
+    hasResumeState: true,
+    running: bm.isRunning(sessionPath),
+    url: bm.currentUrl(sessionPath) || null,
+  };
 }
 
+/**
+ * 把建会话失败的异常分层成 { status, body }。
+ *
+ * 唯一正确的做法是在抛错点就带上 code 和 status——新增抛错点必须这么写。
+ * 下面那串文案正则只服务于还没来得及带码的历史抛错点：它依赖错误信息的字面量，
+ * 上游改一次文案就会失灵，翻译一变更是直接漏判。所以它是只减不增的兜底，
+ * 不要再往里加语言或新的匹配分支。
+ */
 function classifySessionCreationError(err) {
   const message = err?.message || String(err);
   if (err?.status && Number.isInteger(err.status)) {
@@ -218,6 +253,46 @@ function isDisplayableHistoryMessage(message) {
   return false;
 }
 
+// 与 /sessions/messages 主循环的序号语义逐字对齐：
+// 只有 user/assistant 且 isDisplayableHistoryMessage 为真的消息推进 displayIdx。
+// 改这里必须同步改 messages 主循环与 tests/session-find-route.test.ts 的一致性测试。
+const FIND_LEGACY_STEER_PREFIX_RE = /^(?:（插话，无需 MOOD）|\(Interjection, no MOOD needed\))\n?/;
+const FIND_TURN_TAG_PREFIX_RE = /^<t>[^<]*<\/t>\s*/;
+
+// find 路由的热路径缓存：key 为 sessionPath，value 为 { revision, entries }。
+// revision（stat 签名，与 /api/sessions 列表投影同源同格式）不一致即失效；
+// revision 为 null（修订未知）时不写缓存，防止把"未知"固化成陈旧命中。
+// 容量上限 FIND_ENTRIES_CACHE_MAX，超限时按插入序淘汰最早的 key。
+const FIND_ENTRIES_CACHE_MAX = 8;
+const findEntriesCache = new Map();
+
+export function collectFindableHistoryEntries(sourceMessages, sanitizeVisibleContent) {
+  const entries = [];
+  let displayIdx = 0;
+  for (const m of Array.isArray(sourceMessages) ? sourceMessages : []) {
+    if (m?.role !== "user" && m?.role !== "assistant") continue;
+    if (!isDisplayableHistoryMessage(m)) continue;
+    const currentIndex = displayIdx;
+    displayIdx += 1;
+    if (m.role === "user") {
+      const { text } = extractTextContent(m.content);
+      const content = sanitizeVisibleContent(text);
+      // 前端 history-builder 不渲染这类系统消息（history-builder.ts:503），
+      // 序号照常推进，但不参与命中。
+      if (isHiddenTurnInputMessage({ content })) continue;
+      const visible = content
+        .replace(FIND_LEGACY_STEER_PREFIX_RE, "")
+        .replace(FIND_TURN_TAG_PREFIX_RE, "");
+      if (visible.trim()) entries.push({ index: currentIndex, text: visible });
+    } else {
+      const { text } = extractTextContent(m.content, { stripThink: true });
+      const content = sanitizeVisibleContent(text);
+      if (content.trim()) entries.push({ index: currentIndex, text: content });
+    }
+  }
+  return entries;
+}
+
 function nextImmediateDisplayableAssistantIndex(sourceMessages, sourceIndex, displayIdxAtSource) {
   let displayIdx = displayIdxAtSource;
   for (let i = sourceIndex + 1; i < sourceMessages.length; i += 1) {
@@ -244,6 +319,11 @@ function resolveHistoryPageBounds(sourceMessages, { beforeId, limit, forceAll })
   return { total, startIdx, endIdx, hasMore: startIdx > 0 };
 }
 
+function isBridgeSessionPath(sessionPath) {
+  if (typeof sessionPath !== "string" || !sessionPath) return false;
+  return sessionPath.split(/[\\/]+/).includes("bridge");
+}
+
 /**
  * 读取会话文件的磁盘修订点（stat 签名，与 /api/sessions 列表投影同源同格式）。
  * stat 失败（请求竞态中文件被归档/删除）返回 null —— 显式的「修订点未知」，
@@ -260,6 +340,7 @@ async function readSessionFileRevision(sessionPath) {
 
 export function createSessionsRoute(engine, hub = null) {
   const route = new Hono();
+  const lifecycleLocks = new Map();
 
   function resolveSessionCacheLocator(sessionPath) {
     if (!sessionPath) return { cacheKey: null, readPath: null, sessionId: null };
@@ -340,7 +421,7 @@ export function createSessionsRoute(engine, hub = null) {
     }
 
     const inferredAgentId = sessionPath
-      ? engine.agentIdFromSessionPath?.(sessionPath) || null
+      ? engine.resolveSessionOwnership?.(sessionPath)?.agentId || null
       : null;
     if (!inferredAgentId) return;
 
@@ -436,7 +517,7 @@ export function createSessionsRoute(engine, hub = null) {
 
   function getSessionSummaryRecord(sessionPath, agentIdHint = null) {
     if (!sessionPath) return null;
-    const agentId = agentIdHint || engine.agentIdFromSessionPath?.(sessionPath) || null;
+    const agentId = agentIdHint || engine.resolveSessionOwnership?.(sessionPath)?.agentId || null;
     if (!agentId) return null;
     const agent = engine.getAgent?.(agentId) || null;
     const summaryManager = agent?.summaryManager || null;
@@ -479,6 +560,133 @@ export function createSessionsRoute(engine, hub = null) {
 
   function activePathForArchivedSession(sessionPath) {
     return path.join(path.dirname(path.dirname(sessionPath)), path.basename(sessionPath));
+  }
+
+  function lifecycleLockKeyForPaths(paths) {
+    for (const sessionPath of uniqueLifecyclePaths(paths)) {
+      try {
+        const sessionId = engine.getSessionIdForPath?.(sessionPath);
+        if (typeof sessionId === "string" && sessionId.trim()) return `session:${sessionId.trim()}`;
+      } catch {
+        // Fall through to path-derived legacy lock keys.
+      }
+    }
+    for (const sessionPath of uniqueLifecyclePaths(paths)) {
+      const sessionPathText = typeof sessionPath === "string" ? sessionPath : "";
+      const agentId = engine.resolveSessionOwnership?.(sessionPathText)?.agentId || "unknown-agent";
+      const basename = path.basename(sessionPathText);
+      if (basename) return `legacy:${agentId}:${basename}`;
+    }
+    return "legacy:unknown-session";
+  }
+
+  async function withSessionLifecycleLock(paths, fn) {
+    const key = lifecycleLockKeyForPaths(paths);
+    while (lifecycleLocks.has(key)) {
+      await lifecycleLocks.get(key).catch(() => {});
+    }
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    lifecycleLocks.set(key, held);
+    try {
+      return await fn();
+    } finally {
+      if (lifecycleLocks.get(key) === held) lifecycleLocks.delete(key);
+      release();
+    }
+  }
+
+  async function moveSessionLifecycleOrThrow(input) {
+    if (typeof engine.moveSessionLifecycle !== "function") {
+      throw routeError(
+        "Session manifest lifecycle transition is unavailable",
+        "session_manifest_unavailable",
+        503,
+      );
+    }
+    const manifest = await engine.moveSessionLifecycle(input);
+    if (!manifest?.sessionId) {
+      throw routeError(
+        "Session manifest lifecycle transition failed",
+        "session_lifecycle_transition_failed",
+        500,
+      );
+    }
+    return manifest;
+  }
+
+  async function permanentlyDeleteArchivedFile(sessionPath, reason) {
+    const stagedPath = `${sessionPath}.deleting`;
+    if (await pathExists(stagedPath) || await pathExists(sessionFileSidecarPath(stagedPath))) {
+      throw routeError("Archived session deletion is already staged", "session_delete_staged_conflict", 409);
+    }
+
+    await fs.rename(sessionPath, stagedPath);
+    try {
+      moveSessionFileSidecarSync(sessionPath, stagedPath);
+    } catch (err) {
+      await fs.rename(stagedPath, sessionPath).catch(() => {});
+      throw err;
+    }
+
+    let manifest;
+    try {
+      manifest = await moveSessionLifecycleOrThrow({
+        fromPath: sessionPath,
+        toPath: sessionPath,
+        lifecycle: "deleted",
+        reason,
+      });
+    } catch (err) {
+      moveSessionFileSidecarSync(stagedPath, sessionPath);
+      await fs.rename(stagedPath, sessionPath).catch(() => {});
+      throw err;
+    }
+
+    try {
+      await fs.unlink(stagedPath);
+      deleteSessionFileSidecarSync(stagedPath);
+    } catch (err) {
+      try {
+        await moveSessionLifecycleOrThrow({
+          fromPath: sessionPath,
+          toPath: sessionPath,
+          lifecycle: "archived",
+          reason: "session_delete_rollback",
+        });
+        await fs.rename(stagedPath, sessionPath);
+        moveSessionFileSidecarSync(stagedPath, sessionPath);
+      } catch (rollbackErr) {
+        lifecycleLog.error(`delete rollback failed for ${sessionPath}: ${rollbackErr.message}`);
+      }
+      throw err;
+    }
+    return manifest;
+  }
+
+  async function sessionFileHasMessages(sessionPath) {
+    const raw = await fs.readFile(sessionPath, "utf-8");
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        return true;
+      }
+      if (entry?.type === "message" && entry.message) return true;
+    }
+    return false;
+  }
+
+  async function repairHeaderOnlyActiveRestoreTarget(destPath) {
+    if (!(await pathExists(destPath))) return { repaired: false };
+    if (await sessionFileHasMessages(destPath)) {
+      throw routeError("Active path already exists with messages", "active_session_conflict", 409);
+    }
+    await fs.unlink(destPath);
+    deleteSessionFileSidecarSync(destPath);
+    return { repaired: true };
   }
 
   function uniqueLifecyclePaths(paths) {
@@ -562,12 +770,66 @@ export function createSessionsRoute(engine, hub = null) {
 
   function isDeletedAgentSessionPath(sessionPath) {
     if (!sessionPath) return false;
-    const agentId = engine.agentIdFromSessionPath?.(sessionPath) || null;
-    return !!agentId && engine.isAgentDeleted?.(agentId) === true;
+    return engine.isDeletedAgentSession?.(sessionPath) === true;
   }
 
   function rejectDeletedAgentSession(c) {
     return c.json({ error: "agent_deleted", reason: "agent_deleted" }, 409);
+  }
+
+  function normalizeRequestSessionId(value) {
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  }
+
+  function resolveSessionLocatorFromBody(body, operation) {
+    const sessionId = normalizeRequestSessionId(body?.sessionId);
+    const legacySessionPath = typeof body?.path === "string" && body.path.trim()
+      ? body.path
+      : typeof body?.sessionPath === "string" && body.sessionPath.trim()
+        ? body.sessionPath
+        : null;
+
+    if (sessionId) {
+      const manifest = engine.getSessionManifest?.(sessionId) || null;
+      const sessionPath = manifest?.currentLocator?.path || null;
+      if (!sessionPath) {
+        throw routeError(`${operation}: session manifest not found`, "session_manifest_not_found", 404);
+      }
+      if (legacySessionPath && path.resolve(legacySessionPath) !== path.resolve(sessionPath)) {
+        const err: any = routeError(
+          `${operation}: supplied path does not match the current session locator`,
+          "session_locator_mismatch",
+          409,
+        );
+        err.sessionId = sessionId;
+        err.requestedPath = legacySessionPath;
+        err.currentPath = sessionPath;
+        err.lifecycle = manifest.lifecycle || null;
+        throw err;
+      }
+      return { sessionId, sessionPath, manifest };
+    }
+
+    if (!legacySessionPath) {
+      throw routeError(`${operation}: sessionId or path is required`, "session_locator_required", 400);
+    }
+    const resolvedSessionId = normalizeRequestSessionId(engine.getSessionIdForPath?.(legacySessionPath));
+    const manifest = resolvedSessionId ? engine.getSessionManifest?.(resolvedSessionId) || null : null;
+    return { sessionId: resolvedSessionId, sessionPath: legacySessionPath, manifest };
+  }
+
+  function assertManifestLifecycle(ref, lifecycle, operation) {
+    if (!ref?.manifest?.lifecycle) return;
+    if (ref.manifest.lifecycle === lifecycle) return;
+    const err: any = routeError(
+      `${operation}: session lifecycle is ${ref.manifest.lifecycle}, expected ${lifecycle}`,
+      "session_lifecycle_mismatch",
+      409,
+    );
+    err.sessionId = ref.sessionId || ref.manifest.sessionId || null;
+    err.currentPath = ref.manifest.currentLocator?.path || null;
+    err.lifecycle = ref.manifest.lifecycle;
+    throw err;
   }
 
   function sessionFolderScopeResponse(scope) {
@@ -657,6 +919,7 @@ export function createSessionsRoute(engine, hub = null) {
             ? engine.getSessionPermissionMode(s.path)
             : engine.permissionMode || null),
           pinnedAt: s.pinnedAt || null,
+          pinOrder: Number.isFinite(s.pinOrder) ? s.pinOrder : null,
           agentDeleted: s.agentDeleted === true,
           readOnlyReason: s.readOnlyReason || (s.agentDeleted === true ? "agent_deleted" : null),
           continuationAvailable: s.continuationAvailable === true,
@@ -721,6 +984,7 @@ export function createSessionsRoute(engine, hub = null) {
         workspaceMountId: s.workspaceMountId || null,
         workspaceLabel: s.workspaceLabel || null,
         pinnedAt: s.pinnedAt || null,
+        pinOrder: Number.isFinite(s.pinOrder) ? s.pinOrder : null,
         agentDeleted: s.agentDeleted === true,
         readOnlyReason: s.readOnlyReason || (s.agentDeleted === true ? "agent_deleted" : null),
         continuationAvailable: s.continuationAvailable === true,
@@ -733,6 +997,72 @@ export function createSessionsRoute(engine, hub = null) {
     } catch (err) {
       if (err instanceof SessionSearchTokenizerUnavailableError) {
         log.error(`session search tokenizer unavailable: ${err.cause || err}`);
+        return c.json({ error: err.message }, 503);
+      }
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
+  route.get("/sessions/find", async (c) => {
+    try {
+      const requestContext = createRequestContext(c, engine);
+      const querySessionId = c.req.query("sessionId") || null;
+      let queryPath = c.req.query("path") || null;
+      if (typeof querySessionId === "string" && querySessionId.trim()) {
+        const manifest = engine.getSessionManifest?.(querySessionId.trim()) || null;
+        if (!manifest?.currentLocator?.path) {
+          return c.json({ error: "Session manifest not found", code: "session_manifest_not_found" }, 404);
+        }
+        queryPath = manifest.currentLocator.path;
+      }
+      // 定位语义要求显式目标：禁止回退 engine.currentSessionPath（全局焦点指针）。
+      if (!queryPath) return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
+      if (!isValidSessionPath(queryPath, engine.agentsDir)) {
+        return c.json({ error: "Invalid session path" }, 403);
+      }
+      const auth = authorizeSessionRoute(requestContext, "sessions.read", {
+        kind: "session",
+        studioId: requestContext.studioId,
+        sessionPath: queryPath,
+      });
+      if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
+
+      const query = (c.req.query("q") || "").trim();
+      if (!query) {
+        return c.json({ query, total: 0, bestIndex: null, tokens: [], matches: [], truncated: false });
+      }
+      if ([...query].length > SESSION_SEARCH_QUERY_MAX_LENGTH) {
+        return c.json({ error: "query_too_long", maxLength: SESSION_SEARCH_QUERY_MAX_LENGTH }, 400);
+      }
+
+      // 修订点必须在读取内容之前取（同 messages 路由）：读取期间若有新写入，
+      // revision 只会偏旧，下次请求会重新解析，不会把没读到的写入标成已同步。
+      const revision = await readSessionFileRevision(queryPath);
+      const cached = findEntriesCache.get(queryPath);
+      let entries;
+      if (revision && cached && cached.revision === revision) {
+        entries = cached.entries;
+      } else {
+        const sourceMessages = await loadSessionHistoryMessages(engine, queryPath);
+        const sanitize = (value) => {
+          const withoutReminder = stripSessionReminderBlocks(value);
+          return isBridgeSessionPath(queryPath)
+            ? sanitizeBridgeVisibleText(withoutReminder)
+            : withoutReminder;
+        };
+        entries = collectFindableHistoryEntries(sourceMessages, sanitize);
+        if (revision) {
+          findEntriesCache.set(queryPath, { revision, entries });
+          if (findEntriesCache.size > FIND_ENTRIES_CACHE_MAX) {
+            findEntriesCache.delete(findEntriesCache.keys().next().value);
+          }
+        }
+      }
+      const result = findInSessionMessages(entries, query);
+      return c.json({ query, revision, ...result });
+    } catch (err) {
+      if (err instanceof SessionSearchTokenizerUnavailableError) {
+        log.error(`session find tokenizer unavailable: ${err.cause || err}`);
         return c.json({ error: err.message }, 503);
       }
       return c.json({ error: err.message }, 500);
@@ -769,25 +1099,16 @@ export function createSessionsRoute(engine, hub = null) {
     try {
       const requestContext = createRequestContext(c, engine);
       const body = await safeJson(c);
-      const { sessionId, path: legacySessionPath, pinned } = body;
-      let sessionPath = typeof legacySessionPath === "string" ? legacySessionPath : null;
-      if (typeof sessionId === "string" && sessionId.trim()) {
-        const manifest = engine.getSessionManifest?.(sessionId.trim()) || null;
-        if (!manifest?.currentLocator?.path) {
-          return c.json({ error: "Session manifest not found", code: "session_manifest_not_found" }, 404);
-        }
-        sessionPath = manifest.currentLocator.path;
-      }
-      if (!sessionPath) {
-        return c.json({ error: t("error.missingParam", { param: "sessionId" }) }, 400);
-      }
+      const { pinned } = body;
+      const sessionRef = resolveSessionLocatorFromBody(body, "setSessionPinned");
+      const { sessionId, sessionPath } = sessionRef;
       if (typeof pinned !== "boolean") {
         return c.json({ error: t("error.missingParam", { param: "pinned" }) }, 400);
       }
       if (!isValidSessionPath(sessionPath, engine.agentsDir)) {
         return c.json({ error: "Invalid session path" }, 403);
       }
-      if (isDeletedAgentSessionPath(sessionPath)) {
+      if (isDeletedAgentSessionPath(sessionPath) && pinned === true) {
         return rejectDeletedAgentSession(c);
       }
       const auth = authorizeSessionRoute(requestContext, "sessions.write", {
@@ -796,13 +1117,65 @@ export function createSessionsRoute(engine, hub = null) {
         sessionPath,
       });
       if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
-      const pinnedAt = await engine.setSessionPinned({
+      const { pinnedAt, pinOrder } = await engine.setSessionPinned({
         ...(sessionId ? { sessionId } : {}),
         sessionPath,
       }, pinned);
-      return c.json({ ok: true, pinnedAt, sessionId: sessionId || engine.getSessionIdForPath?.(sessionPath) || null });
+      return c.json({
+        ok: true,
+        pinnedAt,
+        pinOrder: Number.isFinite(pinOrder) ? pinOrder : null,
+        sessionId: sessionId || engine.getSessionIdForPath?.(sessionPath) || null,
+      });
     } catch (err) {
-      return c.json({ error: err.message, code: err.code || undefined }, err.status || 500);
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
+    }
+  });
+
+  // 重排置顶区：提交完整有序的 sessionId 列表，服务端整体重新编号
+  route.post("/sessions/pin-order", async (c) => {
+    try {
+      const requestContext = createRequestContext(c, engine);
+      const body = await safeJson(c);
+      const rawSessionIds = Array.isArray(body?.sessionIds) ? body.sessionIds : null;
+      if (!rawSessionIds || rawSessionIds.length === 0) {
+        return c.json({ error: t("error.missingParam", { param: "sessionIds" }) }, 400);
+      }
+
+      const refs = [];
+      const seen = new Set();
+      for (const rawSessionId of rawSessionIds) {
+        const sessionId = normalizeRequestSessionId(rawSessionId);
+        if (!sessionId) {
+          return c.json({ error: t("error.missingParam", { param: "sessionIds" }) }, 400);
+        }
+        if (seen.has(sessionId)) {
+          return c.json({
+            error: `setSessionPinOrder: duplicate session ${sessionId}`,
+            code: "session_pin_order_duplicate",
+            sessionId,
+          }, 400);
+        }
+        seen.add(sessionId);
+        // 每个 session 都独立解析定位并鉴权：一次请求跨多个 session，
+        // 授权不能只看列表里的第一个。
+        const sessionRef = resolveSessionLocatorFromBody({ sessionId }, "setSessionPinOrder");
+        if (!isValidSessionPath(sessionRef.sessionPath, engine.agentsDir)) {
+          return c.json({ error: "Invalid session path" }, 403);
+        }
+        const auth = authorizeSessionRoute(requestContext, "sessions.write", {
+          kind: "session",
+          studioId: requestContext.studioId,
+          sessionPath: sessionRef.sessionPath,
+        });
+        if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
+        refs.push({ sessionId: sessionRef.sessionId });
+      }
+
+      const orders = await engine.setSessionPinOrder(refs);
+      return c.json({ ok: true, orders });
+    } catch (err) {
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
     }
   });
 
@@ -914,6 +1287,70 @@ export function createSessionsRoute(engine, hub = null) {
       // 标成「已同步」会让 /rc 消息永久漏掉，issue #1610 的反方向竞态）。
       const revision = await readSessionFileRevision(resolvedSessionPath);
       const sourceMessages = await loadSessionHistoryMessages(engine, resolvedSessionPath);
+      // annotateOriginMessages 会把 origin custom 条目从数组里摘掉、把 origin/displayText
+      // 并进其后第一条 user 消息。下面的主展示循环大量以 sourceIndex 回查
+      // sourceMessages[sourceIndex]（nextImmediateDisplayableAssistantIndex、
+      // recordDeferredInterlude 等），如果直接把循环换成过滤后的短数组，sourceIndex
+      // 会和 sourceMessages 错位，静默污染 deferred/subagent 块的归属。这里改用
+      // zip 只取 annotateOriginMessages 的注释结果、映射回原始下标，循环本身仍遍历
+      // 原始 sourceMessages，不破坏既有 sourceIndex 语义。
+      const originBySourceIndex = new Map();
+      {
+        const annotatedMessages = annotateOriginMessages(sourceMessages);
+        let annotatedIdx = 0;
+        for (let i = 0; i < sourceMessages.length; i += 1) {
+          const original = sourceMessages[i];
+          if (original?.role === "custom" && (
+            original.customType === MESSAGE_ORIGIN_RECORD_TYPE
+            || original.customType === AGENT_REVIEW_RECORD_TYPE
+            || original.customType === MESSAGE_PRESENTATION_RECORD_TYPE
+          )) continue;
+          const annotated = annotatedMessages[annotatedIdx];
+          annotatedIdx += 1;
+          if (original?.role === "user" && annotated?.origin) {
+            originBySourceIndex.set(i, {
+              origin: annotated.origin,
+              ...(typeof annotated.displayText === "string" ? { displayText: annotated.displayText } : {}),
+            });
+          }
+        }
+      }
+      const presentationBySourceIndex = new Map();
+      {
+        let pendingPresentation = null;
+        for (let i = 0; i < sourceMessages.length; i += 1) {
+          const message = sourceMessages[i];
+          if (message?.role === "custom" && message.customType === MESSAGE_PRESENTATION_RECORD_TYPE) {
+            pendingPresentation = message.data || null;
+            continue;
+          }
+          if (message?.role === "user") {
+            if (pendingPresentation) presentationBySourceIndex.set(i, pendingPresentation);
+            pendingPresentation = null;
+          }
+        }
+      }
+      const agentReviewBySourceIndex = new Map();
+      {
+        let pendingReview = null;
+        for (let i = 0; i < sourceMessages.length; i += 1) {
+          const message = sourceMessages[i];
+          if (message?.role === "custom" && message.customType === AGENT_REVIEW_RECORD_TYPE) {
+            pendingReview = message.data || null;
+            continue;
+          }
+          if (message?.role === "user") {
+            if (pendingReview?.status === "completed") agentReviewBySourceIndex.set(i, pendingReview);
+            pendingReview = null;
+          }
+        }
+      }
+      const sanitizeVisibleContent = (value) => {
+        const withoutReminder = stripSessionReminderBlocks(value);
+        return isBridgeSessionPath(resolvedSessionPath)
+          ? sanitizeBridgeVisibleText(withoutReminder)
+          : withoutReminder;
+      };
 
       // 分页参数
       const beforeId = c.req.query("before") != null ? Number(c.req.query("before")) : null;
@@ -933,8 +1370,29 @@ export function createSessionsRoute(engine, hub = null) {
       const deferredInterludeDeliveryIds = new Set();
       const turnInputConsumptionDeliveryIds = new Set();
       const turnInputConsumptionEntryIds = new Set();
+      const turnInputByAssistantEntryId = new Map<string, string>();
+      const sourceIndexByEntryId = new Map<string, number>();
+      const displayIndexByEntryId = new Map<string, number>();
       const deferredStore = engine.deferredResults;
       const receiverName = resolveDeferredReceiverName(engine, resolvedSessionPath);
+      // 草稿卡确认状态持久化（灰测修复 C）：决策 custom 消息本身 display:false
+      // 不会进展示（与 origin 记录同理），只用来覆盖后面 toolResult 分支产出的
+      // suggestion_card block 的 status，让重开 session 不再回弹 pending。
+      const sessionCollabDecisions = collectSessionCollabDecisions(sourceMessages);
+      const toolOutcomesByCallId = collectToolOutcomesByCallId(sourceMessages);
+      let projectedDisplayIndex = 0;
+      for (let sourceIndex = 0; sourceIndex < sourceMessages.length; sourceIndex += 1) {
+        const message = sourceMessages[sourceIndex];
+        const entryId = typeof message?.id === "string" && message.id.trim() ? message.id.trim() : null;
+        if (entryId) sourceIndexByEntryId.set(entryId, sourceIndex);
+        if (
+          (message?.role === "user" || message?.role === "assistant")
+          && isDisplayableHistoryMessage(message)
+        ) {
+          if (entryId) displayIndexByEntryId.set(entryId, projectedDisplayIndex);
+          projectedDisplayIndex += 1;
+        }
+      }
       for (const message of sourceMessages) {
         if (message?.role !== "custom" || message.customType !== TURN_INPUT_CONSUMPTION_EVENT_TYPE) continue;
         const parsed = parseTurnInputConsumptionRecord(message.data);
@@ -944,8 +1402,12 @@ export function createSessionsRoute(engine, hub = null) {
         const entryId = typeof parsed?.input?.entryId === "string" && parsed.input.entryId.trim()
           ? parsed.input.entryId.trim()
           : null;
+        const assistantEntryId = typeof parsed?.assistant?.entryId === "string" && parsed.assistant.entryId.trim()
+          ? parsed.assistant.entryId.trim()
+          : null;
         if (deliveryId) turnInputConsumptionDeliveryIds.add(deliveryId);
         if (entryId) turnInputConsumptionEntryIds.add(entryId);
+        if (assistantEntryId && entryId) turnInputByAssistantEntryId.set(assistantEntryId, entryId);
       }
       const recordMediaGenerationResult = (parsed, afterIndex, sourceIndex = null) => {
         if (!parsed?.taskId || !isMediaGenerationDeferredResult(parsed)) return;
@@ -959,10 +1421,24 @@ export function createSessionsRoute(engine, hub = null) {
         }
       };
       const recordTurnInputConsumptionInterlude = (message, afterIndex, sourceIndex = null) => {
-        if (!Number.isInteger(afterIndex) || afterIndex < 0) return;
         const parsed = parseTurnInputConsumptionRecord(message?.data);
         const block = parsed?.block;
         if (!block || block.type !== "interlude") return;
+        const assistantEntryId = typeof parsed?.assistant?.entryId === "string" && parsed.assistant.entryId.trim()
+          ? parsed.assistant.entryId.trim()
+          : null;
+        const inputEntryId = typeof parsed?.input?.entryId === "string" && parsed.input.entryId.trim()
+          ? parsed.input.entryId.trim()
+          : null;
+        const assistantDisplayIndex = assistantEntryId
+          ? displayIndexByEntryId.get(assistantEntryId)
+          : undefined;
+        const anchoredAfterIndex = Number.isInteger(assistantDisplayIndex)
+          ? Math.max(0, assistantDisplayIndex - 1)
+          : afterIndex;
+        if (!Number.isInteger(anchoredAfterIndex) || anchoredAfterIndex < 0) return;
+        const inputSourceIndex = inputEntryId ? sourceIndexByEntryId.get(inputEntryId) : undefined;
+        const anchoredSourceIndex = Number.isInteger(inputSourceIndex) ? inputSourceIndex : sourceIndex;
         const normalizedDeliveryId = typeof parsed.deliveryId === "string" && parsed.deliveryId.trim()
           ? parsed.deliveryId.trim()
           : null;
@@ -970,8 +1446,8 @@ export function createSessionsRoute(engine, hub = null) {
         blocks.push({
           ...block,
           ...(normalizedDeliveryId ? { deliveryId: normalizedDeliveryId } : {}),
-          afterIndex,
-          ...(Number.isInteger(sourceIndex) ? { sourceIndex } : {}),
+          afterIndex: anchoredAfterIndex,
+          ...(Number.isInteger(anchoredSourceIndex) ? { sourceIndex: anchoredSourceIndex } : {}),
         });
         if (normalizedDeliveryId) deferredInterludeDeliveryIds.add(normalizedDeliveryId);
       };
@@ -1029,40 +1505,71 @@ export function createSessionsRoute(engine, hub = null) {
         if (normalizedDeliveryId) deferredInterludeDeliveryIds.add(normalizedDeliveryId);
       };
       let displayIdx = 0;
+      let latestTurnInputEntryId: string | null = null;
+      let latestTurnInputVisible = false;
 
       for (let sourceIndex = 0; sourceIndex < sourceMessages.length; sourceIndex += 1) {
         const m = sourceMessages[sourceIndex];
         if (m.role === "user") {
+          latestTurnInputEntryId = typeof m.id === "string" && m.id.trim() ? m.id.trim() : null;
+          latestTurnInputVisible = !isHiddenTurnInputMessage(m);
           if (!isDisplayableHistoryMessage(m)) continue;
           const currentIndex = displayIdx;
           displayIdx += 1;
           if (currentIndex >= pageBounds.startIdx && currentIndex < pageBounds.endIdx) {
             const { text, images } = extractTextContent(m.content);
             const visibleImages = filterUnreferencedInlineImages(text, images);
+            const content = sanitizeVisibleContent(text);
+            const originInfo = originBySourceIndex.get(sourceIndex);
+            const agentReview = agentReviewBySourceIndex.get(sourceIndex);
+            const presentation = presentationBySourceIndex.get(sourceIndex);
             messages.push({
               id: String(currentIndex),
               sourceIndex,
               ...(m.id ? { entryId: m.id } : {}),
               role: "user",
-              content: text,
+              content,
               images: visibleImages.length ? visibleImages : undefined,
               ...(m.timestamp ? { timestamp: m.timestamp } : {}),
+              ...(originInfo?.origin ? { origin: originInfo.origin } : {}),
+              ...(typeof originInfo?.displayText === "string" ? { displayText: originInfo.displayText } : {}),
+              ...(agentReview ? { agentReview } : {}),
+              ...(typeof agentReview?.displayText === "string" ? { displayText: agentReview.displayText } : {}),
+              ...(typeof presentation?.displayText === "string" ? { displayText: presentation.displayText } : {}),
+              ...(Array.isArray(presentation?.sessionRefs) ? { sessionRefs: presentation.sessionRefs } : {}),
+              ...(Array.isArray(presentation?.agentMentions) ? { agentMentions: presentation.agentMentions } : {}),
+              ...(presentation?.agentReviewRequest ? { agentReviewRequest: presentation.agentReviewRequest } : {}),
             });
           }
         } else if (m.role === "assistant") {
           if (!isDisplayableHistoryMessage(m)) continue;
+          const assistantEntryId = typeof m.id === "string" && m.id.trim() ? m.id.trim() : null;
+          const consumedTurnInputEntryId = assistantEntryId
+            ? turnInputByAssistantEntryId.get(assistantEntryId) || null
+            : null;
+          const turnInputEntryId = consumedTurnInputEntryId || latestTurnInputEntryId;
+          const turnInputVisible = consumedTurnInputEntryId ? false : latestTurnInputVisible;
           const currentIndex = displayIdx;
           displayIdx += 1;
           if (currentIndex >= pageBounds.startIdx && currentIndex < pageBounds.endIdx) {
             const { text, thinking, toolUses } = extractTextContent(m.content, { stripThink: true });
+            const content = sanitizeVisibleContent(text);
+            const projectedToolUses = toolUses.map((toolUse) => {
+              const outcome = toolUse.id ? toolOutcomesByCallId.get(toolUse.id) : null;
+              return {
+                ...toolUse,
+                ...(outcome || { status: "unknown", success: false }),
+              };
+            });
             messages.push({
               id: String(currentIndex),
               sourceIndex,
               ...(m.id ? { entryId: m.id } : {}),
               role: "assistant",
-              content: text,
+              content,
+              ...(turnInputEntryId ? { turnInputEntryId, turnInputVisible } : {}),
               ...(contentHasThinkingBlock(m.content, { stripThink: true }) ? { thinking } : {}),
-              toolCalls: toolUses.length ? toolUses : undefined,
+              toolCalls: projectedToolUses.length ? projectedToolUses : undefined,
               ...(m.timestamp ? { timestamp: m.timestamp } : {}),
             });
           }
@@ -1071,10 +1578,15 @@ export function createSessionsRoute(engine, hub = null) {
           if (afterIndex >= pageBounds.startIdx && afterIndex < pageBounds.endIdx) {
             const extracted = extractBlocks(m.toolName, m.details, m);
             for (const b of extracted) {
-              blocks.push({ ...b, afterIndex, sourceIndex });
+              const overlaid = overlaySessionCollabDecision(b, sessionCollabDecisions);
+              blocks.push({ ...overlaid, afterIndex, sourceIndex });
             }
           }
         } else if (m.role === "custom") {
+          if (isCustomTurnInputHistoryMessage(m)) {
+            latestTurnInputEntryId = typeof m.id === "string" && m.id.trim() ? m.id.trim() : null;
+            latestTurnInputVisible = false;
+          }
           const afterIndex = displayIdx - 1;
           if (m.display !== false && afterIndex >= pageBounds.startIdx && afterIndex < pageBounds.endIdx) {
             const extracted = extractBlocks(m.customType, m.details, m);
@@ -1111,10 +1623,13 @@ export function createSessionsRoute(engine, hub = null) {
         }
       }
       const resolvedBlocks = normalizePluginChatSurfaceBlocks(
-        resolveMediaGenerationBlocks(
-          blocks,
-          mediaGenerationResults,
-          standaloneMediaGenerationResults,
+        dropUninstalledPluginCards(
+          resolveMediaGenerationBlocks(
+            blocks,
+            mediaGenerationResults,
+            standaloneMediaGenerationResults,
+          ),
+          pluginInstalledPredicate(engine),
         ),
         engine,
       );
@@ -1232,7 +1747,7 @@ export function createSessionsRoute(engine, hub = null) {
       }
 
       patchSessionFileLifecycleBlocks(slicedBlocks, engine, resolvedSessionPath);
-      const sessionFiles = listSessionRegistryFiles(engine, resolvedSessionPath);
+      const sessionFiles = listSessionRegistryFiles(engine, resolvedSessionPath, sourceMessages);
 
       // 从历史中提取最新 todo 状态：branch-aware，沿当前 leaf 回溯到 root，
       // 只在当前分支路径上找最新合法快照。避免从抛弃的分支取到错误状态。
@@ -1293,6 +1808,126 @@ export function createSessionsRoute(engine, hub = null) {
     }
   });
 
+  route.post("/sessions/turns/retry", async (c) => {
+    try {
+      const requestContext = createRequestContext(c, engine);
+      const body = await safeJson(c);
+      const sessionRef = resolveSessionLocatorFromBody(body, "retrySessionTurn");
+      assertManifestLifecycle(sessionRef, "active", "retrySessionTurn");
+      const { sessionId, sessionPath } = sessionRef;
+      const auth = authorizeSessionRoute(requestContext, "sessions.write", {
+        kind: "session",
+        studioId: requestContext.studioId,
+        sessionPath,
+      });
+      if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
+      if (!isActiveDesktopSessionPath(sessionPath, engine.agentsDir)) {
+        return c.json({ error: "Invalid session path" }, 403);
+      }
+      if (isDeletedAgentSessionPath(sessionPath)) {
+        return rejectDeletedAgentSession(c);
+      }
+      if (!(await pathExists(sessionPath))) {
+        return c.json({ error: "session not found" }, 404);
+      }
+      if (engine.isSessionStreaming?.(sessionPath)) {
+        return c.json({ error: "session_busy" }, 409);
+      }
+
+      const result = await retrySessionTurn(engine, {
+        sessionId,
+        sessionPath,
+        target: body?.target,
+        clientMessageId: body?.clientMessageId || null,
+        replacementText: typeof body?.text === "string" ? body.text : undefined,
+        displayMessage: body?.displayMessage || null,
+        uiContext: body?.uiContext ?? null,
+      });
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      // 无码默认 400（重放失败绝大多数是请求本身的问题），session_busy 仍单独回 409。
+      return c.json(
+        bodyFromRouteError(err),
+        statusFromRouteError(err, err?.message === "session_busy" ? 409 : 400),
+      );
+    }
+  });
+
+  route.post("/sessions/fork", async (c) => {
+    try {
+      const requestContext = createRequestContext(c, engine);
+      const body = await safeJson(c);
+      const sessionRef = resolveSessionLocatorFromBody(body, "forkSessionAtNode");
+      assertManifestLifecycle(sessionRef, "active", "forkSessionAtNode");
+      const { sessionId, sessionPath } = sessionRef;
+      const auth = authorizeSessionRoute(requestContext, "sessions.write", {
+        kind: "session",
+        studioId: requestContext.studioId,
+        sessionPath,
+      });
+      if (!auth.allowed) return c.json({ error: "insufficient_scope", reason: auth.reason }, 403);
+      if (!isActiveDesktopSessionPath(sessionPath, engine.agentsDir)) {
+        return c.json({ error: "Invalid session path" }, 403);
+      }
+      if (isDeletedAgentSessionPath(sessionPath)) {
+        return rejectDeletedAgentSession(c);
+      }
+      if (!(await pathExists(sessionPath))) {
+        return c.json({ error: "session not found" }, 404);
+      }
+      if (engine.isSessionStreaming?.(sessionPath)) {
+        return c.json({ error: "session_busy" }, 409);
+      }
+      if (typeof engine.forkSessionAtNode !== "function") {
+        throw routeError("session fork is unavailable", "session_fork_unavailable", 503);
+      }
+
+      const result = await engine.forkSessionAtNode({
+        sessionId,
+        sessionPath,
+        target: body?.target,
+      });
+      const childPath = result?.sessionPath || result?.path || null;
+      const childSessionId = result?.sessionId || (childPath ? engine.getSessionIdForPath?.(childPath) : null) || null;
+      const permissionMode = result?.permissionMode || engine.getSessionPermissionMode?.(childPath) || "ask";
+      const response = {
+        ok: true,
+        path: childPath,
+        sessionPath: childPath,
+        sessionId: childSessionId,
+        agentId: result?.agentId || null,
+        agentName: result?.agentName || engine.getAgent?.(result?.agentId)?.agentName || result?.agentId || null,
+        cwd: result?.cwd || null,
+        workspaceFolders: Array.isArray(result?.workspaceFolders) ? result.workspaceFolders : [],
+        authorizedFolders: Array.isArray(result?.authorizedFolders) ? result.authorizedFolders : [],
+        planMode: result?.planMode ?? permissionMode === "read_only",
+        permissionMode,
+        accessMode: result?.accessMode || (permissionMode === "read_only" ? "read_only" : "operate"),
+        thinkingLevel: normalizeSessionThinkingLevel(result?.thinkingLevel),
+        projectId: result?.projectId ?? null,
+        workspaceMountId: result?.workspaceMountId || null,
+        workspaceLabel: result?.workspaceLabel || null,
+        sourceSessionId: result?.sourceSessionId || sessionId,
+        forkedFromEntryId: result?.forkedFromEntryId || null,
+        target: result?.target || body?.target || null,
+        sessionFiles: result?.sessionFiles || { files: [], refs: [], fileIdMap: {} },
+        visionNotes: result?.visionNotes || { notes: 0, keys: [] },
+        memoryModelUnavailableReason: engine.memoryModelUnavailableReason || null,
+      };
+      hub?.eventBus?.emit?.({
+        type: "session_created",
+        session: response,
+      }, childPath);
+      return c.json(response);
+    } catch (err) {
+      // 无码默认 500（fork 失败多半是文件系统或引擎侧的问题），session_busy 仍单独回 409。
+      return c.json(
+        bodyFromRouteError(err),
+        statusFromRouteError(err, err?.message === "session_busy" ? 409 : 500),
+      );
+    }
+  });
+
   route.post("/sessions/todos/complete", async (c) => {
     try {
       const requestContext = createRequestContext(c, engine);
@@ -1322,10 +1957,12 @@ export function createSessionsRoute(engine, hub = null) {
         return c.json({ error: "Cannot complete todos while session is streaming" }, 409);
       }
 
-      const snapshot = await loadLatestTodoSnapshotFromSessionFile(sessionPath);
+      const manager = getWritableSessionManager(engine, sessionPath);
+      const snapshot = extractLatestTodoSnapshot(
+        manager.buildSessionContext?.().messages || [],
+      );
       const completedTodos = completeTodoItems(snapshot?.todos || []);
       if (!snapshot?.removed && completedTodos.length > 0) {
-        const manager = getWritableSessionManager(engine, sessionPath);
         manager.appendCustomMessageEntry(
           TODO_STATE_CUSTOM_TYPE,
           TODO_COMPLETE_MESSAGE,
@@ -1337,6 +1974,7 @@ export function createSessionsRoute(engine, hub = null) {
             todos: completedTodos,
           },
         );
+        engine.syncSessionBranchHead?.(sessionPath, manager, "todo_complete_append");
       }
 
       engine.emitEvent?.({ type: "todo_update", todos: [] }, sessionPath);
@@ -1397,6 +2035,11 @@ export function createSessionsRoute(engine, hub = null) {
         createOptions.workspaceLabel = workspaceSelection.mount.label || null;
       }
       let newSessionPath, newSessionId, newAgentId;
+      // @ui-focus-ok: this asks "is the caller switching to a different agent
+      // than the one already on screen?", which is a question about the focus
+      // itself. The caller's own view wins when it says so; the server's focus
+      // is the last resort for deciding whether this is a switch at all, and
+      // the agent being switched to is the explicit one either way.
       if (agentId && agentId !== (body.currentAgentId || engine.currentAgentId)) {
         ({ sessionPath: newSessionPath, sessionId: newSessionId, agentId: newAgentId } = await engine.createSessionForAgent(
           agentId,
@@ -1414,7 +2057,7 @@ export function createSessionsRoute(engine, hub = null) {
           createOptions,
         ));
       }
-      engine.persistSessionMeta();
+      engine.persistSessionMeta(newSessionPath);
       if (projectId && typeof engine.setSessionProjectAssignment === "function") {
         await engine.setSessionProjectAssignment({ sessionPath: newSessionPath, projectId });
       }
@@ -1474,6 +2117,13 @@ export function createSessionsRoute(engine, hub = null) {
         ? body.workspaceFolders.filter(p => typeof p === "string" && p.trim())
         : [];
       const memFlag = memoryEnabled !== false;
+      const projectId = Object.prototype.hasOwnProperty.call(body, "projectId")
+        ? (
+            typeof engine.normalizeSessionProjectAssignmentId === "function"
+              ? engine.normalizeSessionProjectAssignmentId(body.projectId)
+              : (typeof body.projectId === "string" && body.projectId.trim() ? body.projectId.trim() : null)
+          )
+        : null;
 
       const detachedOptions: {
         cwd: any;
@@ -1504,7 +2154,15 @@ export function createSessionsRoute(engine, hub = null) {
       const result = await engine.createDetachedSession(detachedOptions);
       const newSessionPath = result.sessionPath;
       const newAgentId = result.agentId;
-      engine.persistSessionMeta?.();
+      const newSessionId = result.sessionId || engine.getSessionIdForPath?.(newSessionPath) || null;
+      engine.persistSessionMeta?.(newSessionPath);
+      if (projectId && typeof engine.setSessionProjectAssignment === "function") {
+        await engine.setSessionProjectAssignment({ sessionPath: newSessionPath, projectId });
+      }
+      if (cwd && body.recordWorkspaceHistory === true) {
+        const history = mergeWorkspaceHistory(engine.config?.cwd_history, [cwd]);
+        await engine.updateConfig?.({ last_cwd: cwd, cwd_history: history });
+      }
 
       const resolvedPermissionMode = engine.getSessionPermissionMode?.(newSessionPath)
         || permissionMode
@@ -1513,11 +2171,13 @@ export function createSessionsRoute(engine, hub = null) {
       const response = {
         ok: true,
         path: newSessionPath,
+        sessionId: newSessionId,
         cwd: result.session?.sessionManager?.getCwd?.() || cwd || engine.cwd || null,
         workspaceFolders: engine.getSessionWorkspaceFolders?.(newSessionPath) || workspaceFolders,
         authorizedFolders: engine.getSessionAuthorizedFolders?.(newSessionPath) || [],
         agentId: newAgentId,
         agentName: engine.getAgent?.(newAgentId)?.agentName || newAgentId || engine.agentName,
+        projectId,
         currentSessionPath: engine.currentSessionPath || null,
         planMode: resolvedPermissionMode === "read_only",
         permissionMode: resolvedPermissionMode,
@@ -1532,7 +2192,8 @@ export function createSessionsRoute(engine, hub = null) {
       }, newSessionPath);
       return c.json(response);
     } catch (err) {
-      return c.json({ error: err.message }, 500);
+      const classified = classifySessionCreationError(err);
+      return c.json(classified.body, classified.status);
     }
   });
 
@@ -1566,6 +2227,7 @@ export function createSessionsRoute(engine, hub = null) {
       const response = {
         ok: true,
         path: newSessionPath,
+        sessionId: result.sessionId || engine.getSessionIdForPath?.(newSessionPath) || null,
         cwd: result.cwd || engine.cwd || null,
         workspaceFolders: result.workspaceFolders || engine.getSessionWorkspaceFolders?.(newSessionPath) || [],
         authorizedFolders: result.authorizedFolders || engine.getSessionAuthorizedFolders?.(newSessionPath) || [],
@@ -1586,7 +2248,13 @@ export function createSessionsRoute(engine, hub = null) {
       }, newSessionPath);
       return c.json(response);
     } catch (err) {
-      return c.json({ error: err.message }, 500);
+      const status = Number.isInteger(err?.status) && err.status >= 400 && err.status < 600
+        ? err.status
+        : 500;
+      return c.json({
+        error: err.message,
+        ...(err?.code ? { code: err.code } : {}),
+      }, status);
     }
   });
 
@@ -1617,18 +2285,26 @@ export function createSessionsRoute(engine, hub = null) {
       const bm = BrowserManager.instance();
       const suspendPath = oldSessionPath;
       if (suspendPath && bm.isRunning(suspendPath)) {
-        await bm.suspendForSession(suspendPath);
+        // viewer 开着就让它跟着切，不再因为切换会话把窗口藏起来
+        await bm.suspendForSession(suspendPath, { keepViewerVisible: true });
       }
 
       await engine.switchSession(sessionPath);
 
-      // 恢复目标 session 的浏览器（若有）
-      await bm.resumeForSession(sessionPath);
+      // 恢复目标 session 的浏览器（若有）。无 browser host 的 server/PWA 环境只记录 typed skip；
+      // 一旦判断为可恢复，resumeForSession 内的真实 browser 错误仍会向外抛出。
+      const browserResume = await resumeBrowserForSessionSwitch(bm, sessionPath);
 
       const session = engine.getSessionByPath(sessionPath);
 
-      // 从 sessionPath 解析 agentId，避免依赖 engine 焦点指针的时序
-      const switchedAgentId = engine.agentIdFromSessionPath(sessionPath) || engine.currentAgentId;
+      // viewer 跟随：无论是否 resume 成功都告知 viewer 当前 session（没有标签页组就显示空态）。
+      // 不改变窗口可见性，viewer 没开着时这条通知只更新标题缓存。
+      void bm.notifyViewerSession(sessionPath, session?.title || null);
+
+      // 从 manifest 归属解析 agentId，避免依赖 engine 焦点指针的时序。
+      // switchSession 只接受 agents/{id}/sessions/*.jsonl 布局的路径，归属要么
+      // 来自 manifest，要么从这个布局推出来，所以走到这里一定解析得到 agentId。
+      const switchedAgentId = engine.resolveSessionOwnership(sessionPath).agentId;
       const switchedAgent = engine.getAgent(switchedAgentId);
 
       // switchSession 已同步设置焦点到目标 session。
@@ -1637,7 +2313,8 @@ export function createSessionsRoute(engine, hub = null) {
       // master && session 的临时组合态；否则现有 session 的缓存前缀身份
       // 会被全局 gate 混淆。
       // agentId/agentName 已从 sessionPath 解析，不依赖焦点。
-      const activeModel = engine.activeSessionModel ?? engine.currentModel;
+      const activeModel = session?.model ?? engine.currentModel;
+      const modelAvailability = engine.getSessionModelAvailability?.(sessionPath) || null;
       const frozenSessionMemoryEnabled = typeof engine.getSessionMemoryEnabled === "function"
         ? engine.getSessionMemoryEnabled(sessionPath)
         : (switchedAgent?.isSessionMemoryEnabledFor?.(sessionPath) ?? engine.memoryEnabled);
@@ -1658,6 +2335,7 @@ export function createSessionsRoute(engine, hub = null) {
         agentName: switchedAgent?.agentName || switchedAgentId,
         browserRunning: bm.isRunning(sessionPath),
         browserUrl: bm.currentUrl(sessionPath) || null,
+        browserResume,
         isStreaming: engine.isSessionStreaming(sessionPath),
         currentModelId: activeModel?.id || null,
         currentModelProvider: activeModel?.provider || null,
@@ -1674,39 +2352,22 @@ export function createSessionsRoute(engine, hub = null) {
         currentModelThinkingLevels: activeModel ? getModelThinkingLevels(activeModel) : null,
         currentModelDefaultThinkingLevel: activeModel ? resolveModelDefaultThinkingLevel(activeModel) : null,
         currentModelContextWindow: activeModel?.contextWindow ?? null,
-        // #1624：restore 时算好的工具/prompt 漂移提示（无漂移或已 dismiss → null）
-        capabilityDrift: engine.getSessionCapabilityDriftNotice?.(sessionPath) || null,
+        currentModelAvailable: modelAvailability?.available !== false,
+        currentModelUnavailableReason: modelAvailability?.available === false
+          ? (modelAvailability.reason || "temporarily_unavailable")
+          : null,
       });
     } catch (err) {
       const errDetail = `${err.message}\n${err.stack || ""}`;
       switchLog.error(`error: ${errDetail}`);
       try { appendFileSync(path.join(engine.hanakoHome, "switch-error.log"), `${new Date().toISOString()}\n${errDetail}\n---\n`); } catch {}
-      return c.json({ error: err.message }, 500);
+      // 日志保持全量，响应按下游语义分层：session-coordinator 抛的 409/404/503
+      // 不该在这里被压平成 500，否则用户只看得到"未知错误"，无从判断该刷新还是重试。
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
     }
   });
 
-  // #1624：关闭当前 fingerprint 的"工具能力有更新"提示（跟 session 走，指纹再变才重新提示）
-  route.post("/sessions/capability-drift/dismiss", async (c) => {
-    try {
-      const body = await safeJson(c);
-      const { path: sessionPath, fingerprint } = body || {};
-      if (!sessionPath) {
-        return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
-      }
-      if (typeof fingerprint !== "string" || !fingerprint) {
-        return c.json({ error: t("error.missingParam", { param: "fingerprint" }) }, 400);
-      }
-      if (!isActiveDesktopSessionPath(sessionPath, engine.agentsDir)) {
-        return c.json({ error: "Invalid session path" }, 403);
-      }
-      await engine.dismissSessionCapabilityDrift(sessionPath, fingerprint);
-      return c.json({ ok: true });
-    } catch (err) {
-      return c.json({ error: err.message }, 500);
-    }
-  });
-
-  // #1624：显式刷新 Agent 工具——fresh compact：压缩旧对话 + 用当前配置重建 prompt/工具快照
+  // 显式更新 Agent 能力：fresh compact 压缩旧对话，再用当前配置重建 prompt/工具快照。
   route.post("/sessions/fresh-compact", async (c) => {
     try {
       const body = await safeJson(c);
@@ -1724,11 +2385,10 @@ export function createSessionsRoute(engine, hub = null) {
       return c.json({
         ok: true,
         ...result,
-        capabilityDrift: engine.getSessionCapabilityDriftNotice?.(sessionPath) || null,
       });
     } catch (err) {
       lifecycleLog.error(`fresh-compact failed: ${err.message}`);
-      return c.json({ error: err.message }, 500);
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
     }
   });
 
@@ -1744,12 +2404,26 @@ export function createSessionsRoute(engine, hub = null) {
     return c.json(bm.getBrowserSessionStates());
   });
 
+  // 打开指定 session 的浏览器（侧栏徽章左键入口）：冷状态先恢复，再让 viewer 展示该 session
+  route.post("/browser/open-session", async (c) => {
+    const body = await safeJson(c);
+    const { sessionPath } = body;
+    if (!sessionPath) return c.json({ error: "missing sessionPath" }, 400);
+    const bm = BrowserManager.instance();
+    const resume = await bm.resumeForSessionIfAvailable(sessionPath);
+    const session = engine.getSessionByPath(sessionPath);
+    await bm.notifyViewerSession(sessionPath, session?.title || null);
+    return c.json({ ok: true, resume });
+  });
+
   // 关闭指定 session 的浏览器
   route.post("/browser/close-session", async (c) => {
     const body = await safeJson(c);
-    const { sessionPath } = body;
+    const { sessionPath, revoke } = body;
     if (!sessionPath) return c.json({ error: "missing sessionPath" });
     const bm = BrowserManager.instance();
+    // 急停（revoke）不只是关窗，还要撤销该 session 的 agent 浏览器授权。
+    if (revoke === true) bm.revokeBrowserAuthorization(sessionPath);
     await bm.closeBrowserForSession(sessionPath);
     hub?.eventBus?.emit?.({ type: "browser_status", running: false, url: null }, sessionPath);
     return c.json({ ok: true, sessions: bm.getBrowserSessionStates() });
@@ -1802,8 +2476,7 @@ export function createSessionsRoute(engine, hub = null) {
             if (stat.mtime.getTime() < cutoff) {
               const activeKey = path.join(agentsDir, agentId, "sessions", f);
               await cleanupSessionLifecycle([activeKey, fp], "parent session deleted");
-              await fs.unlink(fp);
-              deleteSessionFileSidecarSync(fp);
+              await permanentlyDeleteArchivedFile(fp, "session_cleanup");
               deleted++;
               // 清理 titles.json 孤儿（key = 对应的活跃路径）
               try { await engine.clearSessionTitle(activeKey); } catch {}
@@ -1832,51 +2505,71 @@ export function createSessionsRoute(engine, hub = null) {
   route.post("/sessions/archive", async (c) => {
     try {
       const body = await safeJson(c);
-      const { path: sessionPath } = body;
-      if (!sessionPath) {
-        return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
-      }
+      const sessionRef = resolveSessionLocatorFromBody(body, "archiveSession");
+      assertManifestLifecycle(sessionRef, "active", "archiveSession");
+      const { sessionId, sessionPath } = sessionRef;
       // archive 是 lifecycle transition，只允许 active desktop session。
       if (!isActiveDesktopSessionPath(sessionPath, engine.agentsDir)) {
         return c.json({ error: "Invalid session path" }, 403);
       }
-      if (isDeletedAgentSessionPath(sessionPath)) {
-        return rejectDeletedAgentSession(c);
-      }
-
-      // 确认文件存在
-      try {
-        await fs.access(sessionPath);
-      } catch {
-        return c.json({ error: t("error.sessionNotFound") }, 404);
-      }
 
       // 从 session 路径推导归档目录（同 agent 的 sessions/archived/）
       const destPath = archivedPathForActiveSession(sessionPath);
-      const archiveDir = path.dirname(destPath);
-      if (await pathExists(destPath)) {
-        return c.json({ error: "Archived path already exists" }, 409);
-      }
-      if (await pathExists(sessionFileSidecarPath(destPath))) {
-        return c.json({ error: "Stage file sidecar destination already exists" }, 409);
-      }
-      await cleanupSessionLifecycle([sessionPath, destPath], "parent session archived", { skipMemory: true });
+      return await withSessionLifecycleLock([sessionPath, destPath], async () => {
+        const archiveDir = path.dirname(destPath);
+        // 确认文件存在
+        try {
+          await fs.access(sessionPath);
+        } catch {
+          return c.json({ error: t("error.sessionNotFound") }, 404);
+        }
+        if (await pathExists(destPath)) {
+          return c.json({ error: "Archived path already exists" }, 409);
+        }
+        if (await pathExists(sessionFileSidecarPath(destPath))) {
+          return c.json({ error: "Stage file sidecar destination already exists" }, 409);
+        }
+        await cleanupSessionLifecycle([sessionPath, destPath], "parent session archived", { skipMemory: true });
 
-      // 再从 engine 的 session map 中移除。
-      await engine.setSessionPinned(sessionPath, false);
-      await engine.closeSession(sessionPath);
+        // 再从 engine 的 session map 中移除。
+        await engine.setSessionPinned({
+          ...(sessionId ? { sessionId } : {}),
+          sessionPath,
+        }, false);
+        await engine.closeSession(sessionPath);
 
-      await fs.mkdir(archiveDir, { recursive: true });
-      await fs.rename(sessionPath, destPath);
-      moveSessionFileSidecarSync(sessionPath, destPath);
+        await fs.mkdir(archiveDir, { recursive: true });
+        const manifest = await moveSessionLifecycleOrThrow({
+          fromPath: sessionPath,
+          toPath: destPath,
+          lifecycle: "archived",
+          reason: "session_archive",
+        });
+        try {
+          await fs.rename(sessionPath, destPath);
+          moveSessionFileSidecarSync(sessionPath, destPath);
+        } catch (err) {
+          try {
+            await moveSessionLifecycleOrThrow({
+              fromPath: destPath,
+              toPath: sessionPath,
+              lifecycle: "active",
+              reason: "session_archive_rollback",
+            });
+          } catch (rollbackErr) {
+            lifecycleLog.error(`archive manifest rollback failed for ${sessionPath}: ${rollbackErr.message}`);
+          }
+          throw err;
+        }
 
-      // 将 mtime 置为归档瞬间，使 cleanup 按"归档时间"而非"最后活动时间"判断
-      const nowSec = Date.now() / 1000;
-      await fs.utimes(destPath, nowSec, nowSec);
+        // 将 mtime 置为归档瞬间，使 cleanup 按"归档时间"而非"最后活动时间"判断
+        const nowSec = Date.now() / 1000;
+        await fs.utimes(destPath, nowSec, nowSec);
 
-      return c.json({ ok: true });
+        return c.json({ ok: true, sessionId: manifest.sessionId || sessionId || null, archivedPath: destPath });
+      });
     } catch (err) {
-      return c.json({ error: err.message }, 500);
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
     }
   });
 
@@ -1884,10 +2577,9 @@ export function createSessionsRoute(engine, hub = null) {
   route.post("/sessions/restore", async (c) => {
     try {
       const body = await safeJson(c);
-      const { path: sessionPath } = body;
-      if (!sessionPath) {
-        return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
-      }
+      const sessionRef = resolveSessionLocatorFromBody(body, "restoreSession");
+      assertManifestLifecycle(sessionRef, "archived", "restoreSession");
+      const { sessionId, sessionPath } = sessionRef;
       if (!isArchivedDesktopSessionPath(sessionPath, engine.agentsDir)) {
         return c.json({ error: "Invalid session path" }, 403);
       }
@@ -1905,20 +2597,45 @@ export function createSessionsRoute(engine, hub = null) {
       const activeDir = path.dirname(archDir);
       const destPath = path.join(activeDir, path.basename(sessionPath));
 
-      // 冲突检测：目标位置已存在，不自动改名（违背"禁止非用户预期的 fallback"）
-      try {
-        await fs.access(destPath);
-        return c.json({ error: "Active path already exists" }, 409);
-      } catch { /* 目标不存在，可以恢复 */ }
-      if (await pathExists(sessionFileSidecarPath(destPath))) {
-        return c.json({ error: "Stage file sidecar destination already exists" }, 409);
-      }
+      return await withSessionLifecycleLock([destPath, sessionPath], async () => {
+        try {
+          await fs.access(sessionPath);
+        } catch {
+          return c.json({ error: t("error.sessionNotFound") }, 404);
+        }
 
-      await fs.rename(sessionPath, destPath);
-      moveSessionFileSidecarSync(sessionPath, destPath);
-      return c.json({ ok: true, restoredPath: destPath });
+        await cleanupSessionLifecycle([destPath, sessionPath], "parent session restored", { skipMemory: true });
+
+        // 冲突检测：目标位置已有真实消息时，不自动合并；只有旧 bug 留下的 header-only 文件可修复。
+        await repairHeaderOnlyActiveRestoreTarget(destPath);
+        if (await pathExists(sessionFileSidecarPath(destPath))) {
+          return c.json({ error: "Stage file sidecar destination already exists" }, 409);
+        }
+
+        await fs.rename(sessionPath, destPath);
+        moveSessionFileSidecarSync(sessionPath, destPath);
+        let manifest = null;
+        try {
+          manifest = await moveSessionLifecycleOrThrow({
+            fromPath: sessionPath,
+            toPath: destPath,
+            lifecycle: "active",
+            reason: "session_restore",
+          });
+        } catch (err) {
+          try {
+            await fs.mkdir(archDir, { recursive: true });
+            await fs.rename(destPath, sessionPath);
+            moveSessionFileSidecarSync(destPath, sessionPath);
+          } catch (rollbackErr) {
+            lifecycleLog.error(`restore file rollback failed for ${destPath}: ${rollbackErr.message}`);
+          }
+          throw err;
+        }
+        return c.json({ ok: true, restoredPath: destPath, sessionId: manifest?.sessionId || sessionId || null });
+      });
     } catch (err) {
-      return c.json({ error: err.message }, 500);
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
     }
   });
 
@@ -1926,10 +2643,9 @@ export function createSessionsRoute(engine, hub = null) {
   route.post("/sessions/archived/delete", async (c) => {
     try {
       const body = await safeJson(c);
-      const { path: sessionPath } = body;
-      if (!sessionPath) {
-        return c.json({ error: t("error.missingParam", { param: "path" }) }, 400);
-      }
+      const sessionRef = resolveSessionLocatorFromBody(body, "deleteArchivedSession");
+      assertManifestLifecycle(sessionRef, "archived", "deleteArchivedSession");
+      const { sessionId, sessionPath } = sessionRef;
       if (!isArchivedDesktopSessionPath(sessionPath, engine.agentsDir)) {
         return c.json({ error: "Invalid session path" }, 403);
       }
@@ -1938,21 +2654,27 @@ export function createSessionsRoute(engine, hub = null) {
         return c.json({ error: "Not an archived session path" }, 403);
       }
       const activeKey = activePathForArchivedSession(sessionPath);
-      await cleanupSessionLifecycle([activeKey, sessionPath], "parent session deleted");
-      try {
-        await fs.unlink(sessionPath);
-        deleteSessionFileSidecarSync(sessionPath);
-      } catch (err) {
-        if (err.code === "ENOENT") {
-          return c.json({ error: t("error.sessionNotFound") }, 404);
+      return await withSessionLifecycleLock([activeKey, sessionPath], async () => {
+        const draftSessionId = sessionId || engine.getSessionIdForPath?.(activeKey) || null;
+        await cleanupSessionLifecycle([activeKey, sessionPath], "parent session deleted");
+        let deletedManifest;
+        try {
+          deletedManifest = await permanentlyDeleteArchivedFile(sessionPath, "archived_session_deleted");
+        } catch (err) {
+          if (err.code === "ENOENT") {
+            return c.json({ error: t("error.sessionNotFound") }, 404);
+          }
+          throw err;
         }
-        throw err;
-      }
-      // 清理 titles.json 孤儿（key = 对应的活跃路径）
-      try { await engine.clearSessionTitle(activeKey); } catch {}
-      return c.json({ ok: true });
+        if (draftSessionId) {
+          try { engine.deleteSessionInputDrafts?.(draftSessionId); } catch { /* 草稿清理失败不阻塞删除 */ }
+        }
+        // 清理 titles.json 孤儿（key = 对应的活跃路径）
+        try { await engine.clearSessionTitle(activeKey); } catch {}
+        return c.json({ ok: true, sessionId: deletedManifest?.sessionId || sessionId || null });
+      });
     } catch (err) {
-      return c.json({ error: err.message }, 500);
+      return c.json(bodyFromRouteError(err), statusFromRouteError(err));
     }
   });
 
@@ -1991,9 +2713,9 @@ function patchSessionFileLifecycleBlocks(blocks, engine, sessionPath) {
   }
 }
 
-function listSessionRegistryFiles(engine, sessionPath) {
+function listSessionRegistryFiles(engine, sessionPath, activeReferences = []) {
   if (!sessionPath || typeof engine?.listSessionFiles !== "function") return [];
-  return engine.listSessionFiles(sessionPath)
+  return engine.listSessionFiles(sessionPath, { references: activeReferences })
     .map(file => {
       if (typeof engine.serializeSessionFile === "function") return engine.serializeSessionFile(file);
       return serializeSessionFile(file, { runtimeContext: engine?.runtimeContext || null });
@@ -2052,3 +2774,8 @@ function sessionFileLifecycleFields(file, engine) {
     ...(source.resource ? { resource: source.resource } : {}),
   };
 }
+
+// 仅供测试使用的内部函数出口；生产调用一律走 route handler。
+// 这个出口跟 classifySessionCreationError 的文案正则兜底同生共死：它存在的唯一理由
+// 是让那段兜底可被直接测到。兜底删除之日，这个出口一并删除，不要往里加第二个成员。
+export const __testables = { classifySessionCreationError };

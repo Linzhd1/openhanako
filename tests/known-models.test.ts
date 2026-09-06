@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import defaultModels from "../lib/default-models.json";
-import { listKnownProviderModels, lookupKnown } from "../shared/known-models.ts";
+import {
+  listKnownProviderModels,
+  lookupKnown,
+  lookupKnownProvider,
+  lookupKnownWithSource,
+} from "../shared/known-models.ts";
 
 describe("known-models dictionary", () => {
   it("treats missing model ids as unknown instead of throwing", () => {
@@ -12,7 +17,7 @@ describe("known-models dictionary", () => {
   it("keeps current OpenAI GPT-5.4 API context metadata", () => {
     expect(lookupKnown("openai", "gpt-5.4")).toMatchObject({
       name: "GPT-5.4",
-      context: 1050000,
+      context: 272000,
       maxOutput: 128000,
       image: true,
       reasoning: true,
@@ -25,13 +30,89 @@ describe("known-models dictionary", () => {
     });
   });
 
-  it("declares GPT-5.5 metadata for Codex OAuth with conservative context", () => {
-    expect(lookupKnown("openai-codex-oauth", "gpt-5.5")).toEqual({
+  it("declares GPT-5.5 metadata for Codex OAuth with the Hana-owned Codex contract", () => {
+    expect(lookupKnown("openai-codex-oauth", "gpt-5.5")).toMatchObject({
       name: "GPT-5.5",
-      context: 400000,
+      context: 272000,
       maxOutput: 128000,
       image: true,
       reasoning: true,
+      api: "openai-codex-responses",
+      thinkingLevels: ["low", "medium", "high", "max"],
+      thinkingLevelMap: { off: null, minimal: "low", xhigh: "xhigh" },
+      defaultThinkingLevel: "medium",
+    });
+  });
+
+  it("keeps legacy Codex OAuth defaults on provider-specific 272K contracts", () => {
+    for (const id of ["gpt-5.4", "gpt-5.4-mini", "gpt-5.2"]) {
+      expect(lookupKnownProvider("openai-codex-oauth", id)).toMatchObject({
+        context: 272000,
+        maxOutput: 128000,
+        api: "openai-codex-responses",
+        thinkingLevels: ["low", "medium", "high", "max"],
+        thinkingLevelMap: { off: null, minimal: "low", xhigh: "xhigh" },
+        defaultThinkingLevel: "medium",
+      });
+    }
+    expect(lookupKnownProvider("openai-codex-oauth", "gpt-5.3-codex-spark")).toMatchObject({
+      context: 128000,
+      maxOutput: 128000,
+      api: "openai-codex-responses",
+      legacyCompatibility: true,
+    });
+  });
+
+  it("keeps GPT-5.6 provider contracts isolated from generic fallback metadata", () => {
+    expect(defaultModels.openai.slice(0, 4)).toEqual([
+      "gpt-5.6",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+    ]);
+    expect(lookupKnownProvider("openai", "gpt-5.6-sol")).toMatchObject({
+      context: 1050000,
+      maxOutput: 128000,
+      api: "openai-responses",
+      thinkingLevels: ["off", "low", "medium", "high", "max"],
+      thinkingLevelMap: { off: "none", xhigh: "max" },
+      defaultThinkingLevel: "medium",
+    });
+    expect(lookupKnownProvider("openai-codex-oauth", "gpt-5.6-sol")).toMatchObject({
+      context: 353400,
+      maxContext: 372000,
+      maxOutput: 128000,
+      api: "openai-codex-responses",
+      thinkingLevels: ["low", "medium", "high", "max"],
+      thinkingLevelMap: { off: null, minimal: null, xhigh: "max" },
+      defaultThinkingLevel: "low",
+    });
+    expect(lookupKnownWithSource("unknown-proxy", "gpt-5.6-sol")).toEqual({
+      source: "fallback",
+      metadata: {
+        name: "GPT-5.6 Sol",
+        context: 1050000,
+        maxOutput: 128000,
+        image: true,
+        reasoning: true,
+      },
+    });
+    expect(lookupKnownProvider("unknown-proxy", "gpt-5.6-sol")).toBeNull();
+  });
+
+  it("declares all six OpenRouter GPT-5.6 routes", () => {
+    expect(listKnownProviderModels("openrouter")).toEqual(expect.arrayContaining([
+      "openai/gpt-5.6-sol",
+      "openai/gpt-5.6-sol-pro",
+      "openai/gpt-5.6-terra",
+      "openai/gpt-5.6-terra-pro",
+      "openai/gpt-5.6-luna",
+      "openai/gpt-5.6-luna-pro",
+    ]));
+    expect(lookupKnownProvider("openrouter", "openai/gpt-5.6-sol")).toMatchObject({
+      api: "openai-completions",
+      context: 1050000,
+      maxOutput: 128000,
     });
   });
 
@@ -48,7 +129,7 @@ describe("known-models dictionary", () => {
 
   it("declares recent frontier and agent model metadata by provider", () => {
     expect(lookupKnown("openai", "gpt-5.5")).toMatchObject({
-      context: 1050000,
+      context: 272000,
       maxOutput: 128000,
       image: true,
       reasoning: true,
@@ -59,6 +140,31 @@ describe("known-models dictionary", () => {
       image: true,
       reasoning: true,
     });
+    for (const [id, name] of [
+      ["claude-opus-5", "Claude Opus 5"],
+      ["claude-sonnet-5", "Claude Sonnet 5"],
+    ]) {
+      expect(lookupKnown("anthropic", id)).toMatchObject({
+        name,
+        context: 1000000,
+        maxOutput: 128000,
+        image: true,
+        reasoning: true,
+        xhigh: true,
+        compat: {
+          thinkingFormat: "anthropic",
+          reasoningProfile: "anthropic-adaptive-only",
+        },
+      });
+      expect(lookupKnown("unknown-provider", `anthropic/${id}`)).toMatchObject({
+        name,
+        context: 1000000,
+        maxOutput: 128000,
+        image: true,
+        reasoning: true,
+        xhigh: true,
+      });
+    }
     expect(lookupKnown("anthropic", "claude-fable-5")).toMatchObject({
       name: "Claude Fable 5",
       context: 1000000,
@@ -95,6 +201,23 @@ describe("known-models dictionary", () => {
         reasoningProfile: "openrouter-anthropic-adaptive",
       },
     });
+    for (const [id, name] of [
+      ["anthropic/claude-opus-5", "Anthropic/Claude Opus 5"],
+      ["anthropic/claude-sonnet-5", "Anthropic/Claude Sonnet 5"],
+    ]) {
+      expect(lookupKnown("openrouter", id)).toMatchObject({
+        name,
+        context: 1000000,
+        maxOutput: 128000,
+        image: true,
+        reasoning: true,
+        xhigh: true,
+        compat: {
+          thinkingFormat: "openrouter",
+          reasoningProfile: "openrouter-anthropic-adaptive",
+        },
+      });
+    }
     expect(lookupKnown("unknown-provider", "anthropic/claude-mythos-5")).toMatchObject({
       name: "Claude Mythos 5",
       context: 1000000,
@@ -138,6 +261,13 @@ describe("known-models dictionary", () => {
     expect(lookupKnown("xai", "grok-4.20-reasoning")).toMatchObject({
       context: 2000000,
       maxOutput: 2000000,
+      image: true,
+      reasoning: true,
+    });
+    expect(defaultModels.xai[0]).toBe("grok-4.5");
+    expect(lookupKnown("xai", "grok-4.5")).toMatchObject({
+      name: "Grok 4.5",
+      context: 500000,
       image: true,
       reasoning: true,
     });
@@ -248,11 +378,60 @@ describe("known-models dictionary", () => {
       maxOutput: 32768,
       image: true,
       reasoning: true,
+      thinkingLevels: ["off", "low", "high", "max"],
+      defaultThinkingLevel: "high",
+      thinkingLevelMap: {
+        off: null,
+        low: "low",
+        medium: "high",
+        high: "high",
+        xhigh: "max",
+      },
       compat: {
         thinkingFormat: "kimi",
         reasoningProfile: "kimi-openai",
       },
     });
+  });
+
+  it("declares official Kimi K3 metadata while keeping the stable default model", () => {
+    const k3 = lookupKnownProvider("kimi-coding", "k3");
+    const k3_256k = lookupKnownProvider("kimi-coding", "k3-256k");
+    expect(k3).toMatchObject({
+      name: "Kimi K3",
+      context: 1048576,
+      image: true,
+      reasoning: true,
+      thinkingLevels: ["medium", "high", "max"],
+      thinkingLevelMap: {
+        off: null,
+        low: "low",
+        medium: "low",
+        high: "high",
+        xhigh: "max",
+      },
+      defaultThinkingLevel: "max",
+    });
+    expect(k3_256k).toMatchObject({
+      name: "Kimi K3 256K",
+      context: 262144,
+      image: true,
+      reasoning: true,
+      thinkingLevels: ["medium", "high", "max"],
+      thinkingLevelMap: {
+        off: null,
+        low: "low",
+        medium: "low",
+        high: "high",
+        xhigh: "max",
+      },
+      defaultThinkingLevel: "high",
+    });
+    expect(k3).not.toHaveProperty("video");
+    expect(k3).not.toHaveProperty("maxOutput");
+    expect(k3_256k).not.toHaveProperty("video");
+    expect(k3_256k).not.toHaveProperty("maxOutput");
+    expect(defaultModels["kimi-coding"]).toEqual(["kimi-for-coding"]);
   });
 
   it("declares official Moonshot Kimi K2.6 video capability", () => {
@@ -317,12 +496,16 @@ describe("known-models dictionary", () => {
   it("declares current MiniMax M-series text and image metadata across billing providers", () => {
     const m3 = {
       name: "MiniMax M3",
-      context: 1000000,
-      maxOutput: 524288,
+      // context 为用户策展值：实测 500k 以上基本不可用，不取官方 1M
+      //（sync-known-models-from-pi.mjs 排除表持有此口径）
+      context: 500000,
+      maxOutput: 128000,
       image: true,
       reasoning: true,
     };
     expect(lookupKnown("minimax", "MiniMax-M3")).toEqual(m3);
+    // minimax-token-plan 不在词典分区内，经 known-model-fallbacks.json 兜底解析；
+    // 2026-07-08 起两个数据源已对齐同值。
     expect(lookupKnown("minimax-token-plan", "MiniMax-M3")).toEqual(m3);
     expect(lookupKnown("minimax", "MiniMax-M2.1-highspeed")).toEqual({
       name: "MiniMax M2.1 Highspeed",
@@ -339,14 +522,48 @@ describe("known-models dictionary", () => {
 
   it("keeps provider-specific metadata ahead of generic fallbacks", () => {
     expect(lookupKnown("openai-codex-oauth", "gpt-5.5")).toMatchObject({
-      context: 400000,
+      context: 272000,
     });
     expect(lookupKnown("unknown-provider", "gpt-5.5")).toMatchObject({
-      context: 1050000,
+      context: 272000,
     });
   });
 
   it("does not treat arbitrary provider-specific entries as generic fallbacks", () => {
     expect(lookupKnown("unknown-provider", "openrouter/auto")).toBeNull();
+  });
+
+  it("declares DeepSeek V4 Flash Vision (Exp) as image-capable on the official DeepSeek provider", () => {
+    expect(lookupKnown("deepseek", "deepseek-v4-flash-vision-exp")).toMatchObject({
+      name: "DeepSeek V4 Flash Vision (Exp)",
+      context: 1000000,
+      maxOutput: 384000,
+      image: true,
+      reasoning: true,
+      xhigh: true,
+    });
+  });
+
+  it("declares DeepSeek V4's official three-tier thinking ladder, dropping the unsupported medium", () => {
+    for (const id of ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]) {
+      expect(lookupKnown("deepseek", id)).toMatchObject({
+        thinkingLevels: ["off", "low", "high", "max"],
+        defaultThinkingLevel: "high",
+      });
+    }
+  });
+
+  it("also reaches DeepSeek V4 Flash Vision (Exp) through the generic fallback table, without inheriting DeepSeek's protocol-level thinking ladder", () => {
+    expect(lookupKnownWithSource("unknown-proxy", "deepseek-v4-flash-vision-exp")).toEqual({
+      source: "fallback",
+      metadata: {
+        name: "DeepSeek V4 Flash Vision (Exp)",
+        context: 1000000,
+        maxOutput: 384000,
+        image: true,
+        reasoning: true,
+        xhigh: true,
+      },
+    });
   });
 });

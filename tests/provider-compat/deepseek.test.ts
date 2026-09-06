@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { convertMessages } from "../../node_modules/@mariozechner/pi-ai/dist/providers/openai-completions.js";
-import { normalizeProviderPayload } from "../../core/provider-compat.ts";
+import { convertMessages } from "../../node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js";
+import {
+  normalizeProviderContextMessages,
+  normalizeProviderPayload,
+} from "../../core/provider-compat.ts";
 import * as deepseek from "../../core/provider-compat/deepseek.ts";
 
 describe("provider-compat/deepseek — matches", () => {
@@ -40,9 +43,7 @@ describe("provider-compat/deepseek — matches", () => {
 });
 
 describe("provider-compat/deepseek — extractReasoningFromContent", () => {
-  it("从被 transform-messages 降级为 text 的 content 里恢复原文", () => {
-    // pi-ai transform-messages.js:38-48 跨模型时把 thinking block 转为
-    // { type: "text", text: <思考原文> }，放在 content 数组首位
+  it("不把普通 text content 猜成 reasoning_content", () => {
     const message = {
       role: "assistant",
       content: [
@@ -50,7 +51,7 @@ describe("provider-compat/deepseek — extractReasoningFromContent", () => {
       ],
       tool_calls: [{ id: "call_1", type: "function", function: { name: "date", arguments: "{}" } }],
     };
-    expect(deepseek.extractReasoningFromContent(message)).toBe("思考原文：先调用 date 工具");
+    expect(deepseek.extractReasoningFromContent(message)).toBe("");
   });
 
   it("已有 thinking block（同模型路径）时也能取出 thinking 字段", () => {
@@ -68,9 +69,9 @@ describe("provider-compat/deepseek — extractReasoningFromContent", () => {
     const message = {
       role: "assistant",
       content: [
-        { type: "thinking", thinking: "第一段思考" },
+        { type: "thinking", thinking: "第一段思考", thinkingSignature: "reasoning_content" },
         { type: "text", text: "中间正文" },
-        { type: "thinking", thinking: "第二段思考" },
+        { type: "thinking", thinking: "第二段思考", thinkingSignature: "reasoning_content" },
       ],
     };
     expect(deepseek.extractReasoningFromContent(message)).toBe("第一段思考");
@@ -80,20 +81,20 @@ describe("provider-compat/deepseek — extractReasoningFromContent", () => {
     const message = {
       role: "assistant",
       content: [
-        { type: "thinking", thinking: "" },
+        { type: "thinking", thinking: "", thinkingSignature: "reasoning_content" },
         { type: "text", text: "正文，不应被当作 reasoning" },
       ],
     };
     expect(deepseek.extractReasoningFromContent(message)).toBe("");
   });
 
-  it("content 为字符串（真实 SDK 转换后的 assistantMsg.content）时返回字符串内容", () => {
+  it("不把序列化后的 assistant content 字符串猜成 reasoning_content", () => {
     const message = {
       role: "assistant",
       content: "已经转换成 string 的思考原文",
       tool_calls: [{ id: "call_1" }],
     };
-    expect(deepseek.extractReasoningFromContent(message)).toBe("已经转换成 string 的思考原文");
+    expect(deepseek.extractReasoningFromContent(message)).toBe("");
   });
 
   it("无 content 字段时返回空字符串", () => {
@@ -182,8 +183,7 @@ describe("provider-compat/deepseek — ensureReasoningContentForToolCalls", () =
     expect(result[1].reasoning_content).toBe("调用 date 工具");
   });
 
-  it("从降级 text block 恢复 reasoning_content（档 2，跨 V4 子版本路径）", () => {
-    // 模拟 transform-messages 跨 V4-Pro 切 V4-Flash 后的状态
+  it("降级 text block 没有协议签名时 fail closed", () => {
     const messages = [
       { role: "user", content: "what time" },
       {
@@ -194,11 +194,11 @@ describe("provider-compat/deepseek — ensureReasoningContentForToolCalls", () =
         tool_calls: [{ id: "call_1", type: "function", function: { name: "date", arguments: "{}" } }],
       },
     ];
-    const result = deepseek.ensureReasoningContentForToolCalls(messages);
-    expect(result[1].reasoning_content).toBe("用 date 工具查时间");
+    expect(() => deepseek.ensureReasoningContentForToolCalls(messages))
+      .toThrow(/DeepSeek.*reasoning_content.*tool_calls/);
   });
 
-  it("从真实 SDK 转换后的 content 字符串恢复 reasoning_content（档 2，跨 V4 子版本路径）", () => {
+  it("普通 assistant content 字符串没有协议签名时 fail closed", () => {
     const messages = [
       { role: "user", content: "what time" },
       {
@@ -207,8 +207,8 @@ describe("provider-compat/deepseek — ensureReasoningContentForToolCalls", () =
         tool_calls: [{ id: "call_1", type: "function", function: { name: "date", arguments: "{}" } }],
       },
     ];
-    const result = deepseek.ensureReasoningContentForToolCalls(messages);
-    expect(result[1].reasoning_content).toBe("用 date 工具查时间");
+    expect(() => deepseek.ensureReasoningContentForToolCalls(messages))
+      .toThrow(/DeepSeek.*reasoning_content.*tool_calls/);
   });
 
   it("既无 reasoning_content 也无可恢复原文 → fail closed，不再注入空字符串占位", () => {
@@ -299,14 +299,14 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
     maxTokens: 384000,
   };
 
-  it("chat mode + 思考开启：tool_calls 历史补 reasoning_content（覆盖跨 V4 切换）", () => {
+  it("中心入口只从 signed thinking block 投影 reasoning_content", () => {
     const payload = {
       model: "deepseek-v4-flash",
       messages: [
         { role: "user", content: "what time" },
         {
           role: "assistant",
-          content: [{ type: "text", text: "调用 date" }],  // 模拟降级
+          content: [{ type: "thinking", thinking: "调用 date", thinkingSignature: "reasoning_content" }],
           tool_calls: [{ id: "call_1", type: "function", function: { name: "date", arguments: "{}" } }],
         },
         { role: "tool", tool_call_id: "call_1", content: "2026-04-26" },
@@ -314,16 +314,12 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
       tools: [{ type: "function", function: { name: "date" } }],
       reasoning_effort: "high",
     };
-    const result = deepseek.apply(payload, deepseekModel, { mode: "chat", reasoningLevel: "high" });
+    const result = normalizeProviderPayload(payload, deepseekModel, { mode: "chat", reasoningLevel: "high" });
     expect(result.messages[1].reasoning_content).toBe("调用 date");
     expect(result.thinking).toEqual({ type: "enabled" });
   });
 
-  it("normalizeProviderPayload 在真实 SDK 转换后恢复 DeepSeek tool-call reasoning_content", () => {
-    // Regression for #468: pi-ai convertMessages may downgrade a previous
-    // thinking block to assistant.content before a DeepSeek V4 sub-version
-    // switch. The provider compat boundary must restore reasoning_content
-    // before the outgoing request reaches DeepSeek.
+  it("跨 DeepSeek 兼容模型切换时在 SDK 转换前保留 signed reasoning", () => {
     const context = {
       messages: [
         { role: "user", content: "之前用 V4-Pro 问的" },
@@ -359,9 +355,13 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
       contextWindow: 384000,
       maxTokens: 384000,
     };
+    const replayMessages = normalizeProviderContextMessages(context.messages, v4FlashModel, {
+      mode: "chat",
+      reasoningLevel: "high",
+    });
     const convertedMessages = convertMessages(
       v4FlashModel,
-      context as Parameters<typeof convertMessages>[1],
+      { ...context, messages: replayMessages } as Parameters<typeof convertMessages>[1],
       {} as Parameters<typeof convertMessages>[2],
     );
     const result = normalizeProviderPayload({
@@ -373,8 +373,9 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
       reasoningLevel: "high",
     });
 
+    expect(context.messages[1]).toMatchObject({ model: "deepseek-v4-pro" });
     expect(result.thinking).toEqual({ type: "enabled" });
-    expect(result.messages[1].content).toBe("V4-Pro 时代的思考");
+    expect(result.messages[1].content).toBe("");
     expect(result.messages[1].reasoning_content).toBe("V4-Pro 时代的思考");
   });
 
@@ -424,7 +425,7 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
       ],
       tools: [{ type: "function", function: { name: "date" } }],
     };
-    expect(() => deepseek.apply(payload, deepseekModel, { mode: "chat", reasoningLevel: "high" }))
+    expect(() => normalizeProviderPayload(payload, deepseekModel, { mode: "chat", reasoningLevel: "high" }))
       .toThrow(/DeepSeek.*reasoning_content.*tool_calls/);
   });
 
@@ -625,10 +626,14 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
         },
         { role: "tool", tool_call_id: "call_1", content: "ok1" },
         { role: "user", content: "round 2" },
-        // 档 2：无 reasoning_content 但 content 是降级 text（跨 V4 子版本切换后的状态）
+        // signed block 可以由中心层安全投影
         {
           role: "assistant",
-          content: [{ type: "text", text: "本轮思考被降级" }],
+          content: [{
+            type: "thinking",
+            thinking: "本轮思考",
+            thinkingSignature: "reasoning_content",
+          }],
           tool_calls: [{ id: "call_2", type: "function", function: { name: "y", arguments: "{}" } }],
         },
         { role: "tool", tool_call_id: "call_2", content: "ok2" },
@@ -642,7 +647,7 @@ describe("provider-compat/deepseek — apply 主流程接入 reasoning_content �
       ],
       tools: [{ type: "function", function: { name: "x" } }],
     };
-    expect(() => deepseek.apply(payload, deepseekModel, { mode: "chat", reasoningLevel: "high" }))
+    expect(() => normalizeProviderPayload(payload, deepseekModel, { mode: "chat", reasoningLevel: "high" }))
       .toThrow(/DeepSeek.*reasoning_content.*tool_calls/);
   });
 });

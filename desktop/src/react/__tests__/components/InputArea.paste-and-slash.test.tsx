@@ -2,19 +2,34 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
+import type { JSONContent } from '@tiptap/core';
+import { Schema, type Node as ProseMirrorNode } from '@tiptap/pm/model';
+import { EditorState, TextSelection } from '@tiptap/pm/state';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InputArea } from '../../components/InputArea';
+import type { SlashItem } from '../../components/input/slash-commands';
 import { useStore } from '../../stores';
 
 const mocks = vi.hoisted(() => ({
   editorOptions: undefined as undefined | Record<string, unknown>,
   editorText: '',
+  editorJson: undefined as undefined | JSONContent,
+  editorState: undefined as undefined | EditorState,
   updateHandler: undefined as undefined | (() => void),
   insertContent: vi.fn(),
   setContent: vi.fn(),
+  splitListItem: vi.fn(),
+  editorIsActive: vi.fn((_name?: string) => false),
   chainInserted: [] as unknown[],
-  ensureSession: vi.fn(async () => true),
+  chainDeletedRanges: [] as Array<{ from: number; to: number }>,
+  chainClearContent: vi.fn(),
+  ensureSession: vi.fn(async () => ({
+    sessionId: 'sess_input',
+    sessionPath: '/session/input.jsonl',
+    agentId: 'hana',
+  })),
   loadSessions: vi.fn(),
+  upsertOptimisticSessionFirstMessage: vi.fn(),
   hanaFetch: vi.fn(),
   wsSend: vi.fn(),
   editorFocus: vi.fn(),
@@ -29,11 +44,76 @@ function editorJsonForText(text: string) {
   };
 }
 
+const slashRangeSchema = new Schema({
+  nodes: {
+    doc: { content: 'block+' },
+    paragraph: { content: 'inline*', group: 'block' },
+    text: { group: 'inline' },
+    hardBreak: { inline: true, group: 'inline', atom: true },
+    skillBadge: {
+      inline: true,
+      group: 'inline',
+      atom: true,
+      attrs: { name: { default: '' } },
+    },
+    fileBadge: {
+      inline: true,
+      group: 'inline',
+      atom: true,
+      attrs: {
+        fileId: { default: null },
+        path: { default: '' },
+        name: { default: '' },
+      },
+    },
+    agentBadge: {
+      inline: true,
+      group: 'inline',
+      atom: true,
+      attrs: {
+        agentId: { default: '' },
+        label: { default: '' },
+      },
+    },
+  },
+  marks: {
+    bold: {},
+    italic: {},
+  },
+});
+
+function setMockEditorDocument(doc: ProseMirrorNode, cursor: number): void {
+  mocks.editorJson = doc.toJSON();
+  mocks.editorText = doc.textBetween(0, doc.content.size, '\n', '');
+  mocks.editorState = EditorState.create({
+    doc,
+    selection: TextSelection.create(doc, cursor),
+  });
+}
+
+function findTextNodePosition(doc: ProseMirrorNode, text: string): number {
+  let match = -1;
+  doc.descendants((node, position) => {
+    if (match >= 0 || !node.isText || node.text !== text) return match < 0;
+    match = position;
+    return false;
+  });
+  if (match < 0) throw new Error(`Missing text node: ${text}`);
+  return match;
+}
+
 vi.mock('@tiptap/react', () => ({
   useEditor: (options: Record<string, unknown>) => {
     mocks.editorOptions = options;
     const chain = {
-      clearContent: vi.fn(() => chain),
+      clearContent: vi.fn(() => {
+        mocks.chainClearContent();
+        return chain;
+      }),
+      deleteRange: vi.fn((range: { from: number; to: number }) => {
+        mocks.chainDeletedRanges.push(range);
+        return chain;
+      }),
       insertContent: vi.fn((content: unknown) => {
         mocks.chainInserted.push(content);
         return chain;
@@ -48,12 +128,16 @@ vi.mock('@tiptap/react', () => ({
         scrollIntoView: vi.fn(),
         setContent: mocks.setContent,
         insertContent: mocks.insertContent,
+        splitListItem: mocks.splitListItem,
       },
       chain: () => chain,
       getText: () => mocks.editorText,
-      getJSON: () => editorJsonForText(mocks.editorText),
+      getJSON: () => mocks.editorJson ?? editorJsonForText(mocks.editorText),
+      isActive: mocks.editorIsActive,
       isDestroyed: false,
-      state: { tr: { setMeta: vi.fn(() => ({})) } },
+      get state() {
+        return mocks.editorState ?? { tr: { setMeta: vi.fn(() => ({})) } };
+      },
       view: { dispatch: vi.fn() },
       on: vi.fn((event: string, handler: () => void) => {
         if (event === 'update') mocks.updateHandler = handler;
@@ -100,6 +184,7 @@ vi.mock('../../hooks/use-hana-fetch', () => ({
 vi.mock('../../stores/session-actions', () => ({
   ensureSession: mocks.ensureSession,
   loadSessions: mocks.loadSessions,
+  upsertOptimisticSessionFirstMessage: mocks.upsertOptimisticSessionFirstMessage,
 }));
 
 vi.mock('../../stores/desk-actions', () => ({
@@ -117,9 +202,27 @@ vi.mock('../../MainContent', () => ({
 }));
 
 vi.mock('../../components/input/SlashCommandMenu', () => ({
-  SlashCommandMenu: ({ selected }: { selected: number }) => React.createElement(
+  SlashCommandMenu: ({
+    commands,
+    selected,
+    onSelect,
+  }: {
+    commands: SlashItem[];
+    selected: number;
+    onSelect: (item: SlashItem) => void;
+  }) => React.createElement(
     'div',
     { 'data-testid': 'slash-menu', 'data-selected': String(selected) },
+    commands.map(command => React.createElement(
+      'button',
+      {
+        key: command.name,
+        type: 'button',
+        'aria-label': `slash-${command.name}`,
+        onClick: () => onSelect(command),
+      },
+      command.label,
+    )),
   ),
 }));
 
@@ -136,10 +239,25 @@ vi.mock('../../components/input/InputContextRow', () => ({
 }));
 
 vi.mock('../../components/input/InputControlBar', () => ({
-  InputControlBar: ({ onAttach }: { onAttach: () => void }) => React.createElement(
-    'button',
-    { type: 'button', 'aria-label': 'attach', onClick: onAttach },
-    'send',
+  InputControlBar: ({
+    onAttach,
+    onSlashToggle,
+  }: {
+    onAttach: () => void;
+    onSlashToggle: () => void;
+  }) => React.createElement(
+    React.Fragment,
+    null,
+    React.createElement(
+      'button',
+      { type: 'button', 'aria-label': 'attach', onClick: onAttach },
+      'send',
+    ),
+    React.createElement(
+      'button',
+      { type: 'button', 'aria-label': 'slash-toggle', onClick: onSlashToggle },
+      'slash',
+    ),
   ),
 }));
 
@@ -168,6 +286,7 @@ vi.mock('../../hooks/use-slash-items', () => ({
       execute: vi.fn(),
     },
   ],
+  useServerSlashCommandItems: () => [],
 }));
 
 vi.mock('../../utils/paste-upload-feedback', () => ({
@@ -184,6 +303,16 @@ vi.mock('../../services/stream-resume', () => ({
 function seedInputState(overrides: Partial<ReturnType<typeof useStore.getState>> = {}) {
   useStore.setState({
     currentSessionPath: '/session/input.jsonl',
+    currentSessionId: 'sess_input',
+    currentAgentId: 'hana',
+    pendingDraftId: 'draft-input',
+    sessions: [{
+      path: '/session/input.jsonl',
+      sessionId: 'sess_input',
+      agentId: 'hana',
+      agentName: 'Hana',
+    }],
+    sessionLocatorsById: { sess_input: { path: '/session/input.jsonl' } },
     connected: true,
     pendingNewSession: false,
     streamingSessions: [],
@@ -267,16 +396,29 @@ describe('InputArea paste and slash menu behavior', () => {
     vi.clearAllMocks();
     mocks.editorOptions = undefined;
     mocks.editorText = '';
+    mocks.editorJson = undefined;
+    mocks.editorState = undefined;
     mocks.updateHandler = undefined;
     mocks.chainInserted = [];
+    mocks.chainDeletedRanges = [];
+    mocks.chainClearContent.mockClear();
+    mocks.splitListItem.mockClear();
+    mocks.editorIsActive.mockReset();
+    mocks.editorIsActive.mockReturnValue(false);
     mocks.editorFocus.mockClear();
+    mocks.upsertOptimisticSessionFirstMessage.mockClear();
     mocks.ensureSession.mockImplementation(async () => {
       useStore.setState({
         currentSessionPath: '/session/input.jsonl',
+        currentSessionId: 'sess_input',
         pendingNewSession: false,
         welcomeVisible: false,
       } as never);
-      return true;
+      return {
+        sessionId: 'sess_input',
+        sessionPath: '/session/input.jsonl',
+        agentId: 'hana',
+      };
     });
     seedInputState();
     mocks.hanaFetch.mockResolvedValue(new Response('{}', { status: 200 }));
@@ -317,13 +459,16 @@ describe('InputArea paste and slash menu behavior', () => {
   });
 
   it('selects the highlighted slash command on Enter without falling through to message send', async () => {
+    const doc = slashRangeSchema.node('doc', null, [
+      slashRangeSchema.node('paragraph', null, [slashRangeSchema.text('/zz')]),
+    ]);
+    setMockEditorDocument(doc, 4);
     render(React.createElement(InputArea));
 
     await waitFor(() => {
       expect(mocks.updateHandler).toBeTypeOf('function');
     });
 
-    mocks.editorText = '/zz';
     act(() => {
       mocks.updateHandler?.();
     });
@@ -341,7 +486,127 @@ describe('InputArea paste and slash menu behavior', () => {
       type: 'skillBadge',
       attrs: { name: 'zz-second' },
     });
+    expect(mocks.chainDeletedRanges).toEqual([{ from: 1, to: 4 }]);
+    expect(mocks.chainClearContent).not.toHaveBeenCalled();
     expect(mocks.wsSend).not.toHaveBeenCalled();
+  });
+
+  it('replaces only the selected rich-document slash trigger when a skill is clicked', async () => {
+    const doc = slashRangeSchema.node('doc', null, [
+      slashRangeSchema.node('paragraph', null, [
+        slashRangeSchema.text('第一行', [slashRangeSchema.mark('bold')]),
+      ]),
+      slashRangeSchema.node('paragraph', null, [
+        slashRangeSchema.text('前文 ', [slashRangeSchema.mark('italic')]),
+        slashRangeSchema.node('fileBadge', { fileId: 'file-1', path: '/tmp/a.txt', name: 'a.txt' }),
+        slashRangeSchema.text(' '),
+        slashRangeSchema.node('agentBadge', { agentId: 'agent-1', label: 'Agent One' }),
+        slashRangeSchema.text(' '),
+        slashRangeSchema.text('/', [slashRangeSchema.mark('bold')]),
+        slashRangeSchema.text('z'),
+        slashRangeSchema.text('z', [slashRangeSchema.mark('italic')]),
+        slashRangeSchema.text(' 后文', [slashRangeSchema.mark('bold')]),
+      ]),
+      slashRangeSchema.node('paragraph', null, [slashRangeSchema.text('最后一行')]),
+    ]);
+    const slashFrom = findTextNodePosition(doc, '/');
+    setMockEditorDocument(doc, slashFrom + 3);
+    render(React.createElement(InputArea));
+
+    fireEvent.click(screen.getByRole('button', { name: 'slash-toggle' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'slash-zz-first' }));
+
+    expect(mocks.chainDeletedRanges).toEqual([{ from: slashFrom, to: slashFrom + 3 }]);
+    expect(mocks.chainInserted).toEqual([
+      { type: 'skillBadge', attrs: { name: 'zz-first' } },
+      ' ',
+    ]);
+    expect(mocks.chainClearContent).not.toHaveBeenCalled();
+  });
+
+  it('inserts a toolbar-selected skill at the current selection when there is no slash trigger', async () => {
+    const doc = slashRangeSchema.node('doc', null, [
+      slashRangeSchema.node('paragraph', null, [slashRangeSchema.text('已有正文')]),
+    ]);
+    setMockEditorDocument(doc, 3);
+    render(React.createElement(InputArea));
+
+    fireEvent.click(screen.getByRole('button', { name: 'slash-toggle' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'slash-zz-first' }));
+
+    expect(mocks.chainDeletedRanges).toEqual([]);
+    expect(mocks.chainClearContent).not.toHaveBeenCalled();
+    expect(mocks.chainInserted).toEqual([
+      { type: 'skillBadge', attrs: { name: 'zz-first' } },
+      ' ',
+    ]);
+  });
+
+  it('saves rich list drafts as markdown text plus the editor document', async () => {
+    render(React.createElement(InputArea));
+
+    await waitFor(() => {
+      expect(mocks.updateHandler).toBeTypeOf('function');
+    });
+
+    mocks.editorJson = {
+      type: 'doc',
+      content: [{
+        type: 'orderedList',
+        attrs: { start: 1 },
+        content: [{
+          type: 'listItem',
+          content: [{
+            type: 'paragraph',
+            content: [{ type: 'text', text: 'first' }],
+          }],
+        }],
+      }],
+    };
+
+    act(() => {
+      mocks.updateHandler?.();
+    });
+
+    expect(useStore.getState().drafts.sess_input).toBe('1. first');
+    expect(useStore.getState().draftDocs.sess_input).toEqual(mocks.editorJson);
+  });
+
+  it('uses Shift+Enter inside list items to create the next list item', () => {
+    mocks.editorIsActive.mockImplementation((name?: string) => name === 'listItem');
+    render(React.createElement(InputArea));
+
+    const preventDefault = vi.fn();
+    const handled = tiptapKeyDownHandler()?.(null, {
+      key: 'Enter',
+      shiftKey: true,
+      isComposing: false,
+      defaultPrevented: false,
+      preventDefault,
+    } as unknown as KeyboardEvent);
+
+    expect(handled).toBe(true);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(mocks.splitListItem).toHaveBeenCalledWith('listItem');
+    expect(mocks.wsSend).not.toHaveBeenCalled();
+  });
+
+  it('leaves Shift+Enter outside lists to the editor default soft break behavior', () => {
+    mocks.editorIsActive.mockReturnValue(false);
+    render(React.createElement(InputArea));
+
+    const preventDefault = vi.fn();
+    const handled = tiptapKeyDownHandler()?.(null, {
+      key: 'Enter',
+      shiftKey: true,
+      isComposing: false,
+      defaultPrevented: false,
+      preventDefault,
+    } as unknown as KeyboardEvent);
+
+    expect(handled).toBe(false);
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(mocks.splitListItem).not.toHaveBeenCalled();
   });
 
   it('handles welcome Enter inside TipTap before the editor inserts a newline', async () => {
@@ -366,6 +631,11 @@ describe('InputArea paste and slash menu behavior', () => {
       expect(mocks.loadSessions).toHaveBeenCalledTimes(1);
       expect(mocks.wsSend).toHaveBeenCalledTimes(1);
     });
+    expect(mocks.upsertOptimisticSessionFirstMessage).toHaveBeenCalledWith(
+      '/session/input.jsonl',
+      '你好 Hana',
+      expect.any(String),
+    );
   });
 
   it('maps mobile insertParagraph beforeinput to the same send path as Enter', async () => {
@@ -611,7 +881,7 @@ describe('InputArea paste and slash menu behavior', () => {
     const payload = JSON.parse(String(mocks.wsSend.mock.calls[0][0]));
     expect(payload.clientMessageId).toMatch(/^client-user-/);
 
-    const items = useStore.getState().chatSessions['/session/input.jsonl']?.items || [];
+    const items = useStore.getState().chatSessions.sess_input?.items || [];
     expect(items).toHaveLength(1);
     const first = items[0];
     expect(first?.type).toBe('message');

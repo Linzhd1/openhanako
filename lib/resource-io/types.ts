@@ -17,6 +17,7 @@ export type ResourceDescriptor = ResourceRef & {
   provider?: string;
   filePath?: string;
   displayName?: string;
+  isDirectory?: boolean;
 };
 
 export type ResourceEventSource =
@@ -210,6 +211,7 @@ export type MaterializeResult = {
   resource: ResourceDescriptor;
   filePath: string;
   version?: ResourceVersion;
+  isDirectory?: boolean;
 };
 
 export type SessionFileResolution = {

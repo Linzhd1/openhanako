@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { t, autoSaveConfig } from '../../helpers';
-import { Toggle } from '../../widgets/Toggle';
+import { Toggle } from '@/ui';
 import { loadSettingsConfig } from '../../actions';
 import { SettingsSection } from '../../components/SettingsSection';
 import styles from '../../Settings.module.css';
@@ -104,7 +104,7 @@ export function SkillCapabilities({ installCfg }: SkillCapabilitiesProps) {
             />
           </div>
         )}
-        <p className={styles['settings-inline-note']} style={{ padding: 'var(--space-sm) var(--space-md)', margin: 0 }}>{t('settings.skills.learnHint')}</p>
+        <p className={styles['settings-inline-note']} style={{ padding: 'var(--space-8) var(--space-16)', margin: 0 }}>{t('settings.skills.learnHint')}</p>
       </SettingsSection>
 
       {showGithubWarning && (

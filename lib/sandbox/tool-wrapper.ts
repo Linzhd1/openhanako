@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import path from "path";
+import { canonicalFilesystemPathSync, filesystemIdentityKeySync } from "../../shared/link-aware-fs.ts";
 import { t } from "../i18n.ts";
 import { normalizeWin32ShellPath } from "./win32-path.ts";
 
@@ -18,12 +19,22 @@ interface SandboxOpts {
   getExternalReadPaths?: () => string[];
   checkManagedConfigWrite?: (absolutePath: string, operation: string) => { allowed: boolean; reason?: string } | undefined;
   fallbackTool?: any;
+  fallbackExec?: any;
+  /** Windows require_escalated 通道：跳过 SANDBOX_ONLY 分级拦截（HARD 分级任何模式都拦）。 */
+  escalated?: boolean;
 }
 
 /** 构造被拦截时返回给 LLM 的结果 */
 function blockedResult(reason) {
   return {
     content: [{ type: "text", text: t("sandbox.blocked", { reason }) }],
+  };
+}
+
+/** 构造 SANDBOX_ONLY 分级拦截时返回给 LLM 的结果：带 require_escalated 升级出口 */
+function blockedResultNeedsEscalation(reason) {
+  return {
+    content: [{ type: "text", text: t("sandbox.blockedNeedsEscalation", { reason }) }],
   };
 }
 
@@ -44,23 +55,20 @@ function toolPathParam(params) {
   return null;
 }
 
-function normalizeExistingOrResolvedPath(filePath) {
-  const resolved = path.resolve(filePath);
-  try { return fs.realpathSync(resolved); }
-  catch { return resolved; }
-}
-
+/** 两侧都必须是身份键。 */
 function isInsideRoot(filePath, root) {
   const rel = path.relative(root, filePath);
   return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 function externalReadGrantCovers(targetPath, grantPath) {
-  const target = normalizeExistingOrResolvedPath(targetPath);
-  const grant = normalizeExistingOrResolvedPath(grantPath);
+  // 判定是比较，走身份键；statSync 要落到真实路径，所以另留一份 canonical。
+  const target = filesystemIdentityKeySync(targetPath);
+  const grantPathCanonical = canonicalFilesystemPathSync(grantPath);
+  const grant = filesystemIdentityKeySync(grantPathCanonical);
   if (target === grant) return true;
   try {
-    return fs.statSync(grant).isDirectory() && isInsideRoot(target, grant);
+    return fs.statSync(grantPathCanonical).isDirectory() && isInsideRoot(target, grant);
   } catch {
     return false;
   }
@@ -119,7 +127,9 @@ const PREFLIGHT_UNIX: [RegExp, () => any][] = [
   [/\bchown\s/, () => t("sandbox.noChown")],
 ];
 
-const PREFLIGHT_WIN32: [RegExp, () => any][] = [
+// HARD：任何模式都拦，包括 require_escalated——这些是破坏性/权限提升类命令，
+// 升级通道放开的是"沙盒内无法运行的只读探测"，不是"绕过审查的破坏操作"。
+const PREFLIGHT_WIN32_HARD: [RegExp, () => any][] = [
   [/\bdel\s+\/s/i, () => t("sandbox.noDelRecursive")],
   [/\brmdir\s+\/s/i, () => t("sandbox.noRmdirRecursive")],
   [/\breg\s+(delete|add)\b/i, () => t("sandbox.noRegEdit")],
@@ -131,12 +141,13 @@ const PREFLIGHT_WIN32: [RegExp, () => any][] = [
   [/powershell.*-e(xecutionpolicy)?\s*(bypass|unrestricted)/i, () => t("sandbox.noPsExecutionBypass")],
   [/\bformat\s+[a-z]:/i, () => t("sandbox.noFormat")],
   [/\bbcdedit\b/i, () => t("sandbox.noBcdedit")],
-  [/\bwmic\b/i, () => t("sandbox.noWmic")],
 ];
 
-const PREFLIGHT_PATTERNS = process.platform === "win32"
-  ? [...PREFLIGHT_UNIX, ...PREFLIGHT_WIN32]
-  : PREFLIGHT_UNIX;
+// SANDBOX_ONLY：只在非 escalated 模式下拦截，且拦截文案给出 require_escalated 升级出口。
+// 仅覆盖"沙盒内因权限受限而失败，但本身是只读查询"的命令。
+const PREFLIGHT_WIN32_SANDBOX_ONLY: [RegExp, () => any][] = [
+  [/\bwmic\b/i, () => t("sandbox.noWmic")],
+];
 
 /**
  * 从 bash 命令中提取可能的文件路径（启发式）
@@ -357,6 +368,69 @@ function extractPathChecks(command, cwd) {
   return [...checks.values()];
 }
 
+export function checkCommandExecutionAccess(command, guard, cwd, opts: SandboxOpts = {}) {
+  const rawCommand = String(command || "");
+  let pathChecks = null;
+  if (cwd && typeof opts.checkManagedConfigWrite === "function") {
+    pathChecks = extractPathChecks(rawCommand, cwd);
+    for (const p of pathChecks) {
+      const managedConfigCheck = checkManagedConfigWrite(p.path, p.operation, opts);
+      if (!managedConfigCheck.allowed) {
+        return { blocked: blockedResult(managedConfigCheck.reason), sandboxDisabled: false };
+      }
+    }
+  }
+
+  if (opts.getSandboxEnabled && !opts.getSandboxEnabled()) {
+    return { blocked: null, sandboxDisabled: true };
+  }
+
+  const hardPatterns = process.platform === "win32"
+    ? [...PREFLIGHT_UNIX, ...PREFLIGHT_WIN32_HARD]
+    : PREFLIGHT_UNIX;
+  for (const [pattern, reasonFn] of hardPatterns) {
+    if (pattern.test(rawCommand)) {
+      return { blocked: blockedResult(reasonFn()), sandboxDisabled: false };
+    }
+  }
+
+  if (process.platform === "win32" && opts.escalated !== true) {
+    for (const [pattern, reasonFn] of PREFLIGHT_WIN32_SANDBOX_ONLY) {
+      if (pattern.test(rawCommand)) {
+        return { blocked: blockedResultNeedsEscalation(reasonFn()), sandboxDisabled: false };
+      }
+    }
+  }
+
+  if (guard && cwd) {
+    const paths = pathChecks || extractPathChecks(rawCommand, cwd);
+    for (const p of paths) {
+      if (shouldSkipCommandPathGuard(p.operation)) continue;
+      const result = checkWithExternalReadGrant(guard, p.path, p.operation, opts);
+      if (!result.allowed) {
+        return {
+          blocked: blockedResult(t("sandbox.restrictedPath", { path: p.rawPath })),
+          sandboxDisabled: false,
+        };
+      }
+    }
+  }
+
+  return { blocked: null, sandboxDisabled: false };
+}
+
+function blockedCommandError(result) {
+  const err: any = new Error(result?.content?.[0]?.text || "Command blocked");
+  err.hanaCommandBlockedResult = result;
+  return err;
+}
+
+function annotateSandboxWriteError(err) {
+  if (err?.message?.includes("Operation not permitted")) {
+    err.message += "\n\n" + t("sandbox.writeRestricted");
+  }
+}
+
 /**
  * 包装路径类工具（read, write, edit, grep, find, ls）
  *
@@ -416,44 +490,18 @@ export function wrapBashTool(tool, guard, cwd, opts: SandboxOpts = {}) {
   return {
     ...tool,
     execute: async (toolCallId, params, ...rest) => {
-      let pathChecks = null;
-      if (cwd && typeof opts.checkManagedConfigWrite === "function") {
-        pathChecks = extractPathChecks(params.command, cwd);
-        for (const p of pathChecks) {
-          const managedConfigCheck = checkManagedConfigWrite(p.path, p.operation, opts);
-          if (!managedConfigCheck.allowed) {
-            return blockedResult(managedConfigCheck.reason);
-          }
-        }
-      }
+      const access = checkCommandExecutionAccess(params?.command, guard, cwd, opts);
+      if (access.blocked) return access.blocked;
+      const targetTool = access.sandboxDisabled ? (opts.fallbackTool || tool) : tool;
 
       // 沙盒动态关闭 → 使用无 OS 沙盒的 bash 工具，跳过 preflight 和 PathGuard，
       // 保留产品级托管配置边界。
-      if (opts.getSandboxEnabled && !opts.getSandboxEnabled()) {
-        return (opts.fallbackTool || tool).execute(toolCallId, params, ...rest);
-      }
-
-      // preflight
-      for (const [pattern, reasonFn] of PREFLIGHT_PATTERNS) {
-        if (pattern.test(params.command)) {
-          return blockedResult(reasonFn());
-        }
-      }
-
-      // 路径校验：从命令中提取绝对路径，检查 PathGuard
-      if (guard && cwd) {
-        const paths = pathChecks || extractPathChecks(params.command, cwd);
-        for (const p of paths) {
-          if (shouldSkipCommandPathGuard(p.operation)) continue;
-          const result = checkWithExternalReadGrant(guard, p.path, p.operation, opts);
-          if (!result.allowed) {
-            return blockedResult(t("sandbox.restrictedPath", { path: p.rawPath }));
-          }
-        }
+      if (access.sandboxDisabled) {
+        return targetTool.execute(toolCallId, params, ...rest);
       }
 
       try {
-        const result = await tool.execute(toolCallId, params, ...rest);
+        const result = await targetTool.execute(toolCallId, params, ...rest);
 
         // 成功路径的错误翻译（exitCode 0 但 stderr 有 sandbox 拒绝）
         const text = result?.content?.[0]?.text;
@@ -465,11 +513,24 @@ export function wrapBashTool(tool, guard, cwd, opts: SandboxOpts = {}) {
       } catch (err) {
         // Pi SDK 对非零退出 throw Error，错误消息里包含 stderr 输出。
         // 如果是沙盒拦截导致的，追加友好提示。
-        if (err.message?.includes("Operation not permitted")) {
-          err.message += "\n\n" + t("sandbox.writeRestricted");
-        }
+        annotateSandboxWriteError(err);
         throw err;
       }
     },
+  };
+}
+
+export function wrapCommandExec(exec, guard, cwd, opts: SandboxOpts = {}) {
+  return async (command, execCwd, execOpts = {}) => {
+    const access = checkCommandExecutionAccess(command, guard, execCwd || cwd, opts);
+    if (access.blocked) throw blockedCommandError(access.blocked);
+
+    const targetExec = access.sandboxDisabled && opts.fallbackExec ? opts.fallbackExec : exec;
+    try {
+      return await targetExec(command, execCwd, execOpts);
+    } catch (err) {
+      annotateSandboxWriteError(err);
+      throw err;
+    }
   };
 }

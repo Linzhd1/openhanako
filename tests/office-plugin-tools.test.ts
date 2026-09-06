@@ -5,7 +5,7 @@ import path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ExcelJS from "exceljs";
 
-import { execute as readDocument } from "../plugins/office/tools/read-document.ts";
+import { execute as readDocument, parameters as readDocumentParameters } from "../plugins/office/tools/read-document.ts";
 import { execute as listCapabilities } from "../plugins/office/tools/list-capabilities.ts";
 import { renderHtmlToPdf } from "../plugins/office/lib/html-to-pdf.ts";
 import { isOfficeEnabledForAgentConfig } from "../plugins/office/lib/availability.ts";
@@ -91,6 +91,28 @@ describe("office plugin tools", () => {
     expect(isOfficeEnabledForAgentConfig({})).toBe(true);
     expect(isOfficeEnabledForAgentConfig({ tools: { disabled: [] } })).toBe(true);
     expect(isOfficeEnabledForAgentConfig({ tools: { disabled: ["office"] } })).toBe(false);
+  });
+
+  it("keeps read-document parameters compatible with Moonshot/Kimi root schema rules", () => {
+    expect(readDocumentParameters).toMatchObject({
+      type: "object",
+      properties: expect.objectContaining({
+        resource: expect.objectContaining({ type: "object" }),
+        filePath: expect.objectContaining({ type: "string" }),
+      }),
+    });
+    expect(readDocumentParameters).not.toHaveProperty("anyOf");
+    expect(readDocumentParameters).not.toHaveProperty("required");
+  });
+
+  it("validates missing read-document input at runtime", async () => {
+    const result = await readDocument({});
+
+    expect(result.content[0].text).toContain("office_read-document requires resource or filePath");
+    expect(result.details.error).toMatchObject({
+      code: "OFFICE_READ_FAILED",
+      message: "office_read-document requires resource or filePath",
+    });
   });
 
   it("reads xlsx workbooks as structured JSON", async () => {
@@ -255,8 +277,10 @@ describe("office plugin tools", () => {
   it("renders HTML to PDF through the desktop helper contract and stages the output", async () => {
     let observedCommand = null;
     let observedJob = null;
-    const fakeSpawn = vi.fn((command, args) => {
+    let observedSpawnOptions = null;
+    const fakeSpawn = vi.fn((command, args, options) => {
       observedCommand = { command, args };
+      observedSpawnOptions = options;
       const child: any = new EventEmitter();
       child.stdout = new EventEmitter();
       child.stderr = new EventEmitter();
@@ -275,6 +299,14 @@ describe("office plugin tools", () => {
       file: { fileId: "sf_pdf", sessionPath, filePath, label },
       mediaItem: { type: "session_file", fileId: "sf_pdf", sessionPath, filePath, label },
     }));
+    const rendererDist = path.join(tempDir, "active-renderer");
+    const helperEnv = {
+      HANA_DESKTOP_EXEC_PATH: "/Applications/HanaAgent.app/Contents/MacOS/HanaAgent",
+      HANA_DESKTOP_IS_PACKAGED: "1",
+      HANA_RENDERER_DIST: rendererDist,
+      ELECTRON_RUN_AS_NODE: "1",
+      OFFICE_TEST_MARKER: "preserved",
+    };
 
     const result = await renderHtmlToPdf(
       {
@@ -287,10 +319,7 @@ describe("office plugin tools", () => {
         stageFile,
       },
       {
-        env: {
-          HANA_DESKTOP_EXEC_PATH: "/Applications/HanaAgent.app/Contents/MacOS/HanaAgent",
-          HANA_DESKTOP_IS_PACKAGED: "1",
-        },
+        env: helperEnv,
         spawn: fakeSpawn,
       },
     );
@@ -299,6 +328,16 @@ describe("office plugin tools", () => {
       command: "/Applications/HanaAgent.app/Contents/MacOS/HanaAgent",
       args: ["--hana-office-html-to-pdf", expect.stringMatching(/job\.json$/)],
     });
+    expect(observedSpawnOptions).toMatchObject({
+      env: {
+        HANA_RENDERER_DIST: rendererDist,
+        OFFICE_TEST_MARKER: "preserved",
+      },
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(observedSpawnOptions.env).not.toHaveProperty("ELECTRON_RUN_AS_NODE");
+    expect(helperEnv.ELECTRON_RUN_AS_NODE).toBe("1");
     expect(fs.readFileSync(result.outputPath, "utf-8")).toContain("%PDF-1.4");
     expect(observedJob).toMatchObject({ embedHanaFonts: true });
     expect(stageFile).toHaveBeenCalledWith({

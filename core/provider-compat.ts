@@ -1,12 +1,12 @@
 /**
- * core/provider-compat.js — LLM HTTP payload 兼容层（唯一对外入口）
+ * core/provider-compat.ts — LLM HTTP payload 兼容层（唯一对外入口）
  *
  * 架构：dispatcher + 子模块。所有 provider-specific 补丁拆到 ./provider-compat/<name>.js。
  * 完整规范见 ./provider-compat/README.md。
  *
  * 两条调用路径共享本入口（commit f5b5d69 — chat 路径与 utility 路径合一的纪律）：
- *   - core/llm-client.js 的 callText（非流式 / utility 路径）
- *   - core/engine.js 的 Pi SDK before_provider_request 扩展（流式 / chat 路径）
+ *   - core/llm-client.ts 的 callText（非流式 / utility 路径）
+ *   - core/engine.ts 的 Pi SDK before_provider_request 扩展（流式 / chat 路径）
  *
  * 本文件只保留：
  *   1. dispatcher（按 matches 分发到子模块，first-match-wins）
@@ -19,19 +19,26 @@
  */
 
 import * as deepseek from "./provider-compat/deepseek.ts";
+import * as deepseekResponses from "./provider-compat/deepseek-responses.ts";
 import * as kimi from "./provider-compat/kimi.ts";
 import * as mimo from "./provider-compat/mimo.ts";
 import * as qwen from "./provider-compat/qwen.ts";
 import * as zhipu from "./provider-compat/zhipu.ts";
 import * as volcengine from "./provider-compat/volcengine.ts";
+import * as longcat from "./provider-compat/longcat.ts";
 import * as agnes from "./provider-compat/agnes.ts";
 import * as openaiInputAudio from "./provider-compat/openai-input-audio.ts";
 import * as openaiVideoUrl from "./provider-compat/openai-video-url.ts";
 import * as openrouter from "./provider-compat/openrouter.ts";
 import * as anthropic from "./provider-compat/anthropic.ts";
+import * as codexResponses from "./provider-compat/codex-responses.ts";
 import { normalizeImplicitOutputBudget } from "./provider-compat/output-budget.ts";
 import { stripOrphanToolResults } from "./provider-compat/tool-pairing.ts";
 import { normalizeOpenAIInputAudioPayload } from "./provider-compat/input-audio.ts";
+import {
+  normalizeReasoningReplayContextMessages,
+  normalizeReasoningReplayPayload,
+} from "./provider-compat/reasoning-content-replay.ts";
 import {
   MODEL_AUDIO_TRANSPORTS,
   resolveModelAudioInputTransport,
@@ -40,7 +47,10 @@ import {
   getReasoningProfile as getDeclaredReasoningProfile,
   getThinkingFormat as getDeclaredThinkingFormat,
 } from "../shared/model-capabilities.ts";
-import { normalizeRequestThinkingLevel } from "./session-thinking-level.ts";
+import {
+  normalizeRequestThinkingLevel,
+  normalizeThinkingLevelForModel,
+} from "./session-thinking-level.ts";
 
 interface ProviderModule {
   matches(model: any): boolean;
@@ -53,17 +63,22 @@ interface ProviderModule {
  * 新 provider 默认加在末尾；只有当模块的 matches 是另一模块子集（更具体规则）时才前置。
  */
 const PROVIDER_MODULES: ProviderModule[] = [
+  // deepseekResponses 前置于 deepseek：同一批 DeepSeek 官方 endpoint 上，Responses
+  // 协议是更具体的子集，落到 deepseek 会被按 ChatCompletions 语义改写。
+  deepseekResponses,
   deepseek,
   kimi,
   mimo,
   qwen,
   zhipu,
   volcengine,
+  longcat,
   agnes,
   openaiInputAudio,
   openaiVideoUrl,
   openrouter,
   anthropic,
+  codexResponses,
 ];
 
 function lower(value) {
@@ -96,6 +111,7 @@ export function getThinkingFormat(model) {
   if (isDeepSeekModel(model)) return "deepseek";
   if (zhipu.matches(model)) return "zhipu";
   if (volcengine.matches(model)) return "volcengine";
+  if (longcat.matches(model)) return "longcat";
   return null;
 }
 
@@ -126,6 +142,7 @@ function stripIncompatibleThinking(payload, model) {
     || thinkingFormat === "zhipu"
     || thinkingFormat === "kimi"
     || thinkingFormat === "volcengine"
+    || thinkingFormat === "longcat"
   ) return payload;
   const { thinking, ...rest } = payload;
   return rest;
@@ -144,17 +161,21 @@ function stripDisabledReasoningEffort(payload) {
   return rest;
 }
 
-function normalizeAutoReasoningEffort(payload) {
+function normalizeAutoReasoningEffort(payload, model) {
   if (!Object.prototype.hasOwnProperty.call(payload, "reasoning_effort")) return payload;
   if (lower(payload.reasoning_effort) !== "auto") return payload;
-  return { ...payload, reasoning_effort: "medium" };
+  return { ...payload, reasoning_effort: normalizeThinkingLevelForModel("auto", model) };
 }
 
-function normalizeProviderOptions(options: Record<string, any> = {}) {
+function normalizeProviderOptions(options: Record<string, any> = {}, model = null) {
   if (!Object.prototype.hasOwnProperty.call(options, "reasoningLevel")) return options;
+  const rawLevel = options.reasoningLevel;
+  const normalizedLevel = lower(rawLevel) === "auto"
+    ? normalizeThinkingLevelForModel("auto", model)
+    : normalizeThinkingLevelForModel(normalizeRequestThinkingLevel(rawLevel, "off"), model);
   return {
     ...options,
-    reasoningLevel: normalizeRequestThinkingLevel(options.reasoningLevel, "off"),
+    reasoningLevel: normalizedLevel,
   };
 }
 
@@ -162,7 +183,7 @@ function normalizeProviderOptions(options: Record<string, any> = {}) {
  * 孤儿 toolResult 配对兜底（issue #1285，provider-agnostic）。
  * 删除「父 tool_calls 已被 SDK transform-messages 丢弃的孤儿 role:"tool"」，
  * 使每个 role:"tool" 都有前驱带匹配 tool_calls 的 assistant，避免 OpenAI-compatible
- * provider 返回 400。逻辑与删除条件见 ./provider-compat/tool-pairing.js。
+ * provider 返回 400。逻辑与删除条件见 ./provider-compat/tool-pairing.ts。
  */
 function stripOrphanToolMessages(payload) {
   if (!Array.isArray(payload.messages)) return payload;
@@ -247,6 +268,72 @@ function normalizeAudioTransportPayload(payload, model) {
   return payload;
 }
 
+function isToolResultMessage(message) {
+  return message?.role === "toolResult";
+}
+
+function resourceMetadataValue(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value : "(none)";
+}
+
+function formatEmbeddedResourceText(resource, body) {
+  return [
+    "[embedded resource]",
+    `uri: ${resourceMetadataValue(resource?.uri)}`,
+    `name: ${resourceMetadataValue(resource?.name)}`,
+    `mimeType: ${resourceMetadataValue(resource?.mimeType)}`,
+    "",
+    body,
+  ].join("\n");
+}
+
+function projectResourceBlockToText(block) {
+  if (!block || typeof block !== "object" || block.type !== "resource") {
+    return { block, changed: false };
+  }
+  const resource = block.resource && typeof block.resource === "object"
+    ? block.resource
+    : null;
+  if (typeof resource?.text === "string") {
+    return {
+      block: {
+        type: "text",
+        text: formatEmbeddedResourceText(resource, `content:\n${resource.text}`),
+      },
+      changed: true,
+    };
+  }
+  const reason = typeof resource?.blob === "string"
+    ? "content: [binary resource omitted; no model-visible text was provided]"
+    : "content: [resource has no text content]";
+  return {
+    block: {
+      type: "text",
+      text: formatEmbeddedResourceText(resource, reason),
+    },
+    changed: true,
+  };
+}
+
+function projectToolResultResourcesForModel(messages) {
+  let changed = false;
+  const nextMessages = messages.map((message) => {
+    if (!isToolResultMessage(message) || !Array.isArray(message?.content)) {
+      return message;
+    }
+    let contentChanged = false;
+    const nextContent = message.content.map((block) => {
+      const projected = projectResourceBlockToText(block);
+      if (projected.changed) contentChanged = true;
+      return projected.block;
+    });
+    if (!contentChanged) return message;
+    changed = true;
+    return { ...message, content: nextContent };
+  });
+  return changed ? nextMessages : messages;
+}
+
 /**
  * Provider payload 兼容化的唯一入口。chat 路径与 utility 路径共享。
  *
@@ -262,22 +349,25 @@ function normalizeAudioTransportPayload(payload, model) {
 export function normalizeProviderPayload(payload, model, options = {}) {
   if (!payload || typeof payload !== "object") return payload;
 
-  const normalizedOptions = normalizeProviderOptions(options);
+  const normalizedOptions = normalizeProviderOptions(options, model);
   let result = payload;
 
   // 1. 通用补丁（与 provider 无关）
   result = stripEmptyTools(result);
   result = stripIncompatibleThinking(result, model);
+  result = normalizeAutoReasoningEffort(result, model);
   result = stripDisabledReasoningEffort(result);
-  result = normalizeAutoReasoningEffort(result);
   // 孤儿 toolResult 配对兜底先于 provider 子模块：保证子模块（如 deepseek 的
   // reasoning_content 校验）拿到的是已配对的 messages，不会被孤儿干扰。
   result = stripOrphanToolMessages(result);
   result = normalizeImplicitOutputBudget(result, model, normalizedOptions);
   result = stripNativeMediaAttachmentMarkers(result);
   result = normalizeAudioTransportPayload(result, model);
+  // 先把 SDK 尚未序列化的 signed thinking block 投影成 wire carrier。
+  // 部分 provider 模块随后会把 assistant.content 归一化为字符串。
+  result = normalizeReasoningReplayPayload(result, model, normalizedOptions);
 
-  // 2. Provider-specific 补丁（按 matches 分发，first-match-wins）
+  // 2. Provider-specific 请求控制（按 matches 分发，first-match-wins）
   for (const mod of PROVIDER_MODULES) {
     if (mod.matches(model)) {
       result = mod.apply(result, model, normalizedOptions);
@@ -285,12 +375,17 @@ export function normalizeProviderPayload(payload, model, options = {}) {
     }
   }
 
+  // 3. reasoning replay 是协议级契约，不归任何单个 provider 模块所有。
+  // 子模块决定本轮 thinking 开关后，中心层再校验最终请求状态。
+  result = normalizeReasoningReplayPayload(result, model, normalizedOptions);
+
   return result;
 }
 
 /**
  * Provider context 兼容化入口。运行于 Pi SDK context hook，早于 provider
- * serializer，专门承载 replay/history 这类 payload hook 已经来不及处理的协议校验。
+ * serializer，承载 replay/history 这类 payload hook 已经来不及处理的协议校验，
+ * 以及只影响模型可见副本的 provider-agnostic content projection。
  *
  * @param {Array|any} messages — Pi SDK AgentMessage[]
  * @param {object|null|undefined} model
@@ -300,15 +395,17 @@ export function normalizeProviderPayload(payload, model, options = {}) {
 export function normalizeProviderContextMessages(messages, model, options = {}) {
   if (!Array.isArray(messages)) return messages;
 
-  const normalizedOptions = normalizeProviderOptions(options);
+  const normalizedOptions = normalizeProviderOptions(options, model);
+  let result = projectToolResultResourcesForModel(messages);
+  result = normalizeReasoningReplayContextMessages(result, model, normalizedOptions);
   for (const mod of PROVIDER_MODULES) {
     if (mod.matches(model)) {
       if (typeof mod.normalizeContextMessages === "function") {
-        return mod.normalizeContextMessages(messages, model, normalizedOptions);
+        return mod.normalizeContextMessages(result, model, normalizedOptions);
       }
       break;
     }
   }
 
-  return messages;
+  return result;
 }

@@ -131,9 +131,9 @@ export function handleAppEvent(type: string, data: any = {}, options: AppEventOp
       });
       loadChannels();
 
-      // Reload models and reset thinking level
+      // Reload models. Keep the current non-legacy UI value until the session
+      // switch/model-default response installs the target Agent's level.
       loadModels();
-      useStore.setState({ thinkingLevel: 'auto' });
 
       // Reload automation count and clear activities
       hanaFetch('/api/desk/cron').then(r => r.json()).then((d: any) => {
@@ -246,6 +246,11 @@ export function handleAppEvent(type: string, data: any = {}, options: AppEventOp
     case 'chat-layout-changed':
       applyChatLayout(data.chat ?? data);
       break;
+    case 'experiment-changed':
+      window.dispatchEvent(new CustomEvent('hana-settings', {
+        detail: { type: 'experiment-changed', id: data.id, value: data.value },
+      }));
+      break;
     case 'network-proxy-changed':
       if (options.source === 'server') {
         window.platform?.settingsChanged?.('network-proxy-changed', data);
@@ -258,6 +263,9 @@ export function handleAppEvent(type: string, data: any = {}, options: AppEventOp
       break;
     case 'paper-texture-changed':
       window.setPaperTexture(data.enabled);
+      break;
+    case 'sidebar-ui-changed':
+      useStore.getState().applySidebarUiPrefs(data);
       break;
     case 'leaves-overlay-changed':
       window.dispatchEvent(new CustomEvent('hana-settings', {

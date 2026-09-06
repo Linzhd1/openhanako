@@ -78,6 +78,36 @@ export function buildExternalPackage(
   };
 }
 
+function packageNameFromBareSpecifier(specifier) {
+  if (
+    typeof specifier !== "string"
+    || specifier.length === 0
+    || specifier.startsWith(".")
+    || specifier.startsWith("/")
+    || specifier.startsWith("node:")
+  ) {
+    return null;
+  }
+
+  const parts = specifier.split("/");
+  if (specifier.startsWith("@")) {
+    if (parts.length < 2) return null;
+    return `${parts[0]}/${parts[1]}`;
+  }
+  return parts[0];
+}
+
+export function collectBareImportPackageNames(source) {
+  const packages = new Set();
+  const importPattern = /^\s*import\s+(?:[^'"\n]*?\s+from\s+)?["']([^"']+)["']/gm;
+  let match;
+  while ((match = importPattern.exec(source)) !== null) {
+    const packageName = packageNameFromBareSpecifier(match[1]);
+    if (packageName) packages.add(packageName);
+  }
+  return [...packages].sort();
+}
+
 export function collectInstalledOptionalDependencyDirs(nmDir, packageNames) {
   const dirs = [];
 
@@ -135,6 +165,34 @@ export function buildBetterSqliteRuntimeSmokeScript() {
     "  db.close();",
     "}",
     "console.log('[build-server] better-sqlite3 runtime smoke passed');",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Unlike the two smokes above, this one goes through a dynamic `import()`
+ * rather than createRequire, because that is how the packaged server reaches
+ * this package: the bundle keeps it external and imports it lazily, so the
+ * ESM-importing-CJS interop is part of what needs to hold. Both export shapes
+ * are accepted for the same reason the runtime loader accepts both.
+ *
+ * The assertion deliberately stops at "a real conversion produced the source
+ * values" instead of matching the exact table layout — the layout belongs to
+ * the upstream Markdown serializer, and pinning it here would turn a harmless
+ * upstream formatting change into a failed build.
+ */
+export function buildAnydocRuntimeSmokeScript() {
+  return [
+    "const mod = await import('@firecrawl/anydoc');",
+    "const api = mod && typeof mod.toMarkdownBytes === 'function' ? mod : mod?.default;",
+    "if (typeof api?.toMarkdownBytes !== 'function') {",
+    "  throw new Error('@firecrawl/anydoc runtime smoke failed: toMarkdownBytes is not callable');",
+    "}",
+    "const markdown = await api.toMarkdownBytes(Buffer.from('a,b\\n1,2'), 'csv');",
+    "if (typeof markdown !== 'string' || !markdown.includes('1') || !markdown.includes('2')) {",
+    "  throw new Error(`@firecrawl/anydoc runtime smoke failed: ${JSON.stringify(markdown)}`);",
+    "}",
+    "console.log('[build-server] @firecrawl/anydoc runtime smoke passed');",
     "",
   ].join("\n");
 }

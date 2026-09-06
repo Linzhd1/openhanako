@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Collapse, SelectWidget, type SelectOption } from '@/ui';
+import {
+  Collapse,
+  ProviderGroupHeader,
+  SelectWidget,
+  selectWidgetStyles,
+  type SelectOption,
+} from '@/ui';
 import { useStore } from '../../stores';
 import { resolveAgentDisplayInfo } from '../../utils/agent-display';
 import type { CronJob, ModelOption } from './automation-types';
@@ -148,7 +154,7 @@ export function AutomationCard({
           <div className={styles.fieldGrid}>
             <label className={styles.field}>
               <span>{t('automation.field.label')}</span>
-              <input value={label} onChange={e => setLabel(e.target.value)} />
+              <input value={label} onChange={e => setLabel(e.target.value)} spellCheck={false} />
             </label>
           </div>
           <ScheduleEditor draft={scheduleDraft} onChange={updateScheduleDraft} />
@@ -159,6 +165,7 @@ export function AutomationCard({
                 value={prompt}
                 onChange={e => setPrompt(e.target.value)}
                 placeholder={t('automation.promptPlaceholder', { agent: agentInfo.displayName })}
+                spellCheck={false}
               />
             </label>
           ) : null}
@@ -171,10 +178,13 @@ export function AutomationCard({
                   ...modelOptions.map((option): SelectOption => ({
                     value: `${option.provider}/${option.id}`,
                     label: option.name || option.id,
+                    group: option.provider,
                   })),
                 ]}
                 value={model}
                 onChange={setModel}
+                renderGroupHeader={provider => <ProviderGroupHeader provider={provider} />}
+                popupClassName={selectWidgetStyles.providerInset}
               />
             </label>
           ) : null}

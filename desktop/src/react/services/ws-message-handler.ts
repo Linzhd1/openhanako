@@ -22,6 +22,7 @@ import {
   upsertConversationAgentActivity as upsertConversationAgentActivityAction,
 } from '../stores/channel-actions';
 import { showError } from '../utils/ui-helpers';
+import { errorWithCode, presentError } from '../errors/error-presenter';
 import { handleAppEvent } from './app-event-actions';
 import {
   PREVIEW_DOCUMENT_CHANGE_REFRESH_OPTIONS,
@@ -61,9 +62,39 @@ function sessionIdentityFromMessage(msg: any): { sessionId: string | null; sessi
   };
 }
 
-function rememberSessionLocatorFromMessage(msg: any): void {
+function rememberSessionLocatorFromMessage(msg: any): boolean {
   const { sessionId, sessionPath } = sessionIdentityFromMessage(msg);
-  if (!sessionId || !sessionPath) return;
+  if (!sessionId || !sessionPath) return true;
+  if (
+    msg?.type === 'compaction_accepted'
+    || msg?.type === 'compaction_result'
+    || msg?.type === 'compaction_start'
+    || msg?.type === 'compaction_end'
+  ) {
+    // Compaction path is transport metadata only. Identity routing uses sessionId,
+    // and this event family must never mutate the locator truth maintained by the
+    // sessions projection / manifest boundary.
+    return true;
+  }
+  const snapshot = useStore.getState();
+  const knownLocatorPath = snapshot.sessionLocatorsById?.[sessionId]?.path || null;
+  const authoritativeLocatorUpdate = msg?.type === 'session_created';
+  if (knownLocatorPath && knownLocatorPath !== sessionPath && !authoritativeLocatorUpdate) {
+    console.warn('[ws] session locator mismatch; dropping non-authoritative event', {
+      sessionId,
+      sessionPath,
+      knownLocatorPath,
+    });
+    return false;
+  }
+  const knownPathSessionId = snapshot.sessions.find((session: any) => session?.path === sessionPath)?.sessionId
+    || (snapshot.currentSessionPath === sessionPath ? snapshot.currentSessionId : null)
+    || Object.entries(snapshot.sessionLocatorsById || {}).find(([, locator]: any) => locator?.path === sessionPath)?.[0]
+    || null;
+  if (knownPathSessionId && knownPathSessionId !== sessionId) {
+    console.warn('[ws] session identity mismatch; dropping event', { sessionId, sessionPath, knownPathSessionId });
+    return false;
+  }
   useStore.setState((state: any) => {
     const currentLocator = state.sessionLocatorsById?.[sessionId] || null;
     const patch: Record<string, any> = {};
@@ -78,12 +109,16 @@ function rememberSessionLocatorFromMessage(msg: any): void {
     }
     return Object.keys(patch).length ? patch : {};
   });
+  return true;
 }
 
 function isFocusedSessionMessage(msg: any): boolean {
   const { sessionId, sessionPath } = sessionIdentityFromMessage(msg);
   if (!sessionId && !sessionPath) return true;
   const state = useStore.getState();
+  if (sessionId && sessionPath) {
+    return state.currentSessionPath === sessionPath && state.currentSessionId === sessionId;
+  }
   return (!!sessionPath && state.currentSessionPath === sessionPath)
     || (!!sessionId && state.currentSessionId === sessionId);
 }
@@ -241,27 +276,103 @@ function requestInputFocusForCurrentSession(sessionPath: string | null): void {
   const state = useStore.getState();
   if (state.pendingNewSession) return;
   if (state.currentSessionPath !== sessionPath) return;
-  state.requestInputFocus?.();
+  state.requestInputFocus?.('restore');
 }
 
-function applyCompactionLifecycle(msg: any): void {
-  const sp = msg.sessionPath;
-  if (!sp) return;
+function applyTurnEndSideEffects(msg: any): void {
+  scheduleSessionsRefresh('turn_end');
+  const turnSp = msg.sessionPath;
+  if (turnSp) {
+    requestContextUsage(turnSp);
+  } else {
+    console.warn('[ws] turn_end missing sessionPath, skipping context_usage request');
+  }
+}
 
-  if (msg.type === 'compaction_start') {
-    useStore.getState().addCompactingSession(sp);
+function compactionIdentity(msg: any): { key: string | null; sessionId: string | null; sessionPath: string | null } {
+  const { sessionId, sessionPath } = sessionIdentityFromMessage(msg);
+  return { key: sessionId || sessionPath, sessionId, sessionPath };
+}
+
+function setCompactionBusy(msg: any, busy: boolean): void {
+  const { key, sessionId, sessionPath } = compactionIdentity(msg);
+  if (!key) return;
+  useStore.setState((state: any) => {
+    const compactingSessions = state.compactingSessions || [];
+    const wasBusy = compactingSessions.some((item: string) => (
+      item === key || item === sessionId || item === sessionPath
+    ));
+    const withoutIdentity = compactingSessions.filter((item: string) => (
+      item !== key && item !== sessionId && item !== sessionPath
+    ));
+    const compactionModeBySession = { ...(state.compactionModeBySession || {}) };
+    const priorMode = wasBusy
+      ? compactionModeBySession[key]
+        || (sessionId ? compactionModeBySession[sessionId] : null)
+        || (sessionPath ? compactionModeBySession[sessionPath] : null)
+      : null;
+    const incomingMode = typeof msg.mode === 'string' && msg.mode.trim()
+      ? msg.mode.trim()
+      : null;
+    delete compactionModeBySession[key];
+    if (sessionId) delete compactionModeBySession[sessionId];
+    if (sessionPath) delete compactionModeBySession[sessionPath];
+    if (busy && (incomingMode || priorMode)) {
+      compactionModeBySession[key] = incomingMode || priorMode;
+    }
+    return {
+      compactingSessions: busy ? [...withoutIdentity, key] : withoutIdentity,
+      compactionModeBySession,
+    };
+  });
+}
+
+function updateCompactionContext(msg: any): void {
+  const { key, sessionId, sessionPath } = compactionIdentity(msg);
+  if (!key) return;
+  useStore.setState((state: any) => {
+    const existing = state.contextBySession?.[key]
+      || (sessionPath ? sessionScopedValue(state, state.contextBySession, sessionPath) : null);
+    const value = {
+      tokens: msg.tokens ?? null,
+      window: msg.contextWindow ?? existing?.window ?? null,
+      percent: msg.percent ?? null,
+    };
+    const contextBySession = { ...(state.contextBySession || {}), [key]: value };
+    if (sessionId && sessionPath && sessionId !== sessionPath) delete contextBySession[sessionPath];
+    const focused = (sessionId && state.currentSessionId === sessionId)
+      || (!sessionId && sessionPath && state.currentSessionPath === sessionPath);
+    return {
+      contextBySession,
+      ...(focused ? {
+        contextTokens: value.tokens,
+        contextWindow: value.window,
+        contextPercent: value.percent,
+      } : {}),
+    };
+  });
+}
+
+function applyCompactionMessage(msg: any): void {
+  if (msg.type === 'compaction_accepted' || msg.type === 'compaction_start') {
+    setCompactionBusy(msg, true);
     return;
   }
+  if (msg.type === 'compaction_end') {
+    setCompactionBusy(msg, false);
+    updateCompactionContext(msg);
+    return;
+  }
+  if (msg.type !== 'compaction_result') return;
 
-  if (msg.type !== 'compaction_end') return;
-
-  useStore.getState().removeCompactingSession(sp);
-  const existingWindow = sessionScopedValue(useStore.getState(), useStore.getState().contextBySession, sp)?.window ?? null;
-  const window = msg.contextWindow ?? existingWindow;
-  updateKeyed('contextBySession', sp,
-    { tokens: msg.tokens ?? null, window, percent: msg.percent ?? null },
-    (_s, d) => ({ contextTokens: d.tokens, contextWindow: d.window, contextPercent: d.percent }),
-  );
+  setCompactionBusy(msg, false);
+  if (msg.status === 'noop' || msg.status === 'failed') {
+    const message = nonEmptyString(msg.message)
+      || (msg.status === 'noop' ? 'Nothing to compact' : 'Compaction failed');
+    useStore.getState().addToast(message, msg.status === 'noop' ? 'info' : 'error', 6000, {
+      dedupeKey: `compaction-result:${msg.sessionId || msg.sessionPath || 'unknown'}:${msg.status}`,
+    });
+  }
 }
 
 export function applyStreamingStatus(
@@ -404,7 +515,7 @@ function applyInputSessionConfirmationBlock(msg: any): void {
 // ── 消息分发（大 switch） ──
 
 export function handleServerMessage(msg: any): void {
-  rememberSessionLocatorFromMessage(msg);
+  if (!rememberSessionLocatorFromMessage(msg)) return;
   const state = useStore.getState();
 
   const rebuildingFor = isStreamResumeRebuilding();
@@ -427,8 +538,14 @@ export function handleServerMessage(msg: any): void {
     if (!updateSessionStreamMeta(msg)) return;
   }
 
-  if (msg.type === 'compaction_start' || msg.type === 'compaction_end') {
-    applyCompactionLifecycle(msg);
+  if (
+    msg.type === 'compaction_accepted'
+    || msg.type === 'compaction_result'
+    || msg.type === 'compaction_start'
+    || msg.type === 'compaction_end'
+  ) {
+    applyCompactionMessage(msg);
+    if (msg.type === 'compaction_accepted' || msg.type === 'compaction_result') return;
   }
 
   applyInputSessionConfirmationBlock(msg);
@@ -438,6 +555,9 @@ export function handleServerMessage(msg: any): void {
   if (REACT_CHAT_EVENTS.has(msg.type) && msg.sessionPath && msg.sessionPath !== state.currentSessionPath) {
     if (isKnownChatSession(msg.sessionPath, state)) {
       streamBufferManager.handle(msg);
+    }
+    if (msg.type === 'turn_end') {
+      applyTurnEndSideEffects(msg);
     }
     dispatchStreamKey(msg.sessionPath, msg);
     applyTodoToolEnd(msg);
@@ -451,14 +571,7 @@ export function handleServerMessage(msg: any): void {
     streamBufferManager.handle(msg);
     // turn_end 后仍需执行部分通用逻辑（loadSessions、context_usage）
     if (msg.type === 'turn_end') {
-      scheduleSessionsRefresh('turn_end');
-      const turnSp = msg.sessionPath;
-      if (turnSp) {
-        requestContextUsage(turnSp);
-        requestInputFocusForCurrentSession(turnSp);
-      } else {
-        console.warn('[ws] turn_end missing sessionPath, skipping context_usage request');
-      }
+      applyTurnEndSideEffects(msg);
     }
     // tool_end 后更新 todo（兼容新旧工具名 + 新旧格式）
     applyTodoToolEnd(msg);
@@ -495,13 +608,28 @@ export function handleServerMessage(msg: any): void {
     }
     case 'session_branch_reset': {
       const sp = msg.sessionPath;
-      const targetId = msg.clientMessageId || msg.messageId;
-      if (!sp || !targetId) { console.warn('[ws] session_branch_reset missing sessionPath or message id'); break; }
-      const truncated = useStore.getState().truncateSessionFromMessage(sp, targetId);
+      const targetIds = [...new Set([msg.clientMessageId, msg.messageId, msg.projectionMessageId]
+        .filter((id): id is string => typeof id === 'string' && !!id))];
+      if (!sp || targetIds.length === 0) { console.warn('[ws] session_branch_reset missing sessionPath or message id'); break; }
+      let truncated = false;
+      for (const targetId of targetIds) {
+        if (useStore.getState().truncateSessionFromMessage(sp, targetId)) {
+          truncated = true;
+          break;
+        }
+      }
       bumpMessageLiveVersion(sp);
       if (!truncated) {
-        console.warn('[ws] session_branch_reset target message not found:', sp, targetId);
+        console.warn('[ws] session_branch_reset target message not found:', sp, targetIds);
       }
+      if (Array.isArray(msg.todos)) {
+        useStore.getState().setSessionTodosForPath(sp, msg.todos);
+        useStore.getState().bumpTodosLiveVersion(sp);
+      }
+      useStore.getState().applyBranchResetSessionFiles(
+        sp,
+        Array.isArray(msg.sessionFiles) ? msg.sessionFiles : null,
+      );
       break;
     }
 
@@ -543,7 +671,10 @@ export function handleServerMessage(msg: any): void {
           : prev?.thumbnailUrl ?? null
         : null;
       const thumbnailFresh = bRunning && hasFreshThumbnail;
-      setBrowserStateForPath(bsp, { running: bRunning, url: bUrl, thumbnail: bThumbnail, thumbnailCapturedAt, thumbnailUrl, thumbnailFresh });
+      // 卡片的"收起"是用户意图，状态更新不该把它抹掉；只有浏览器重新启用（running false→true）
+      // 才算新一轮会话，卡片回归。
+      const collapsed = bRunning && !prev?.running ? false : (prev?.collapsed ?? false);
+      setBrowserStateForPath(bsp, { running: bRunning, url: bUrl, thumbnail: bThumbnail, thumbnailCapturedAt, thumbnailUrl, thumbnailFresh, collapsed });
       break;
     }
 
@@ -648,6 +779,31 @@ export function handleServerMessage(msg: any): void {
       }
       break;
 
+    case 'agent_review_status': {
+      const sp = nonEmptyString(msg.sessionPath);
+      const requestId = nonEmptyString(msg.requestId);
+      if (!sp || !requestId) break;
+      const session = sessionScopedValue(useStore.getState(), useStore.getState().chatSessions, sp);
+      const item = session?.items.find((candidate: any) => (
+        candidate.type === 'message' && candidate.data.role === 'user' && candidate.data.id === requestId
+      ));
+      if (!item || item.type !== 'message') break;
+      useStore.getState().appendOptimisticUserMessage(sp, {
+        ...item.data,
+        agentReview: {
+          requestId,
+          status: msg.status,
+          reviewedSessionId: msg.reviewedSessionId ?? null,
+          reviewerSessionId: msg.reviewerSessionId ?? null,
+          reviewerAgentId: msg.reviewerAgentId,
+          reviewerAgentName: msg.reviewerAgentName,
+          text: msg.result ?? item.data.agentReview?.text ?? null,
+          error: msg.error ?? null,
+        },
+      });
+      break;
+    }
+
     case 'session_user_message': {
       const sp = msg.sessionPath;
       if (!sp || !msg.message) break;
@@ -679,7 +835,12 @@ export function handleServerMessage(msg: any): void {
         attachments: msg.message.attachments,
         quotedText: msg.message.quotedText,
         skills: msg.message.skills,
+        sessionRefs: msg.message.sessionRefs ?? undefined,
+        agentMentions: msg.message.agentMentions ?? undefined,
+        agentReview: msg.message.agentReview ?? undefined,
+        agentReviewRequest: msg.message.agentReviewRequest ?? undefined,
         deskContext: msg.message.deskContext ?? undefined,
+        origin: msg.message.origin ?? undefined,
       };
       if (clientMessageId && useStore.getState().confirmOptimisticUserMessage(sp, clientMessageId, data)) {
         bumpMessageLiveVersion(sp);
@@ -738,8 +899,9 @@ export function handleServerMessage(msg: any): void {
       const metadata = msg.metadata && typeof msg.metadata === 'object' ? msg.metadata : {};
       if (!sp) { console.warn('[ws] event missing sessionPath:', msg.type); break; }
       const hasPinnedAt = Object.prototype.hasOwnProperty.call(metadata, 'pinnedAt');
+      const hasPinOrder = Object.prototype.hasOwnProperty.call(metadata, 'pinOrder');
       const hasProjectId = Object.prototype.hasOwnProperty.call(metadata, 'projectId');
-      if (hasPinnedAt || hasProjectId) {
+      if (hasPinnedAt || hasPinOrder || hasProjectId) {
         useStore.setState((s) => ({
           sessions: s.sessions.map((session) => {
             if (session.path !== sp && (!sid || session.sessionId !== sid)) return session;
@@ -747,6 +909,9 @@ export function handleServerMessage(msg: any): void {
               ...session,
               ...(hasPinnedAt
                 ? { pinnedAt: typeof metadata.pinnedAt === 'string' ? metadata.pinnedAt : null }
+                : {}),
+              ...(hasPinOrder
+                ? { pinOrder: typeof metadata.pinOrder === 'number' ? metadata.pinOrder : null }
                 : {}),
               ...(hasProjectId
                 ? { projectId: typeof metadata.projectId === 'string' && metadata.projectId.trim() ? metadata.projectId.trim() : null }
@@ -757,9 +922,6 @@ export function handleServerMessage(msg: any): void {
       }
       if (sp === useStore.getState().currentSessionPath && typeof metadata.thinkingLevel === 'string') {
         useStore.getState().setThinkingLevel(metadata.thinkingLevel);
-      }
-      if (Object.prototype.hasOwnProperty.call(metadata, 'capabilityDrift')) {
-        useStore.getState().setSessionCapabilityDrift(sp, metadata.capabilityDrift || null);
       }
       break;
     }
@@ -863,9 +1025,26 @@ export function handleServerMessage(msg: any): void {
     }
 
     case 'error': {
-      const sp = msg.sessionPath;
-      if (!sp) { console.warn('[ws] event missing sessionPath:', msg.type); break; }
-      useStore.getState().setInlineError(sp, msg.message);
+      const { sessionPath: sp } = sessionIdentityFromMessage(msg);
+      const presented = presentError(errorWithCode(
+        String(msg.message ?? ''),
+        typeof msg.code === 'string' ? msg.code : null,
+      ));
+      if (!sp) {
+        // 身份类错误本身就说明没有会话可以挂靠，落不到 inline 位，只能弹 toast。
+        // internal_contract 同理：服务端认定调用方没带身份，用户看不到就等于故障消失了。
+        if (
+          msg.code === 'session_identity_unresolved'
+          || msg.code === 'session_identity_mismatch'
+          || msg.code === 'internal_contract'
+        ) {
+          useStore.getState().addToast(presented.text, 'error', 6000, { errorCode: msg.code });
+        } else {
+          console.warn('[ws] event missing sessionPath:', msg.type);
+        }
+        break;
+      }
+      useStore.getState().setInlineError(sp, presented);
       break;
     }
 
@@ -927,6 +1106,16 @@ export function handleServerMessage(msg: any): void {
       break;
     }
 
+    case 'abort_result': {
+      if (msg.status !== 'already_stopped') break;
+      const sp = msg.sessionPath || null;
+      const sid = typeof msg.sessionId === 'string' && msg.sessionId.trim() ? msg.sessionId.trim() : null;
+      const streamId = typeof msg.streamId === 'string' && msg.streamId.trim() ? msg.streamId.trim() : null;
+      const applied = applyStreamingStatus(false, sp, { streamId }, { force: !streamId });
+      if (sp && applied) streamBufferManager.finishTurn(sp, sid);
+      break;
+    }
+
     case 'status': {
       const sp = msg.sessionPath || null;
       const sid = typeof msg.sessionId === 'string' && msg.sessionId.trim() ? msg.sessionId.trim() : null;
@@ -939,6 +1128,20 @@ export function handleServerMessage(msg: any): void {
         if (msg.isStreaming) streamBufferManager.beginTurn(sp, sid);
         else streamBufferManager.finishTurn(sp, sid);
       }
+      break;
+    }
+
+    case 'slash_result': {
+      if (typeof window === 'undefined') break;
+      if (!isFocusedSessionMessage(msg)) break;
+      const text = typeof msg.text === 'string' ? msg.text.trim() : '';
+      if (!text) break;
+      window.dispatchEvent(new CustomEvent('hana-inline-notice', {
+        detail: {
+          text,
+          type: msg.level === 'error' || msg.error ? 'error' : 'success',
+        },
+      }));
       break;
     }
   }

@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
@@ -13,6 +13,23 @@ const archiveSessionMock = vi.fn();
 const renameSessionMock = vi.fn();
 const pinSessionMock = vi.fn();
 const createNewSessionMock = vi.fn();
+const reorderPinnedSessionsMock = vi.fn();
+const openBrowserViewerMock = vi.fn();
+
+const localServerConnection = {
+  connectionId: 'local',
+  kind: 'local' as const,
+  serverId: 'local',
+  studioId: 'local',
+  label: 'Local Hana',
+  baseUrl: 'http://127.0.0.1:3210',
+  wsUrl: 'ws://127.0.0.1:3210',
+  token: 'test-token',
+  authState: 'paired' as const,
+  trustState: 'local' as const,
+  credentialKind: 'loopback_token' as const,
+  capabilities: ['chat', 'resources', 'files', 'tools'],
+};
 
 vi.mock('../../hooks/use-hana-fetch', () => ({
   hanaFetch: (...args: unknown[]) => hanaFetchMock(...args),
@@ -25,6 +42,7 @@ vi.mock('../../stores/session-actions', () => ({
   renameSession: (...args: unknown[]) => renameSessionMock(...args),
   pinSession: (...args: unknown[]) => pinSessionMock(...args),
   createNewSession: (...args: unknown[]) => createNewSessionMock(...args),
+  reorderPinnedSessions: (...args: unknown[]) => reorderPinnedSessionsMock(...args),
 }));
 
 vi.mock('../../hooks/use-i18n', () => ({
@@ -47,6 +65,7 @@ function seedSessions() {
     sessions: [
       {
         path: '/tmp/agents/hana/sessions/with-summary.jsonl',
+        sessionId: 'sess_with_summary',
         title: 'Has summary',
         firstMessage: 'hello',
         modified: '2026-04-29T08:00:00.000Z',
@@ -78,6 +97,8 @@ function seedSessions() {
     unreadOutputSessionPaths: [],
     browserBySession: {},
     locale: 'zh',
+    activeServerConnectionId: localServerConnection.connectionId,
+    activeServerConnection: localServerConnection,
   });
 }
 
@@ -121,10 +142,14 @@ async function switchToProjectView() {
 describe('SessionList context menu', () => {
   beforeEach(() => {
     window.localStorage.removeItem('hana-session-sidebar-view-mode');
+    window.localStorage.removeItem('hana-sidebar-ui-prefs');
+    useStore.getState().applySidebarUiPrefs({});
+    useStore.setState({ sidebarUiPrefsLoaded: false });
     globalThis.t = ((key: string) => {
       if (key === 'yuan.types') return {};
       return key;
     }) as typeof globalThis.t;
+    hanaFetchMock.mockReset();
     hanaFetchMock.mockImplementation(async (url: string) => {
       if (url === '/api/browser/session-states') return jsonResponse({});
       if (url === '/api/browser/sessions') return jsonResponse({});
@@ -143,11 +168,22 @@ describe('SessionList context menu', () => {
     renameSessionMock.mockReset();
     pinSessionMock.mockReset();
     createNewSessionMock.mockReset();
+    reorderPinnedSessionsMock.mockReset();
+    openBrowserViewerMock.mockReset();
+    Object.defineProperty(window, 'platform', {
+      configurable: true,
+      value: { openBrowserViewer: openBrowserViewerMock },
+    });
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn(async () => undefined) },
+    });
     seedSessions();
   });
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   it('keeps summaryless session rows readable and disables only the summary menu item', () => {
@@ -213,11 +249,93 @@ describe('SessionList context menu', () => {
     expect(archiveSessionMock).toHaveBeenCalledWith('/tmp/agents/hana/sessions/with-summary.jsonl');
   });
 
-  it('closes a sidebar browser badge without switching the session row', async () => {
+  it('copies only the stable Session ID and disables the action when it is unavailable', async () => {
+    render(<SessionList />);
+
+    fireEvent.contextMenu(sessionButton('Has summary'), { clientX: 24, clientY: 32 });
+    fireEvent.click(screen.getByText('session.copyId'));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('sess_with_summary');
+
+    fireEvent.contextMenu(sessionButton('No summary'), { clientX: 24, clientY: 32 });
+    expect(screen.getByText('session.copyId').closest('.context-menu-item')).toHaveClass('disabled');
+  });
+
+  it('allows deleted-agent sessions to unpin and archive without exposing rename or pin', async () => {
+    useStore.setState({
+      sessions: [{
+        path: '/tmp/agents/deleted/sessions/pinned.jsonl',
+        title: 'Deleted pinned',
+        firstMessage: 'old',
+        modified: '2026-04-29T08:00:00.000Z',
+        messageCount: 2,
+        agentId: 'deleted',
+        agentName: 'Deleted',
+        cwd: '/tmp/project',
+        pinnedAt: '2026-04-29T08:10:00.000Z',
+        hasSummary: false,
+        agentDeleted: true,
+      }],
+      currentSessionPath: null,
+      pendingSessionSwitchPath: null,
+      pendingNewSession: false,
+      agents: [],
+      streamingSessions: [],
+      unreadOutputSessionPaths: [],
+      browserBySession: {},
+      locale: 'zh',
+    });
+
+    render(<SessionList />);
+
+    fireEvent.contextMenu(sessionButton('Deleted pinned'), { clientX: 24, clientY: 32 });
+    expect(screen.queryByText('session.rename')).not.toBeInTheDocument();
+    expect(screen.queryByText('session.pin')).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByText('session.unpin'));
+    expect(pinSessionMock).toHaveBeenCalledWith('/tmp/agents/deleted/sessions/pinned.jsonl', false);
+
+    fireEvent.contextMenu(sessionButton('Deleted pinned'), { clientX: 24, clientY: 32 });
+    fireEvent.click(await screen.findByText('session.archive'));
+    expect(archiveSessionMock).toHaveBeenCalledWith('/tmp/agents/deleted/sessions/pinned.jsonl');
+  });
+
+  it('opens the session browser from a left click on the sidebar badge', async () => {
     const browserStates = {
       '/tmp/agents/hana/sessions/with-summary.jsonl': {
         url: 'https://example.com',
         running: false,
+        resumable: true,
+        unavailableReason: null,
+      },
+    };
+    hanaFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/browser/session-states') return jsonResponse(browserStates);
+      if (url === '/api/browser/open-session') return jsonResponse({ ok: true });
+      return jsonResponse({});
+    });
+
+    render(<SessionList />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'browser.open' }));
+
+    await waitFor(() => {
+      expect(hanaFetchMock).toHaveBeenCalledWith('/api/browser/open-session', expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ sessionPath: '/tmp/agents/hana/sessions/with-summary.jsonl' }),
+      }));
+      expect(openBrowserViewerMock).toHaveBeenCalledWith({
+        sessionPath: '/tmp/agents/hana/sessions/with-summary.jsonl',
+      });
+    });
+    expect(hanaFetchMock).not.toHaveBeenCalledWith('/api/browser/close-session', expect.anything());
+    expect(switchSessionMock).not.toHaveBeenCalled();
+    expect(await screen.findByRole('button', { name: 'browser.open' })).toBeInTheDocument();
+  });
+
+  it('closes the session browser from the badge context menu', async () => {
+    const browserStates = {
+      '/tmp/agents/hana/sessions/with-summary.jsonl': {
+        url: 'https://example.com',
+        running: true,
         resumable: true,
         unavailableReason: null,
       },
@@ -234,8 +352,11 @@ describe('SessionList context menu', () => {
 
     render(<SessionList />);
 
-    const closeBadge = await screen.findByRole('button', { name: 'browser.close' });
-    fireEvent.click(closeBadge);
+    fireEvent.contextMenu(await screen.findByRole('button', { name: 'browser.open' }), {
+      clientX: 40,
+      clientY: 60,
+    });
+    fireEvent.click(await screen.findByText('browser.closeForSession'));
 
     await waitFor(() => {
       expect(hanaFetchMock).toHaveBeenCalledWith('/api/browser/close-session', expect.objectContaining({
@@ -245,8 +366,72 @@ describe('SessionList context menu', () => {
     });
     expect(switchSessionMock).not.toHaveBeenCalled();
     await waitFor(() => {
-      expect(screen.queryByRole('button', { name: 'browser.close' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'browser.open' })).not.toBeInTheDocument();
     });
+  });
+
+  it('applies the persisted single-line row mode from the store to regular session rows', () => {
+    act(() => {
+      useStore.getState().applySidebarUiPrefs({
+        sidebarUi: {
+          projectView: { collapsedProjectIds: [], collapsedFolderIds: [], showAllProjectIds: [] },
+          sessionList: { rowMode: 'single-line' },
+        },
+      });
+    });
+
+    render(<SessionList />);
+
+    const row = sessionButton('Has summary');
+    expect(row).toHaveAttribute('data-row-mode', 'single-line');
+    expect(row.querySelector('[data-session-actions]')).toBeInTheDocument();
+    expect(row).toHaveAttribute('title', expect.stringContaining('Hana'));
+  });
+
+  it('never fetches sidebar UI preferences itself', async () => {
+    render(<SessionList />);
+
+    await waitFor(() => {
+      expect(hanaFetchMock).toHaveBeenCalledWith('/api/browser/session-states');
+    });
+    expect(hanaFetchMock).not.toHaveBeenCalledWith('/api/preferences/sidebar-ui');
+  });
+
+  it('follows the row mode when the store picks up new preferences after mount', async () => {
+    render(<SessionList />);
+    expect(sessionButton('Has summary')).toHaveAttribute('data-row-mode', 'two-line');
+
+    act(() => {
+      useStore.getState().applySidebarUiPrefs({
+        sidebarUi: {
+          projectView: { collapsedProjectIds: [], collapsedFolderIds: [], showAllProjectIds: [] },
+          sessionList: { rowMode: 'single-line' },
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(sessionButton('Has summary')).toHaveAttribute('data-row-mode', 'single-line');
+    });
+  });
+
+  it('keeps single-line rows on the very first frame after a remount, without any request', () => {
+    act(() => {
+      useStore.getState().applySidebarUiPrefs({
+        sidebarUi: {
+          projectView: { collapsedProjectIds: [], collapsedFolderIds: [], showAllProjectIds: [] },
+          sessionList: { rowMode: 'single-line' },
+        },
+      });
+    });
+
+    const first = render(<SessionList />);
+    expect(sessionButton('Has summary')).toHaveAttribute('data-row-mode', 'single-line');
+    first.unmount();
+
+    render(<SessionList />);
+    expect(sessionButton('Has summary')).toHaveAttribute('data-row-mode', 'single-line');
+    expect(hanaFetchMock).not.toHaveBeenCalledWith('/api/preferences/sidebar-ui');
   });
 
   it('shows title search results first and then content results', async () => {
@@ -313,7 +498,7 @@ describe('SessionList context menu', () => {
       'utf-8',
     );
 
-    expect(css).toMatch(/\.sessionSummaryBody\s*\{[\s\S]*font-size:\s*0\.66rem/);
+    expect(css).toMatch(/\.sessionSummaryBody\s*\{[\s\S]*font-size:\s*var\(--fs-hint\)/);
     expect(css).not.toMatch(/\.sessionContextMenu/);
     expect(css).not.toMatch(/sessionItemSummaryEmpty/);
   });
@@ -326,7 +511,8 @@ describe('SessionList context menu', () => {
 
     expect(css).not.toMatch(/@media\s*\(hover:\s*hover\)\s*and\s*\(pointer:\s*fine\)/);
     expect(css).toMatch(/@media\s*\(any-hover:\s*hover\)\s*and\s*\(any-pointer:\s*fine\)\s*\{[\s\S]*\.sessionItem:hover\s*\{/);
-    expect(css).toMatch(/@media\s*\(any-hover:\s*hover\)\s*and\s*\(any-pointer:\s*fine\)\s*\{[\s\S]*\.sessionItem:hover \.sessionArchiveBtn\s*\{/);
+    expect(css).toMatch(/@media\s*\(any-hover:\s*hover\)\s*and\s*\(any-pointer:\s*fine\)\s*\{[\s\S]*\.sessionItem:not\(\.sessionItemSingleLine\):hover \.sessionArchiveBtn/);
+    expect(css).toMatch(/@media\s*\(any-hover:\s*hover\)\s*and\s*\(any-pointer:\s*fine\)\s*\{[\s\S]*\.sessionItemSingleLine:hover \.sessionItemActions\s*\{[\s\S]*width:\s*calc\(40px \+ var\(--space-4\)\)/);
     expect(css).toMatch(/@media\s*\(any-hover:\s*hover\)\s*and\s*\(any-pointer:\s*fine\)\s*\{[\s\S]*\.sessionListScroller:hover \.sectionTitleActions/);
   });
 
@@ -345,13 +531,13 @@ describe('SessionList context menu', () => {
       'utf-8',
     );
 
-    expect(css).toMatch(/\.sessionItem:hover \.sessionPinBtn\s*\{/);
-    expect(css).toMatch(/\.sessionItem:hover \.sessionArchiveBtn\s*\{/);
-    expect(css).toMatch(/\.sessionItem:hover \.sessionItemMeta\s*\{[\s\S]*padding-right:\s*52px/);
+    expect(css).toMatch(/\.sessionItem:not\(\.sessionItemSingleLine\):hover \.sessionPinBtn/);
+    expect(css).toMatch(/\.sessionItem:not\(\.sessionItemSingleLine\):hover \.sessionArchiveBtn/);
+    expect(css).toMatch(/\.sessionItem:not\(\.sessionItemSingleLine\):hover \.sessionItemMeta\s*\{[\s\S]*padding-right:\s*52px/);
+    expect(css).toMatch(/\.sessionItem:not\(\.sessionItemSingleLine\) \.sessionItemActions\s*\{[\s\S]*position:\s*absolute/);
+    expect(css).toMatch(/\.sessionItemSingleLine \.sessionItemActions\s*\{[\s\S]*width:\s*0/);
     expect(css).not.toMatch(/\.sessionItemActive \.sessionPinBtn/);
     expect(css).not.toMatch(/\.sessionItemActive \.sessionArchiveBtn/);
-    expect(css).not.toMatch(/\.sessionItem:focus-visible \.sessionPinBtn/);
-    expect(css).not.toMatch(/\.sessionItem:focus-visible \.sessionArchiveBtn/);
     expect(css).not.toMatch(/\.sessionItemActive \.sessionItemMeta/);
     expect(css).not.toMatch(/sessionRenameBtn/);
   });
@@ -379,6 +565,54 @@ describe('SessionList context menu', () => {
     const row = sessionButton('Has summary');
     expect(row).toHaveAttribute('data-unread-output', 'true');
     const dot = row.querySelector('[data-session-status-dot]');
+    expect(dot).toBeInTheDocument();
+    expect(dot).toHaveAttribute('data-state', 'running');
+  });
+
+  it('marks the pending switch row immediately without changing the committed session path', () => {
+    useStore.setState({
+      currentSessionPath: '/tmp/agents/hana/sessions/no-summary.jsonl',
+      pendingSessionSwitchPath: '/tmp/agents/hana/sessions/with-summary.jsonl',
+      streamingSessions: [],
+      unreadOutputSessionPaths: [],
+    } as never);
+
+    render(<SessionList />);
+
+    const pendingRow = sessionButton('Has summary');
+    expect(pendingRow).toHaveAttribute('data-switch-pending', 'true');
+
+    const currentRow = sessionButton('No summary');
+    expect(currentRow).toHaveAttribute('data-switch-pending', 'false');
+  });
+
+  // 切换会话是本地操作，通常几十毫秒就完成。此前它会借用「正在输出」的状态点，
+  // 结果每次点列表都闪一下，既是视觉噪音，也把「这个会话正在跑」的语义冲淡了。
+  it('shows no status dot while a session switch is loading', () => {
+    useStore.setState({
+      currentSessionPath: '/tmp/agents/hana/sessions/no-summary.jsonl',
+      pendingSessionSwitchPath: '/tmp/agents/hana/sessions/with-summary.jsonl',
+      streamingSessions: [],
+      unreadOutputSessionPaths: [],
+    } as never);
+
+    render(<SessionList />);
+
+    const pendingRow = sessionButton('Has summary');
+    expect(pendingRow.querySelector('[data-session-status-dot]')).not.toBeInTheDocument();
+  });
+
+  it('keeps the running dot on a session that is both switching and streaming', () => {
+    useStore.setState({
+      currentSessionPath: '/tmp/agents/hana/sessions/no-summary.jsonl',
+      pendingSessionSwitchPath: '/tmp/agents/hana/sessions/with-summary.jsonl',
+      streamingSessions: ['/tmp/agents/hana/sessions/with-summary.jsonl'],
+      unreadOutputSessionPaths: [],
+    } as never);
+
+    render(<SessionList />);
+
+    const dot = sessionButton('Has summary').querySelector('[data-session-status-dot]');
     expect(dot).toBeInTheDocument();
     expect(dot).toHaveAttribute('data-state', 'running');
   });
@@ -739,7 +973,7 @@ describe('SessionList context menu', () => {
         },
       ],
     });
-    hanaFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    hanaFetchMock.mockImplementation(async (url: string) => {
       if (url === '/api/browser/session-states') return jsonResponse({});
       if (url === '/api/session-projects') {
         return jsonResponse({
@@ -749,10 +983,12 @@ describe('SessionList context menu', () => {
           },
         });
       }
-      if (url === '/api/preferences/sidebar-ui' && !init) {
-        return jsonResponse({ sidebarUi: { projectView: { collapsedProjectIds: ['project-root'], collapsedFolderIds: [], showAllProjectIds: [] } } });
-      }
       return jsonResponse({});
+    });
+    act(() => {
+      useStore.getState().applySidebarUiPrefs({
+        sidebarUi: { projectView: { collapsedProjectIds: ['project-root'], collapsedFolderIds: [], showAllProjectIds: [] } },
+      });
     });
 
     render(<SessionList />);
@@ -799,7 +1035,7 @@ describe('SessionList context menu', () => {
         },
       ],
     });
-    hanaFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    hanaFetchMock.mockImplementation(async (url: string) => {
       if (url === '/api/browser/session-states') return jsonResponse({});
       if (url === '/api/session-projects') {
         return jsonResponse({
@@ -809,10 +1045,12 @@ describe('SessionList context menu', () => {
           },
         });
       }
-      if (url === '/api/preferences/sidebar-ui' && !init) {
-        return jsonResponse({ sidebarUi: { projectView: { collapsedProjectIds: [], collapsedFolderIds: ['folder-work'], showAllProjectIds: [] } } });
-      }
       return jsonResponse({});
+    });
+    act(() => {
+      useStore.getState().applySidebarUiPrefs({
+        sidebarUi: { projectView: { collapsedProjectIds: [], collapsedFolderIds: ['folder-work'], showAllProjectIds: [] } },
+      });
     });
 
     render(<SessionList />);
@@ -1013,6 +1251,167 @@ describe('SessionList context menu', () => {
     expect(css).not.toMatch(/\.projectSessionList\s*\{[\s\S]*margin-left:/);
   });
 
+  describe('pinned strip reordering', () => {
+    function seedPinnedSessions(options: { withSessionIds?: boolean } = {}) {
+      const withSessionIds = options.withSessionIds !== false;
+      useStore.setState({
+        sessions: [
+          {
+            path: '/tmp/agents/hana/sessions/pin-a.jsonl',
+            sessionId: withSessionIds ? 'sess_pin_a' : null,
+            title: 'Pin A',
+            firstMessage: 'a',
+            modified: '2026-04-29T08:00:00.000Z',
+            messageCount: 1,
+            agentId: 'hana',
+            agentName: 'Hana',
+            cwd: '/tmp/project',
+            pinnedAt: '2026-04-28T07:00:00.000Z',
+            pinOrder: 1024,
+          },
+          {
+            path: '/tmp/agents/hana/sessions/pin-b.jsonl',
+            sessionId: withSessionIds ? 'sess_pin_b' : null,
+            title: 'Pin B',
+            firstMessage: 'b',
+            modified: '2026-04-29T07:00:00.000Z',
+            messageCount: 1,
+            agentId: 'hana',
+            agentName: 'Hana',
+            cwd: '/tmp/project',
+            pinnedAt: '2026-04-28T07:00:00.000Z',
+            pinOrder: 2048,
+          },
+          {
+            path: '/tmp/agents/hana/sessions/pin-c.jsonl',
+            sessionId: withSessionIds ? 'sess_pin_c' : null,
+            title: 'Pin C',
+            firstMessage: 'c',
+            modified: '2026-04-29T06:00:00.000Z',
+            messageCount: 1,
+            agentId: 'hana',
+            agentName: 'Hana',
+            cwd: '/tmp/project',
+            pinnedAt: '2026-04-28T07:00:00.000Z',
+            pinOrder: 3072,
+          },
+        ],
+      } as never);
+    }
+
+    function pinnedRow(title: string) {
+      const row = sessionButton(title).closest('[data-pinned-session-path]');
+      if (!row) throw new Error(`Missing pinned row: ${title}`);
+      return row as HTMLElement;
+    }
+
+    function stubRowGeometry(row: HTMLElement) {
+      row.getBoundingClientRect = () => ({
+        top: 0, bottom: 40, left: 0, right: 100, width: 100, height: 40, x: 0, y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    }
+
+    // jsdom has no DragEvent, so fireEvent cannot carry pointer coordinates on a
+    // drag event; define them on the event object the way a browser would.
+    function fireDragAt(
+      type: 'dragOver' | 'drop',
+      row: HTMLElement,
+      dataTransfer: ReturnType<typeof dragData>,
+      clientY: number,
+    ) {
+      const event = createEvent[type](row, { dataTransfer });
+      Object.defineProperty(event, 'clientY', { value: clientY });
+      fireEvent(row, event);
+    }
+
+    it('submits the full pinned order when a row is dropped above another row', async () => {
+      seedPinnedSessions();
+      render(<SessionList />);
+
+      const dataTransfer = dragData();
+      fireEvent.dragStart(sessionButton('Pin C'), { dataTransfer });
+      const target = pinnedRow('Pin A');
+      stubRowGeometry(target);
+      fireDragAt('dragOver', target, dataTransfer, 5);
+      fireDragAt('drop', target, dataTransfer, 5);
+
+      await waitFor(() => {
+        expect(reorderPinnedSessionsMock).toHaveBeenCalledWith([
+          'sess_pin_c',
+          'sess_pin_a',
+          'sess_pin_b',
+        ]);
+      });
+    });
+
+    it('submits the order with the dragged row below the target when dropped on its lower half', async () => {
+      seedPinnedSessions();
+      render(<SessionList />);
+
+      const dataTransfer = dragData();
+      fireEvent.dragStart(sessionButton('Pin A'), { dataTransfer });
+      const target = pinnedRow('Pin B');
+      stubRowGeometry(target);
+      fireDragAt('dragOver', target, dataTransfer, 35);
+      fireDragAt('drop', target, dataTransfer, 35);
+
+      await waitFor(() => {
+        expect(reorderPinnedSessionsMock).toHaveBeenCalledWith([
+          'sess_pin_b',
+          'sess_pin_a',
+          'sess_pin_c',
+        ]);
+      });
+    });
+
+    it('disables pinned reordering entirely when any pinned row has no session id', () => {
+      seedPinnedSessions({ withSessionIds: false });
+      render(<SessionList />);
+
+      expect(sessionButton('Pin A')).not.toHaveAttribute('draggable', 'true');
+
+      const dataTransfer = dragData();
+      fireEvent.dragStart(sessionButton('Pin C'), { dataTransfer });
+      fireDragAt('drop', pinnedRow('Pin A'), dataTransfer, 5);
+
+      expect(reorderPinnedSessionsMock).not.toHaveBeenCalled();
+    });
+
+    it('does not assign a pinned row to a project when it is dragged out of the pinned strip', async () => {
+      seedPinnedSessions();
+      hanaFetchMock.mockImplementation(async (url: string) => {
+        if (url === '/api/browser/session-states') return jsonResponse({});
+        if (url === '/api/session-projects') {
+          return jsonResponse({
+            catalog: {
+              folders: [],
+              projects: [{ id: 'project-custom', name: 'Custom Project', folderId: null, order: 0 }],
+            },
+          });
+        }
+        return jsonResponse({});
+      });
+
+      render(<SessionList />);
+      await switchToProjectView();
+
+      const dataTransfer = dragData();
+      fireEvent.dragStart(sessionButton('Pin A'), { dataTransfer });
+      const projectRow = await screen.findByText('Custom Project');
+      fireEvent.dragOver(projectRow, { dataTransfer });
+      fireEvent.drop(projectRow, { dataTransfer });
+
+      await waitFor(() => {
+        expect(hanaFetchMock).not.toHaveBeenCalledWith(
+          '/api/session-projects/session-assignment',
+          expect.anything(),
+        );
+      });
+      expect(reorderPinnedSessionsMock).not.toHaveBeenCalled();
+    });
+  });
+
   it('keeps the pinned heading font unified with date and project headings', () => {
     const css = fs.readFileSync(
       path.join(__dirname, '../../components/SessionList.module.css'),
@@ -1021,7 +1420,7 @@ describe('SessionList context menu', () => {
 
     const baseTitleRule = css.match(/\.sessionSectionTitle\s*\{[^}]*\}/)?.[0] || '';
     const pinnedTitleRule = css.match(/\.pinnedSection \.sessionSectionTitle\s*\{[^}]*\}/)?.[0] || '';
-    expect(baseTitleRule).toContain('font-size: 0.82rem');
+    expect(baseTitleRule).toContain('font-size: var(--fs-ui)');
     expect(pinnedTitleRule).not.toContain('font-size:');
   });
 });

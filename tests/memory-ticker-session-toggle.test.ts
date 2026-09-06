@@ -5,10 +5,15 @@ import path from "path";
 
 vi.mock("../lib/memory/compile.js", () => ({
   compileToday: vi.fn().mockResolvedValue("compiled"),
-  compileWeek: vi.fn().mockResolvedValue("compiled"),
+  compileDaily: vi.fn().mockResolvedValue("compiled"),
+  assembleWeekFromDaily: vi.fn(),
+  rollDailyWindow: vi.fn().mockResolvedValue({ folded: [], failed: [] }),
   compileLongterm: vi.fn().mockResolvedValue("compiled"),
-  compileFacts: vi.fn().mockResolvedValue("compiled"),
+  compileEditableFacts: vi.fn().mockResolvedValue("compiled"),
   assemble: vi.fn(),
+  ensureEditableFactsBaseline: vi.fn(),
+  migrateLegacyEditableFacts: vi.fn(() => ({ migrated: false, reason: "no-legacy-file" })),
+  migrateLegacyWeekToLongterm: vi.fn().mockResolvedValue({ migrated: false }),
 }));
 
 vi.mock("../lib/memory/deep-memory.js", () => ({
@@ -26,6 +31,7 @@ vi.mock("../lib/debug-log.js", () => ({
 
 import { createMemoryTicker } from "../lib/memory/memory-ticker.ts";
 import { compileToday, assemble } from "../lib/memory/compile.ts";
+import { processDirtySessions } from "../lib/memory/deep-memory.ts";
 
 function writeSession(sessionPath) {
   const lines = [
@@ -171,6 +177,35 @@ describe("memory ticker respects session-level memory toggle", () => {
     expect(assemble).toHaveBeenCalled();
   });
 
+  it("awaits an asynchronous fresh memory-model resolver before invoking memory LLM work", async () => {
+    let releaseModel;
+    const modelPromise = new Promise((resolve) => { releaseModel = resolve; });
+    const getResolvedMemoryModel = vi.fn(() => modelPromise);
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true, { getResolvedMemoryModel });
+
+    ticker.notifyTurn(sessionPath);
+    const pending = ticker.flushSessionAndCompile(sessionPath);
+    await Promise.resolve();
+    expect(summaryManager.rollingSummary).not.toHaveBeenCalled();
+
+    const freshModel = {
+      model: "fresh-model",
+      provider: "oauth-provider",
+      api: "openai-completions",
+      api_key: "fresh-token",
+      base_url: "https://fresh.example/v1",
+    };
+    releaseModel(freshModel);
+    await pending;
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
+      freshModel,
+      expect.any(Object),
+    );
+  });
+
   it("flushSessionAndCompile summarizes an unfinished turn bucket and resets the turn count", async () => {
     const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
 
@@ -219,7 +254,8 @@ describe("memory ticker respects session-level memory toggle", () => {
     const pending = ticker.notifySessionEnd(sessionPath);
     // 同步断言：返回值是 Promise，但调用方这一行不应被 LLM 挡住
     expect(pending).toBeInstanceOf(Promise);
-    // rollingSummary 已经在后台启动（同步触发 Promise 构造）
+    // fresh resolver 是异步边界；让一个 microtask 通过后，后台 rollingSummary 启动。
+    await Promise.resolve();
     expect(summaryManager.rollingSummary).toHaveBeenCalledOnce();
     // 关键：不 await pending，测试仍能走到下一行 —— 证明 fire-and-forget
   });
@@ -243,10 +279,11 @@ describe("memory ticker respects session-level memory toggle", () => {
 
     const messages = summaryManager.rollingSummary.mock.calls[0][1];
     expect(messages.map((m) => m.content)).toEqual(["new user message", "new assistant message"]);
-    expect(summaryManager.rollingSummary.mock.calls[0][3]).toEqual({
+    expect(summaryManager.rollingSummary.mock.calls[0][3]).toEqual(expect.objectContaining({
       resetAt: "2026-04-29T08:00:00.000Z",
       timeZone: "Asia/Shanghai",
-    });
+      projection: expect.objectContaining({ selectedLeafId: "legacy-line-4" }),
+    }));
   });
 
   it("passes the injected session memory reflection snapshot into rollingSummary", async () => {
@@ -269,11 +306,12 @@ describe("memory ticker respects session-level memory toggle", () => {
 
     expect(readMemoryReflectionSnapshot).toHaveBeenCalledWith(sessionPath);
     expect(summaryManager.rollingSummary).toHaveBeenCalledOnce();
-    expect(summaryManager.rollingSummary.mock.calls[0][3]).toEqual({
+    expect(summaryManager.rollingSummary.mock.calls[0][3]).toEqual(expect.objectContaining({
       resetAt: null,
       timeZone: "Asia/Shanghai",
       memoryReflectionSnapshot: snapshot,
-    });
+      projection: expect.any(Object),
+    }));
   });
 
   it("startup recovery skips sessions whose file mtime is before the reset watermark", async () => {
@@ -336,5 +374,181 @@ describe("memory ticker respects session-level memory toggle", () => {
 
     expect(summaryManager.rollingSummary).not.toHaveBeenCalled();
     expect(compileToday).not.toHaveBeenCalled();
+  });
+
+  it("recovers a persisted branch fact replacement after restart even when the JSONL is older than the summary", async () => {
+    let replacementPending = true;
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true, {
+      getSessionIdForPath: () => "sess_branch_recovery",
+    });
+    const oldMtime = new Date(Date.now() - 60_000);
+    fs.utimesSync(sessionPath, oldMtime, oldMtime);
+    summaryManager.getSummary.mockImplementation(() => ({
+      updated_at: new Date(Date.now() + 60_000).toISOString(),
+      factReplacementRequired: replacementPending,
+    }));
+    summaryManager.rollingSummary.mockResolvedValue({
+      mode: "append",
+      data: null,
+      reason: "",
+    });
+    (processDirtySessions as any).mockImplementationOnce(async () => {
+      replacementPending = false;
+      return { processed: 1, factsAdded: 1 };
+    });
+
+    await ticker.tick();
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledWith(
+      "sess_branch_recovery",
+      expect.any(Array),
+      expect.any(Object),
+      expect.objectContaining({ projection: expect.any(Object) }),
+    );
+    expect(processDirtySessions).toHaveBeenCalledWith(
+      summaryManager,
+      expect.any(Object),
+      expect.any(Object),
+      expect.objectContaining({ sessionIds: ["sess_branch_recovery"] }),
+    );
+    expect(compileToday).toHaveBeenCalled();
+  });
+
+  it("recovers a rewind-only branch change even when JSONL mtime and summary look current", async () => {
+    const updatedAt = new Date(Date.now() + 60_000).toISOString();
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true, {
+      getSessionIdForPath: () => "sess_rewind_only",
+      getSessionBranchHeadForPath: () => ({ updatedAt, revision: 2 }),
+      readSessionBranchForPath: () => ({
+        selectedLeafId: "u-root",
+        rootLineageHash: "root-hash",
+        lineageHash: "current-hash",
+        prefixHashes: { "u-root": "current-hash" },
+        lineage: [{ id: "u-root", lineageHash: "current-hash" }],
+        messages: [{ role: "user", content: "current root", lineageIndex: 0 }],
+      }),
+    });
+    const oldMtime = new Date(Date.now() - 60_000);
+    fs.utimesSync(sessionPath, oldMtime, oldMtime);
+    summaryManager.getSummary.mockReturnValue({
+      updated_at: new Date(Date.now() + 30_000).toISOString(),
+      cursor: { coveredLeafId: "a-discarded", lineageHash: "discarded-hash" },
+      factReplacementRequired: false,
+    });
+    summaryManager.rollingSummary.mockResolvedValue({
+      mode: "replace",
+      data: { factReplacementRequired: true },
+      reason: "",
+    });
+
+    await ticker.tick();
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledWith(
+      "sess_rewind_only",
+      expect.arrayContaining([expect.objectContaining({ content: "current root" })]),
+      expect.any(Object),
+      expect.objectContaining({ projection: expect.objectContaining({ selectedLeafId: "u-root" }) }),
+    );
+  });
+
+  it("keeps forced branch replacement pending, skips compile on fact failure, and retries next turn", async () => {
+    let replacementPending = true;
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+    summaryManager.rollingSummary.mockResolvedValue({
+      mode: "replace",
+      data: { factReplacementRequired: true },
+      reason: "",
+    });
+    summaryManager.getSummary.mockImplementation(() => ({
+      factReplacementRequired: replacementPending,
+    }));
+    (processDirtySessions as any)
+      .mockRejectedValueOnce(new Error("replaceBySession failed"))
+      .mockImplementationOnce(async () => {
+        replacementPending = false;
+        return { processed: 1, factsAdded: 1 };
+      });
+
+    await ticker.notifyTurn(sessionPath, { forceSummary: true });
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(1);
+    expect(compileToday).not.toHaveBeenCalled();
+
+    await ticker.notifyTurn(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(2);
+    expect(processDirtySessions).toHaveBeenCalledTimes(2);
+    expect(compileToday).toHaveBeenCalledOnce();
+  });
+
+  it("keeps forced replacement pending when the branch changes during summary generation", async () => {
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+    summaryManager.rollingSummary
+      .mockResolvedValueOnce({ mode: "replace", data: null, reason: "branch_changed" })
+      .mockResolvedValueOnce({ mode: "append", data: null, reason: "" });
+
+    await ticker.notifyTurn(sessionPath, { forceSummary: true });
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(1);
+    expect(compileToday).not.toHaveBeenCalled();
+
+    await ticker.notifyTurn(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(2);
+    expect(compileToday).toHaveBeenCalledOnce();
+  });
+
+  it("keeps forced replacement pending when the replacement summary is empty", async () => {
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+    summaryManager.rollingSummary
+      .mockResolvedValueOnce({ mode: "replace", data: null, reason: "empty_output" })
+      .mockResolvedValueOnce({ mode: "append", data: null, reason: "" });
+
+    await ticker.notifyTurn(sessionPath, { forceSummary: true });
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(1);
+    expect(compileToday).not.toHaveBeenCalled();
+
+    await ticker.notifyTurn(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(2);
+    expect(compileToday).toHaveBeenCalledOnce();
+  });
+
+  it("starts branch replacement as soon as a rewind is persisted", async () => {
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+    summaryManager.rollingSummary.mockResolvedValue({ mode: "replace", data: {}, reason: "" });
+
+    await ticker.notifyBranchChanged(sessionPath);
+
+    expect(summaryManager.rollingSummary).toHaveBeenCalledOnce();
+    expect(compileToday).toHaveBeenCalledOnce();
+  });
+
+  it("queues a newer forced replacement when a rewind summary is already running", async () => {
+    const { ticker, summaryManager } = makeTicker(tmpDir, () => true);
+    let resolveFirst: (value: any) => void = () => {};
+    summaryManager.rollingSummary
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveFirst = resolve;
+      }))
+      .mockResolvedValue({ mode: "append", data: null, reason: "" });
+
+    const firstJob = ticker.notifyBranchChanged(sessionPath);
+    await vi.waitFor(() => expect(summaryManager.rollingSummary).toHaveBeenCalledOnce());
+    fs.appendFileSync(sessionPath, `${JSON.stringify({
+      type: "message",
+      timestamp: "2026-03-12T15:49:00.000Z",
+      message: { role: "user", content: "replacement leaf" },
+    })}\n`, "utf-8");
+    await ticker.notifyTurn(sessionPath, { forceSummary: true });
+
+    resolveFirst({ mode: "replace", data: { factReplacementRequired: true }, reason: "" });
+    await firstJob;
+    await vi.waitFor(() => expect(summaryManager.rollingSummary).toHaveBeenCalledTimes(2));
+    await ticker.stop();
+
+    const rerunMessages = summaryManager.rollingSummary.mock.calls[1][1];
+    expect(rerunMessages.map((message) => message.content)).toContain("replacement leaf");
   });
 });

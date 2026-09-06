@@ -14,8 +14,10 @@ import { WorkflowInlineCard } from './WorkflowInlineCard';
 import { InterludeBlock } from './InterludeBlock';
 import { SettingsConfirmCard } from './SettingsConfirmCard';
 import { SettingsUpdateCard } from './SettingsUpdateCard';
+import { InteractiveCard } from './InteractiveCard';
+import { SessionCollabDraftCard } from './SessionCollabDraftCard';
 import { useMessageFooterActions } from './MessageActions';
-import { MessageFooterActions, formatMessageTime, type MessageFooterAction } from './MessageFooterActions';
+import { MessageFooterActions, formatMessageTime } from './MessageFooterActions';
 import { ChatResourceCard } from './ChatResourceCard';
 import { FileResourceIcon, SkillResourceIcon } from './ChatResourceIcons';
 import { BLOCK_RENDERERS } from './block-renderers';
@@ -24,6 +26,7 @@ const lazyScreenshot = () => import('../../utils/screenshot').then(m => m.takeSc
 import type { ChatMessage, ContentBlock } from '../../stores/chat-types';
 import { useStore } from '../../stores';
 import { selectSessionFiles } from '../../stores/selectors/file-refs';
+import { sessionIdForPathFromLocatorState } from '../../stores/session-slice';
 import { hanaFetch } from '../../hooks/use-hana-fetch';
 import { openFilePreview, openSkillPreview } from '../../utils/file-preview';
 import { writeAppFileDragPayload, clearAppFileDragPayload } from '../../utils/app-file-drag';
@@ -33,12 +36,14 @@ import { resolveServerConnection } from '../../services/server-connection';
 import { resolveFileRefUrl } from '../../services/resource-url';
 import type { FileRef } from '../../types/file-ref';
 import { openPreview } from '../../stores/preview-actions';
-import { replayLatestUserMessage } from '../../stores/message-turn-actions';
-import { selectIsStreamingSession, selectSelectedIdsBySession } from '../../stores/session-selectors';
-import { extractSelectedTexts } from '../../utils/message-text';
-import { AgentAvatar, resolveAgentDisplayInfo } from '../../utils/agent-display';
+import type { ForkedSessionHandler, SessionNodeTarget } from '../../stores/message-turn-actions';
+import { selectSelectedIdsBySession } from '../../stores/session-selectors';
+import { normalizeSessionRouteError } from '../../../../../shared/error-user-messages.ts';
+import { extractSelectedTexts, extractTextBlockPlainText } from '../../utils/message-text';
+import { AgentAvatar, resolveAgentDisplayInfo, type AgentDisplayInfo } from '../../utils/agent-display';
 import { ScheduleEditor } from '../automation/ScheduleEditor';
 import { SelectWidget, type SelectOption } from '@/ui';
+import { useSessionNodeActions } from './SessionNodeActions';
 import {
   scheduleDraftFromStored,
   schedulePreviewFromDraft,
@@ -55,10 +60,15 @@ interface Props {
   sessionPath: string;
   agentId?: string | null;
   readOnly?: boolean;
+  agentDisplay: AgentDisplayInfo & { yuan: string };
+  isStreaming: boolean;
+  isSelected: boolean;
   isLatestAssistantMessage?: boolean;
   showTurnCompletionTime?: boolean;
   assistantTurnSelectionIds?: readonly string[];
+  turnTarget?: SessionNodeTarget | null;
   retrySourceMessage?: ChatMessage | null;
+  onForkCreated?: ForkedSessionHandler;
   messageRef?: (element: HTMLDivElement | null) => void;
 }
 
@@ -72,29 +82,20 @@ export const AssistantMessage = memo(function AssistantMessage({
   sessionPath,
   agentId,
   readOnly = false,
+  agentDisplay,
+  isStreaming,
+  isSelected,
   isLatestAssistantMessage = false,
   showTurnCompletionTime = false,
   assistantTurnSelectionIds,
+  turnTarget = null,
   retrySourceMessage = null,
+  onForkCreated,
   messageRef,
 }: Props) {
-  const agents = useStore(s => s.agents);
-  const globalAgentName = useStore(s => s.agentName) || 'Hanako';
-  const globalYuan = useStore(s => s.agentYuan) || 'hanako';
-  const isStreaming = useStore(s => selectIsStreamingSession(s, sessionPath));
-  const selectedIds = useStore(s => selectSelectedIdsBySession(s, sessionPath));
-  const isSelected = selectedIds.includes(message.id);
-  const t = window.t ?? ((p: string) => p);
-
-  // Resolve agent identity from agentId prop; fall back to global values
-  const displayInfo = resolveAgentDisplayInfo({
-    id: agentId || null,
-    agents,
-    fallbackAgentName: globalAgentName,
-    fallbackAgentYuan: globalYuan,
-  });
-  const displayName = displayInfo.displayName;
-  const displayYuan = displayInfo.yuan || globalYuan;
+  const displayInfo = agentDisplay;
+  const displayName = agentDisplay.displayName;
+  const displayYuan = agentDisplay.yuan;
 
   const blocks = useMemo(
     () => (message.blocks || [])
@@ -103,9 +104,9 @@ export const AssistantMessage = memo(function AssistantMessage({
     [message.blocks],
   );
   const isInterludeOnly = blocks.length > 0 && blocks.every(block => block.type === 'interlude');
+  const hasWideBlock = blocks.some(b => b.type === 'interactive_card');
 
   const [copied, setCopied] = useState(false);
-  const [retrying, setRetrying] = useState(false);
   const handleCopy = useCallback(() => {
     const ids = selectSelectedIdsBySession(useStore.getState(), sessionPath);
     let text: string;
@@ -116,10 +117,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         (b): b is ContentBlock & { type: 'text' } => b.type === 'text'
       );
       if (textBlocks.length === 0) return;
-      // eslint-disable-next-line no-restricted-syntax
-      const tmp = document.createElement('div');
-      tmp.innerHTML = textBlocks.map(b => b.html).join('\n');
-      text = tmp.innerText.trim();
+      text = extractTextBlockPlainText(textBlocks);
     }
     if (!text) return;
     navigator.clipboard.writeText(text).then(() => {
@@ -133,17 +131,14 @@ export const AssistantMessage = memo(function AssistantMessage({
     fn(message.id, sessionPath);
   }, [message.id, sessionPath]);
 
-  const handleRegenerate = useCallback(async () => {
-    if (!retrySourceMessage || retrying || isStreaming) return;
-    setRetrying(true);
-    try {
-      await replayLatestUserMessage(sessionPath, retrySourceMessage);
-    } finally {
-      setRetrying(false);
-    }
-  }, [isStreaming, retrying, retrySourceMessage, sessionPath]);
-
-  const canShowRegenerateAction = !readOnly && showTurnCompletionTime && isLatestAssistantMessage && !!retrySourceMessage && !isStreaming;
+  const { actions: nodeActions, busy: nodeActionBusy } = useSessionNodeActions({
+    sessionPath,
+    target: readOnly || !showTurnCompletionTime ? null : turnTarget,
+    retryMessage: retrySourceMessage || undefined,
+    onForkCreated,
+    disabled: isStreaming,
+  });
+  const canShowNodeActions = !readOnly && showTurnCompletionTime && !!turnTarget && !isStreaming;
   const shouldPersistCompletionTime = showTurnCompletionTime && isLatestAssistantMessage && !isStreaming;
   const timeText = showTurnCompletionTime && !isStreaming ? formatMessageTime(message.timestamp) : null;
   const standardMessageActions = useMessageFooterActions({
@@ -153,19 +148,10 @@ export const AssistantMessage = memo(function AssistantMessage({
     onCopy: handleCopy,
     onScreenshot: () => { void handleScreenshot(); },
     copied,
-    isStreaming,
+    isStreaming: isStreaming || nodeActionBusy,
   });
   const messageActions = readOnly || !showTurnCompletionTime || isStreaming ? [] : standardMessageActions;
-  const regenerateActions: MessageFooterAction[] = useMemo(() => [
-    {
-      id: 'regenerate',
-      title: t('common.regenerate'),
-      icon: <RegenerateIcon />,
-      onClick: () => { void handleRegenerate(); },
-      disabled: retrying || isStreaming,
-    },
-  ], [handleRegenerate, isStreaming, retrying, t]);
-  const footerActions = canShowRegenerateAction ? regenerateActions : [];
+  const footerActions = canShowNodeActions ? nodeActions : [];
 
   return (
     <div className={`${styles.messageGroup} ${styles.messageGroupAssistant}${isInterludeOnly ? ` ${styles.messageGroupInterludeOnly}` : ''}${isSelected ? ` ${styles.messageGroupSelected}` : ''}`}
@@ -181,7 +167,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           <span className={styles.avatarName}>{displayName}</span>
         </div>
       )}
-      <div className={`${styles.message} ${styles.messageAssistant}${isInterludeOnly ? ` ${styles.messageAssistantInterludeOnly}` : ''}`}>
+      <div className={`${styles.message} ${styles.messageAssistant}${hasWideBlock ? ` ${styles.messageHasWideBlock}` : ''}${isInterludeOnly ? ` ${styles.messageAssistantInterludeOnly}` : ''}`}>
         {blocks.map((block, i) => (
           <ContentBlockErrorBoundary
             key={`block-${i}`}
@@ -216,14 +202,6 @@ export const AssistantMessage = memo(function AssistantMessage({
     </div>
   );
 });
-
-function RegenerateIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M21 3v5m0 0h-5m5 0-3-2.708A9 9 0 1 0 20.777 14" />
-    </svg>
-  );
-}
 
 class ContentBlockErrorBoundary extends Component<{
   messageId: string;
@@ -800,7 +778,10 @@ const ScreenshotBlock = memo(function ScreenshotBlock({ block, sessionPath, mess
 
   return (
     <div className={styles.browserScreenshot} onClick={handleClick} style={{ cursor: 'default' }}>
-      <img src={`data:${block.mimeType};base64,${block.base64}`} alt={window.t('chat.browserScreenshot')} />
+      <img
+        src={`data:${block.mimeType};base64,${block.base64}`}
+        alt={window.t('chat.browserScreenshot')}
+      />
     </div>
   );
 });
@@ -838,6 +819,8 @@ function defaultAutomationAgentId(agents: any[], currentAgentId: string | null, 
     || null;
 }
 
+class AutomationSubmissionError extends Error {}
+
 function buildAutomationExecutionContext({
   agent,
   agentId,
@@ -852,6 +835,10 @@ function buildAutomationExecutionContext({
   const homeFolder = typeof agent?.homeFolder === 'string' && agent.homeFolder.trim()
     ? agent.homeFolder.trim()
     : null;
+  const baseAgentId = typeof baseContext.createdByAgentId === 'string' && baseContext.createdByAgentId.trim()
+    ? baseContext.createdByAgentId.trim()
+    : null;
+  const crossesAgentBoundary = !!baseAgentId && !!agentId && baseAgentId !== agentId;
   return {
     kind: typeof baseContext.kind === 'string' && baseContext.kind.trim()
       ? baseContext.kind
@@ -862,9 +849,18 @@ function buildAutomationExecutionContext({
       : (Array.isArray(baseContext.workspaceFolders)
         ? baseContext.workspaceFolders.filter((folder: unknown) => typeof folder === 'string' && folder.trim())
         : []),
-    sourceSessionPath: typeof baseContext.sourceSessionPath === 'string' && baseContext.sourceSessionPath.trim()
-      ? baseContext.sourceSessionPath
-      : (sessionPath || null),
+    authorizedFolders: crossesAgentBoundary
+      ? []
+      : (Array.isArray(baseContext.authorizedFolders)
+        ? baseContext.authorizedFolders.filter((folder: unknown) => typeof folder === 'string' && folder.trim())
+        : []),
+    sourceSessionId: crossesAgentBoundary ? null : (baseContext.sourceSessionId || null),
+    sourceBridgeSessionKey: crossesAgentBoundary ? null : (baseContext.sourceBridgeSessionKey || null),
+    sourceSessionPath: crossesAgentBoundary
+      ? null
+      : typeof baseContext.sourceSessionPath === 'string' && baseContext.sourceSessionPath.trim()
+        ? baseContext.sourceSessionPath
+        : (sessionPath || null),
     createdByAgentId: agentId || null,
   };
 }
@@ -881,13 +877,16 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
   const confirmLabelKey = operation === 'update' ? 'automation.confirmUpdate' : 'automation.confirmCreate';
   const initialType = (jobData.type || jobData.scheduleType || 'cron') as string;
   const agents = useStore(s => s.agents);
+  const addToast = useStore(s => s.addToast);
   const currentAgentId = useStore(s => s.currentAgentId);
+  const sourceSessionId = useStore(state => sessionIdForPathFromLocatorState(state, sessionPath));
   const fallbackAgentName = useStore(s => s.agentName) || 'Hanako';
   const fallbackAgentYuan = useStore(s => s.agentYuan) || 'hanako';
   const initialPrompt = (jobData.prompt as string) || (block.description as string) || '';
   const [draftLabel, setDraftLabel] = useState((jobData.label as string) || (block.title as string) || initialPrompt.slice(0, 40) || '');
   const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(() => scheduleDraftFromStored(initialType, jobData.schedule));
   const [draftPrompt, setDraftPrompt] = useState(initialPrompt);
+  const [submitting, setSubmitting] = useState(false);
   const label = draftLabel || (draftPrompt || '').slice(0, 40) || '';
   const schedulePreview = schedulePreviewFromDraft(scheduleDraft);
   const pending = status === 'pending';
@@ -972,18 +971,54 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
   };
 
   const submitDraftJob = async (editedJobData: Record<string, unknown>) => {
+    if (isSuggestionCard) {
+      const suggestionId = block.suggestionId || block.detail?.suggestionId;
+      if (typeof suggestionId !== 'string' || !suggestionId.trim() || !sourceSessionId) {
+        throw new Error('automation suggestion identity unavailable');
+      }
+      const response = await hanaFetch('/api/desk/cron', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'apply_suggestion',
+          suggestionId: suggestionId.trim(),
+          sessionId: sourceSessionId,
+          jobData: {
+            type: editedJobData.type,
+            schedule: editedJobData.schedule,
+            label: editedJobData.label,
+            prompt: editedJobData.prompt,
+            model: editedJobData.model,
+            ...(effectiveAgentId ? { targetAgentId: effectiveAgentId } : {}),
+          },
+        }),
+        throwOnHttpError: false,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new AutomationSubmissionError(normalizeSessionRouteError(body).message);
+      }
+      return;
+    }
     const isUpdate = operation === 'update';
     const { id, ...fields } = editedJobData;
-    await hanaFetch('/api/desk/cron', {
+    const response = await hanaFetch('/api/desk/cron', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(isUpdate
         ? { action: 'update', id, ...fields }
         : { action: 'add', ...editedJobData }),
+      throwOnHttpError: false,
     });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new AutomationSubmissionError(normalizeSessionRouteError(body).message);
+    }
   };
 
   const handleApprove = async () => {
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const editedJobData = buildDraftJobData();
       if (isSuggestionCard) {
@@ -999,7 +1034,13 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
       }
       setStatus('approved');
       setModalOpen(false);
-    } catch { /* silent */ }
+    } catch (err) {
+      const prefix = window.t('automation.createFailed');
+      const detail = err instanceof AutomationSubmissionError ? err.message.trim() : '';
+      addToast(detail ? `${prefix}: ${detail}` : prefix, 'error');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const handleReject = async () => {
@@ -1051,6 +1092,7 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
               value={draftLabel}
               onChange={e => setDraftLabel(e.target.value)}
               placeholder={window.t('automation.draftTitle')}
+              spellCheck={false}
             />
             <button className={styles.automationDraftIconButton} type="button" title={window.t('automation.closeDraft')} onClick={() => setModalOpen(false)}>
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1065,6 +1107,7 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
             onChange={e => setDraftPrompt(e.target.value)}
             placeholder={window.t('automation.promptPlaceholder', { agent: agentInfo.displayName })}
             aria-label={window.t('automation.field.prompt')}
+            spellCheck={false}
           />
           <div className={styles.automationDraftFooter}>
             <ScheduleEditor draft={scheduleDraft} onChange={setScheduleDraft} className={styles.automationDraftSchedule} />
@@ -1108,8 +1151,8 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
               />
             </label>
             <div className={styles.automationDraftActions}>
-              <button className={styles.automationDraftTextButton} type="button" onClick={handleReject}>{window.t('common.cancel')}</button>
-              <button className={styles.automationDraftPrimaryButton} type="button" onClick={handleApprove}>{window.t(confirmLabelKey)}</button>
+              <button className={styles.automationDraftTextButton} type="button" onClick={handleReject} disabled={submitting}>{window.t('common.cancel')}</button>
+              <button className={styles.automationDraftPrimaryButton} type="button" onClick={handleApprove} disabled={submitting} aria-busy={submitting}>{window.t(confirmLabelKey)}</button>
             </div>
           </div>
         </div>
@@ -1124,6 +1167,16 @@ const CronConfirmBlock = memo(function CronConfirmBlock({ block, sessionPath }: 
       {modal}
     </>
   );
+});
+
+// suggestion_card 分发：session 协作草稿（send / create）走 SessionCollabDraftCard，
+// 其余（automation_draft 等）沿用既有 CronConfirmBlock。BLOCK_RENDERERS 是「组件引用」表，
+// 保持表结构不变，只把 'suggestion_card' 注册成这个小分发器。
+const SuggestionCardDispatch = memo(function SuggestionCardDispatch({ block, sessionPath }: { block: any; sessionPath?: string }) {
+  if (block.kind === 'session_send_draft' || block.kind === 'session_create_draft') {
+    return <SessionCollabDraftCard block={block} sessionPath={sessionPath} />;
+  }
+  return <CronConfirmBlock block={block} sessionPath={sessionPath} />;
 });
 
 function AutomationDraftIcon() {
@@ -1156,6 +1209,7 @@ BLOCK_RENDERERS['artifact'] = LegacyArtifactBlock;
 BLOCK_RENDERERS['plugin_card'] = PluginCardWrapper;
 BLOCK_RENDERERS['skill'] = SkillBlock;
 BLOCK_RENDERERS['cron_confirm'] = CronConfirmBlock;
-BLOCK_RENDERERS['suggestion_card'] = CronConfirmBlock;
+BLOCK_RENDERERS['suggestion_card'] = SuggestionCardDispatch;
 BLOCK_RENDERERS['settings_confirm'] = SettingsConfirmBlock;
 BLOCK_RENDERERS['settings_update'] = SettingsUpdateBlock;
+BLOCK_RENDERERS['interactive_card'] = InteractiveCard;

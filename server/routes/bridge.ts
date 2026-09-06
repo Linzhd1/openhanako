@@ -9,12 +9,26 @@ import path from "path";
 import { Hono } from "hono";
 import { safeJson } from "../hono-helpers.ts";
 import { debugLog } from "../../lib/debug-log.ts";
-import { parseSessionKey, collectKnownUsers, KNOWN_PLATFORMS } from "../../lib/bridge/session-key.ts";
+import { parseSessionKey, collectKnownUsers, KNOWN_PLATFORMS, resolveBridgeSessionIdentity } from "../../lib/bridge/session-key.ts";
 import { isBridgeOwner, resolveBridgeOwnerUserId } from "../../lib/bridge/owner-policy.ts";
 import { collectBridgeMediaAllowedRoots, isInsideBridgeMediaRoot } from "../../lib/bridge/media-roots.ts";
+import { sanitizeBridgeVisibleText } from "../../shared/bridge-visible-text.ts";
 import { t } from "../../lib/i18n.ts";
-import { resolveAgent, resolveAgentStrict } from "../utils/resolve-agent.ts";
+import { AgentNotFoundError, resolveAgentStrict } from "../utils/resolve-agent.ts";
 import { telegramBotOptions } from "../../lib/net/outbound-proxy.ts";
+import { createBridgeOutboundHttp } from "../../lib/bridge/outbound-http.ts";
+import {
+  DINGTALK_API_BASE_URL,
+  assertNoUnsupportedDingTalkRobotFields,
+  canonicalizeDingTalkBridgeConfig,
+  normalizeDingTalkBridgeCredentials,
+} from "../../lib/bridge/dingtalk-contract.ts";
+import {
+  DingTalkApiError,
+  dingtalkErrorInfo,
+  requestDingTalkAccessToken,
+} from "../../lib/bridge/dingtalk-api.ts";
+import { formatSecretFingerprintComparison } from "../../lib/secret-fingerprint.ts";
 import {
   collectSecretPatchPaths,
   isMaskedSecretValue,
@@ -26,25 +40,76 @@ import { recordSecurityAuditEvent } from "../http/security-audit.ts";
 import { normalizeBridgePermissionMode, SESSION_PERMISSION_MODES } from "../../core/session-permission-mode.ts";
 
 const MAX_BRIDGE_MEDIA_SIZE = 50 * 1024 * 1024;
-const FEISHU_TENANT_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
-const DINGTALK_ACCESS_TOKEN_URL = "https://api.dingtalk.io/v1.0/oauth2/accessToken";
+const DEFAULT_FEISHU_REGION = "feishu_cn";
+const FEISHU_DOMAIN_BY_REGION: Record<string, string> = Object.freeze({
+  feishu_cn: "https://open.feishu.cn",
+  lark_global: "https://open.larksuite.com",
+});
 
-function feishuLongConnectionInfo() {
+function cleanBridgeString(value: unknown) {
+  return typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
+}
+
+function firstBridgeString(...values: unknown[]) {
+  for (const value of values) {
+    const cleaned = cleanBridgeString(value);
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+function normalizeFeishuRegion(region: any = DEFAULT_FEISHU_REGION) {
+  const value = typeof region === "string" ? region.trim() : region;
+  if (value === undefined || value === null || value === "") return DEFAULT_FEISHU_REGION;
+  if (value === "feishu_cn" || value === "lark_global") return value;
+  throw new Error(`unsupported Feishu region: ${value}`);
+}
+
+function resolveFeishuDomain(region: any = DEFAULT_FEISHU_REGION) {
+  const normalizedRegion = normalizeFeishuRegion(region);
   return {
+    region: normalizedRegion,
+    domain: FEISHU_DOMAIN_BY_REGION[normalizedRegion],
+    tenantTokenUrl: `${FEISHU_DOMAIN_BY_REGION[normalizedRegion]}/open-apis/auth/v3/tenant_access_token/internal`,
+  };
+}
+
+function feishuStatusDomainInfo(cfg: any = {}) {
+  try {
+    return { ...resolveFeishuDomain(cfg?.region), configError: null };
+  } catch (err: any) {
+    return {
+      region: cfg?.region || DEFAULT_FEISHU_REGION,
+      domain: null,
+      tenantTokenUrl: null,
+      configError: err?.message || String(err),
+    };
+  }
+}
+
+function feishuLongConnectionInfo(domainInfo: any) {
+  return {
+    region: domainInfo.region,
+    domain: domainInfo.domain,
     eventDelivery: "long_connection",
     callbackUrlRequired: false,
+    credentialVerification: {
+      status: "tested",
+      method: "tenant_access_token",
+      endpoint: domainInfo.tenantTokenUrl,
+    },
     longConnection: {
       status: "not_tested",
-      reason: "bridge/test validates credentials only; the runtime WSClient reports live long-connection status after the connector is enabled.",
+      reason: "bridge/test validates credentials by tenant token only; runtime WSClient long-connection status is reported after the connector is enabled.",
     },
   };
 }
 
-function feishuTestInfo({ credentialOk, response, data }: { credentialOk?: any; response?: any; data?: any } = {}) {
+function feishuTestInfo({ credentialOk, response, data, domainInfo }: { credentialOk?: any; response?: any; data?: any; domainInfo?: any } = {}) {
   const logId = data?.error?.log_id || data?.log_id || null;
   return {
     credentialOk,
-    ...feishuLongConnectionInfo(),
+    ...feishuLongConnectionInfo(domainInfo || resolveFeishuDomain()),
     ...(response ? { httpStatus: response.status } : {}),
     ...(data?.code !== undefined ? { feishuCode: data.code } : {}),
     ...(data?.msg ? { feishuMessage: data.msg } : {}),
@@ -63,14 +128,18 @@ function dingtalkStreamInfo() {
   };
 }
 
-function dingtalkTestInfo({ credentialOk, response, data }: { credentialOk?: any; response?: any; data?: any } = {}) {
+function dingtalkTestInfo({ credentialOk, authMode, metadata, errorInfo }: {
+  credentialOk?: any;
+  authMode?: "current" | "legacy_app";
+  metadata?: any;
+  errorInfo?: any;
+} = {}) {
   return {
     credentialOk,
+    ...(authMode ? { authMode } : {}),
     ...dingtalkStreamInfo(),
-    ...(response ? { httpStatus: response.status } : {}),
-    ...(data?.code !== undefined ? { dingtalkCode: data.code } : {}),
-    ...(data?.errcode !== undefined ? { dingtalkErrcode: data.errcode } : {}),
-    ...(data?.message || data?.errmsg || data?.msg ? { dingtalkMessage: data.message || data.errmsg || data.msg } : {}),
+    ...(metadata || {}),
+    ...(errorInfo || {}),
   };
 }
 
@@ -115,13 +184,16 @@ export function buildBridgeStatus(engine: any, manager: any, agent: any) {
   const live = manager?.getStatus?.(agent.id) || {};
   const bridge = agent.config?.bridge || {};
   const index = engine.getBridgeIndex?.(agent.id) || {};
+  const feishuDomainInfo = feishuStatusDomainInfo(bridge.feishu);
 
   const platformStatus = (plat: any, cfg: any, extraFields: any) => {
+    const enabled = !!cfg?.enabled;
+    const configError = extraFields?.configError || null;
     return {
       ...extraFields,
-      enabled: !!cfg?.enabled,
-      status: live[plat]?.status || "disconnected",
-      error: live[plat]?.error || null,
+      enabled,
+      status: enabled && configError ? "error" : live[plat]?.status || "disconnected",
+      error: enabled && configError ? configError : live[plat]?.error || configError,
       agentId: agent.id,
     };
   };
@@ -129,9 +201,60 @@ export function buildBridgeStatus(engine: any, manager: any, agent: any) {
   const tgToken = bridge.telegram?.token || "";
   const fsAppId = bridge.feishu?.appId || "";
   const fsAppSecret = bridge.feishu?.appSecret || "";
-  const dtClientId = bridge.dingtalk?.clientId || "";
-  const dtClientSecret = bridge.dingtalk?.clientSecret || "";
-  const dtRobotCode = bridge.dingtalk?.robotCode || "";
+  const qqSecret = preferredQQSecret(bridge.qq);
+  const dtRaw = bridge.dingtalk || {};
+  let dtCorpId = cleanBridgeString(dtRaw.corpId);
+  let dtAuthMode = dtRaw.authMode === "legacy_app" ? "legacy_app" : "current";
+  let dtClientId = firstBridgeString(dtRaw.clientId, dtRaw.appKey);
+  let dtClientSecret = firstBridgeString(dtRaw.clientSecret, dtRaw.appSecret);
+  let dtRobotCode = cleanBridgeString(dtRaw.robotCode);
+  let dtApiBaseUrl = firstBridgeString(dtRaw.apiBaseUrl, dtRaw.restBaseUrl, DINGTALK_API_BASE_URL);
+  const dtHasConfig = !!(
+    dtRaw.enabled
+    || dtCorpId
+    || dtRaw.authMode
+    || dtClientId
+    || dtClientSecret
+    || dtRobotCode
+    || dtRaw.apiBaseUrl
+    || dtRaw.restBaseUrl
+    || dtRaw.streamOpenUrl
+    || dtRaw.webhook
+    || dtRaw.webhookUrl
+    || dtRaw.webhookToken
+    || dtRaw.webhookSecret
+    || dtRaw.robotWebhook
+    || dtRaw.robotToken
+    || dtRaw.token
+    || dtRaw.secret
+  );
+  let dtConfigured = false;
+  let dtConfigError = null;
+  if (dtHasConfig) {
+    try {
+      const normalized = normalizeDingTalkBridgeCredentials(dtRaw);
+      dtCorpId = normalized.corpId;
+      dtAuthMode = normalized.authMode;
+      dtClientId = normalized.clientId;
+      dtClientSecret = normalized.clientSecret;
+      dtRobotCode = normalized.robotCode;
+      dtApiBaseUrl = normalized.apiBaseUrl;
+      dtConfigured = true;
+    } catch (err: any) {
+      try {
+        const canonical = canonicalizeDingTalkBridgeConfig(dtRaw);
+        dtCorpId = canonical.corpId;
+        dtAuthMode = canonical.authMode === "legacy_app" ? "legacy_app" : "current";
+        dtClientId = canonical.clientId;
+        dtClientSecret = canonical.clientSecret;
+        dtRobotCode = canonical.robotCode;
+        dtApiBaseUrl = canonical.apiBaseUrl;
+      } catch {
+        // Keep the raw projection above when even URL canonicalization fails.
+      }
+      dtConfigError = err?.message || String(err);
+    }
+  }
 
   const ownerDict = {};
   for (const plat of KNOWN_PLATFORMS) {
@@ -148,25 +271,40 @@ export function buildBridgeStatus(engine: any, manager: any, agent: any) {
   return {
     agentId: agent.id,
     telegram: platformStatus("telegram", bridge.telegram, {
-      configured: !!tgToken, token: maskSecretValue(tgToken),
+      configured: !!tgToken, token: maskSecretValue(tgToken), hasToken: !!tgToken,
     }),
     feishu: platformStatus("feishu", bridge.feishu, {
-      configured: !!(fsAppId && fsAppSecret), appId: fsAppId, appSecret: maskSecretValue(fsAppSecret),
+      configured: !!(fsAppId && fsAppSecret && !feishuDomainInfo.configError),
+      appId: fsAppId,
+      appSecret: maskSecretValue(fsAppSecret),
+      hasAppSecret: !!fsAppSecret,
+      region: feishuDomainInfo.region,
+      domain: feishuDomainInfo.domain,
+      configError: feishuDomainInfo.configError,
     }),
     dingtalk: platformStatus("dingtalk", bridge.dingtalk, {
-      configured: !!(dtClientId && dtClientSecret && dtRobotCode),
+      configured: dtConfigured,
+      authMode: dtAuthMode,
+      corpId: dtCorpId,
       clientId: dtClientId,
       clientSecret: maskSecretValue(dtClientSecret),
+      hasClientSecret: !!dtClientSecret,
       robotCode: dtRobotCode,
+      apiBaseUrl: dtApiBaseUrl,
+      // Compatibility projection for pre-canonical desktop clients.
+      restBaseUrl: dtApiBaseUrl,
+      configError: dtConfigError,
     }),
     qq: platformStatus("qq", bridge.qq, {
-      configured: !!(bridge.qq?.appID && (bridge.qq?.appSecret || bridge.qq?.token)),
+      configured: !!(bridge.qq?.appID && qqSecret),
       appID: bridge.qq?.appID || "",
-      appSecret: maskSecretValue(bridge.qq?.appSecret || bridge.qq?.token || ""),
+      appSecret: maskSecretValue(qqSecret),
+      hasAppSecret: !!qqSecret,
     }),
     wechat: platformStatus("wechat", bridge.wechat, {
       configured: !!bridge.wechat?.botToken,
       token: maskSecretValue(bridge.wechat?.botToken || ""),
+      hasBotToken: !!bridge.wechat?.botToken,
     }),
     permissionMode,
     readOnly,
@@ -195,9 +333,27 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
     }
   }
 
+  /**
+   * Bridge reads answer for exactly one agent, so the request has to name it.
+   * There is no server-wide "current" agent that is the right answer for every
+   * connected client, so a request without an agentId gets a 404 rather than
+   * whichever agent the server happens to be focused on.
+   */
+  function withReadAgent(handler: (c: any, agent: any) => any) {
+    return async (c: any) => {
+      let agent;
+      try {
+        agent = resolveAgentStrict(engine, c);
+      } catch (err) {
+        if (err instanceof AgentNotFoundError) return c.json({ error: err.message }, 404);
+        throw err;
+      }
+      return handler(c, agent);
+    };
+  }
+
   /** 获取所有平台连接状态（从 agent.config.bridge 读取） */
-  route.get("/bridge/status", async (c) => {
-    const agent = resolveAgent(engine, c);
+  route.get("/bridge/status", withReadAgent(async (c, agent) => {
     const manager = resolveBridgeManager();
     const bridgeState = bridgeRef.getState?.() || { ready: !!manager, initializing: false, error: null };
     return c.json({
@@ -206,7 +362,7 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
       bridgeInitializing: !!bridgeState.initializing,
       bridgeError: bridgeState.error || null,
     });
-  });
+  }));
 
   /** 设置 owner（哪个账号是你）— 写入 agent.config.bridge */
   route.post("/bridge/owner", async (c) => {
@@ -220,7 +376,7 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
     const agent = resolveAgentStrict(engine, c);
     agent.updateConfig({ bridge: { [platform]: { owner: userId || null } } });
     debugLog()?.log("api", `POST /api/bridge/owner agent=${agent.id} platform=${platform} owner=${userId ? "[set]" : "[cleared]"}`);
-    return c.json({ ok: true });
+    return c.json({ ok: true, status: buildBridgeStatus(engine, resolveBridgeManager(), agent) });
   });
 
   /** 保存凭证 + 启停平台（写入 agent.config.bridge） */
@@ -242,20 +398,81 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
     const agentId = agent.id;
 
     const bridgeCfg = agent.config?.bridge?.[platform] || {};
-    const patch = { ...bridgeCfg };
+    let patch = { ...bridgeCfg };
 
     if (credentials) {
-      Object.assign(patch, resolveBridgeCredentials(platform, credentials, bridgeCfg));
+      try {
+        if (platform === "dingtalk") {
+          patch = mergeDingTalkCredentialInput(bridgeCfg, credentials);
+        } else if (platform === "qq") {
+          patch = mergeQQCredentialInput(bridgeCfg, credentials);
+        } else {
+          patch = { ...patch, ...resolveBridgeCredentials(platform, credentials, bridgeCfg) };
+        }
+      } catch (err: any) {
+        return c.json({ ok: false, error: err?.message || String(err) }, 400);
+      }
     }
     if (typeof enabled === "boolean") patch.enabled = enabled;
+    if (platform === "feishu") {
+      try {
+        patch.region = resolveFeishuDomain(patch.region).region;
+      } catch (err: any) {
+        return c.json({ ok: false, error: err?.message || String(err) }, 400);
+      }
+    }
+    if (platform === "dingtalk") {
+      try {
+        assertNoUnsupportedDingTalkRobotFields(patch);
+        patch = canonicalizeDingTalkBridgeConfig(patch);
+        if (patch.enabled) normalizeDingTalkBridgeCredentials(patch);
+      } catch (err: any) {
+        return c.json({ ok: false, error: err?.message || String(err) }, 400);
+      }
+    }
 
     agent.updateConfig({ bridge: { [platform]: patch } });
 
+    let persistedPatch = agent.config?.bridge?.[platform] || patch;
+
+    if (platform === "dingtalk") {
+      const incoming = resolveDingTalkDiagnosticSecret(credentials, bridgeCfg);
+      let persisted;
+      try {
+        persisted = canonicalizeDingTalkBridgeConfig(agent.config?.bridge?.dingtalk || {});
+      } catch (err: any) {
+        resolveBridgeManager()?.stopPlatform(platform, agentId);
+        return c.json({
+          ok: false,
+          error: `DingTalk configuration could not be reloaded after save: ${err?.message || String(err)}`,
+        }, 500);
+      }
+      debugLog()?.log(
+        "api",
+        `[dingtalk] ${formatSecretFingerprintComparison({
+          stage: "config_save",
+          beforeLabel: incoming.label,
+          before: incoming.value,
+          afterLabel: "persisted",
+          after: persisted.clientSecret,
+        })}`,
+      );
+      const suppliedPlaintextSecret = hasPlaintextDingTalkSecret(credentials);
+      if (suppliedPlaintextSecret && patch.clientSecret !== persisted.clientSecret) {
+        resolveBridgeManager()?.stopPlatform(platform, agentId);
+        return c.json({
+          ok: false,
+          error: "DingTalk Client Secret was not persisted intact; the connector was not started",
+        }, 500);
+      }
+      persistedPatch = persisted;
+    }
+
     // Start/stop
-    if (patch.enabled) {
+    if (persistedPatch.enabled) {
       const manager = await ensureBridgeManager();
       if (!manager) return bridgeUnavailable(c, bridgeRef.getState?.() || {});
-      manager.startPlatformFromConfig(platform, patch, agentId);
+      manager.startPlatformFromConfig(platform, persistedPatch, agentId);
     } else {
       resolveBridgeManager()?.stopPlatform(platform, agentId);
     }
@@ -328,16 +545,14 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
   });
 
   /** 获取最近消息日志（实时内存缓冲） */
-  route.get("/bridge/messages", async (c) => {
+  route.get("/bridge/messages", withReadAgent(async (c, agent) => {
     const limit = parseInt(c.req.query("limit"), 10) || 50;
-    const agent = resolveAgent(engine, c);
     return c.json({ messages: resolveBridgeManager()?.getMessages(limit, agent.id) || [] });
-  });
+  }));
 
   /** 获取 bridge session 列表 */
-  route.get("/bridge/sessions", async (c) => {
+  route.get("/bridge/sessions", withReadAgent(async (c, agent) => {
     const platform = c.req.query("platform"); // optional filter
-    const agent = resolveAgent(engine, c);
     const index = engine.getBridgeIndex(agent.id);
     const bridgeDir = path.join(agent.sessionDir, "bridge");
     const sessions = [];
@@ -364,14 +579,15 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
         lastActive = stat.mtimeMs;
       } catch {}
 
-      const userId = entry.userId || (plat === "wechat" && chatType === "dm" ? chatId : null);
-      const aliases = Array.isArray(entry.qqPrincipal?.aliases) ? entry.qqPrincipal.aliases : undefined;
+      const identity = resolveBridgeSessionIdentity(entry, { sessionKey, parsed: { platform: plat, chatType, chatId } });
+      const userId = identity.userId || (plat === "wechat" && chatType === "dm" ? chatId : null);
+      const aliases = identity.aliases;
       const isOwner = isBridgeOwner({ platform: plat, chatType, userId, aliases, agent });
 
       sessions.push({
         sessionKey, platform: plat, chatType, chatId, file, sessionPath: fp, lastActive,
-        displayName: entry.name || null,
-        avatarUrl: entry.avatarUrl || null,
+        displayName: identity.displayName || null,
+        avatarUrl: identity.avatarUrl || null,
         isOwner,
       });
     }
@@ -379,12 +595,11 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
     // 按最后活跃时间排序
     sessions.sort((a, b) => (b.lastActive || 0) - (a.lastActive || 0));
     return c.json({ sessions });
-  });
+  }));
 
   /** 读取指定 bridge session 的消息 */
-  route.get("/bridge/sessions/:sessionKey/messages", async (c) => {
+  route.get("/bridge/sessions/:sessionKey/messages", withReadAgent(async (c, agent) => {
     const sessionKey = c.req.param("sessionKey");
-    const agent = resolveAgent(engine, c);
     const index = engine.getBridgeIndex(agent.id);
     const raw = index[sessionKey];
     const file = typeof raw === "string" ? raw : raw?.file;
@@ -423,9 +638,10 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
 
         const hasMedia = mediaCount > 0;
         if (!textContent && !hasMedia) continue;
+        const visibleContent = sanitizeBridgeVisibleText(textContent) || (hasMedia ? `[图片 x${mediaCount}]` : "");
         messages.push({
           role: msg.role,
-          content: textContent || (hasMedia ? `[图片 x${mediaCount}]` : ""),
+          content: visibleContent,
           hasMedia,
           mediaCount,
           ts: line.timestamp || null,
@@ -436,7 +652,7 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
     } catch (err) {
       return c.json({ error: err.message, messages: [] });
     }
-  });
+  }));
 
   /** 重置 bridge session（清除上下文，下次消息新建 session） */
   route.post("/bridge/sessions/:sessionKey/reset", async (c) => {
@@ -564,8 +780,14 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
   /** 测试凭证（不启动轮询） */
   route.post("/bridge/test", async (c) => {
     const body = await safeJson(c);
-    const { platform, credentials } = body;
-    if (!platform || !credentials) {
+    const { platform, useSavedCredentials } = body;
+    if (useSavedCredentials !== undefined && typeof useSavedCredentials !== "boolean") {
+      return c.json({ error: "useSavedCredentials must be a boolean" }, 400);
+    }
+    const credentials = body.credentials && typeof body.credentials === "object"
+      ? body.credentials
+      : null;
+    if (!platform || (!credentials && useSavedCredentials !== true)) {
       return c.json({ error: "platform and credentials required" }, 400);
     }
 
@@ -574,26 +796,39 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
     }
     const scopeDenied = denyWithoutScope(c, "bridge.manage");
     if (scopeDenied) return scopeDenied;
-    const secretFields = collectSecretPatchPaths({ credentials }, bridgeSecretKeys(platform));
+    const providedCredentials = credentials || {};
+    const secretFields = collectSecretPatchPaths({ credentials: providedCredentials }, bridgeSecretKeys(platform));
     const secretDenied = denySecretMutationWithoutScope(c, secretFields);
     if (secretDenied) return secretDenied;
 
     try {
-      const usesMaskedCredentials = hasMaskedBridgeCredentials(platform, credentials);
-      if (usesMaskedCredentials && !hasExplicitAgentId(c)) {
-        return c.json({ error: "agentId is required when testing masked bridge credentials" }, 400);
+      const usesMaskedCredentials = hasMaskedBridgeCredentials(platform, providedCredentials);
+      if (useSavedCredentials !== true && usesMaskedCredentials) {
+        return c.json({ error: "masked credentials require useSavedCredentials=true" }, 400);
       }
-      const saved = usesMaskedCredentials
+      const shouldUseSavedCredentials = useSavedCredentials === true;
+      if (shouldUseSavedCredentials && !hasExplicitAgentId(c)) {
+        return c.json({ error: "agentId is required when testing saved or masked bridge credentials" }, 400);
+      }
+      const saved = shouldUseSavedCredentials
         ? resolveAgentStrict(engine, c).config?.bridge?.[platform] || {}
         : {};
-      const effectiveCredentials = resolveBridgeCredentials(platform, credentials, saved);
+      const resolvedCredentials = platform === "dingtalk"
+        ? mergeDingTalkCredentialInput(shouldUseSavedCredentials ? saved : {}, providedCredentials)
+        : platform === "qq"
+          ? mergeQQCredentialInput(shouldUseSavedCredentials ? saved : {}, providedCredentials)
+          : resolveBridgeCredentials(platform, providedCredentials, saved);
+      const effectiveCredentials = shouldUseSavedCredentials && platform !== "dingtalk" && platform !== "qq"
+        ? { ...saved, ...resolvedCredentials }
+        : resolvedCredentials;
       if (platform === "telegram") {
         const TelegramBot = (await import("node-telegram-bot-api")).default;
         const bot = new TelegramBot(effectiveCredentials.token, telegramBotOptions());
         const me = await bot.getMe();
         return c.json({ ok: true, info: { username: me.username, name: me.first_name } });
       } else if (platform === "feishu") {
-        const resp = await fetch(FEISHU_TENANT_TOKEN_URL, {
+        const domainInfo = resolveFeishuDomain(effectiveCredentials.region);
+        const resp = await fetch(domainInfo.tenantTokenUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -608,45 +843,75 @@ export function createBridgeRoute(engine: any, bridgeManagerRef: any) {
             ok: true,
             info: {
               msg: t("error.tokenSuccess"),
-              ...feishuTestInfo({ credentialOk: true, response: resp, data }),
+              ...feishuTestInfo({ credentialOk: true, response: resp, data, domainInfo }),
             },
           });
         }
         return c.json({
           ok: false,
           error: data.msg || t("error.verifyFailed"),
-          info: feishuTestInfo({ credentialOk: false, response: resp, data }),
+          info: feishuTestInfo({ credentialOk: false, response: resp, data, domainInfo }),
         });
       } else if (platform === "dingtalk") {
-        if (!effectiveCredentials.clientId || !effectiveCredentials.clientSecret || !effectiveCredentials.robotCode) {
-          return c.json({ ok: false, error: "clientId, clientSecret and robotCode required" }, 400);
-        }
-        const resp = await fetch(DINGTALK_ACCESS_TOKEN_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            appKey: effectiveCredentials.clientId,
-            appSecret: effectiveCredentials.clientSecret,
-          }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        const data = await resp.json();
-        const code = data.code ?? data.errcode;
-        const token = data.accessToken || data.access_token;
-        if (resp.ok && token && (code === undefined || code === 0 || code === "0")) {
+        const dingtalkCredentials = normalizeDingTalkBridgeCredentials(effectiveCredentials);
+        try {
+          const dingtalkHttp = createBridgeOutboundHttp({
+            platform: "dingtalk",
+            fetchImpl: fetch as any,
+          });
+          const result = await requestDingTalkAccessToken(
+            dingtalkCredentials,
+            (request) => dingtalkHttp.request({
+              stage: "token_test",
+              url: request.url,
+              ...request.init,
+              timeoutMs: 10_000,
+              idempotent: true,
+              maxRetries: 0,
+            }),
+            (request) => {
+              debugLog()?.log(
+                "api",
+                `[dingtalk] ${formatSecretFingerprintComparison({
+                  stage: "credential_test",
+                  beforeLabel: shouldUseSavedCredentials ? "saved" : "normalized",
+                  before: shouldUseSavedCredentials
+                    ? preferredDingTalkSecret(saved)
+                    : dingtalkCredentials.clientSecret,
+                  afterLabel: shouldUseSavedCredentials ? "effective" : "outbound",
+                  after: shouldUseSavedCredentials
+                    ? dingtalkCredentials.clientSecret
+                    : "client_secret" in request.payload
+                      ? request.payload.client_secret
+                      : request.payload.appSecret,
+                })}`,
+              );
+            },
+          );
           return c.json({
             ok: true,
             info: {
               msg: t("error.tokenSuccess"),
-              ...dingtalkTestInfo({ credentialOk: true, response: resp, data }),
+              ...dingtalkTestInfo({
+                credentialOk: true,
+                authMode: dingtalkCredentials.authMode,
+                metadata: result.metadata,
+              }),
             },
           });
+        } catch (err: any) {
+          if (!(err instanceof DingTalkApiError)) throw err;
+          const errorInfo = dingtalkErrorInfo(err);
+          return c.json({
+            ok: false,
+            error: errorInfo?.dingtalkMessage || t("error.verifyFailed"),
+            info: dingtalkTestInfo({
+              credentialOk: false,
+              authMode: dingtalkCredentials.authMode,
+              errorInfo,
+            }),
+          });
         }
-        return c.json({
-          ok: false,
-          error: data.message || data.errmsg || data.msg || t("error.verifyFailed"),
-          info: dingtalkTestInfo({ credentialOk: false, response: resp, data }),
-        });
       } else if (platform === "qq") {
         // v2 鉴权：appID + appSecret → access_token → /users/@me
         const tokenRes = await fetch("https://bots.qq.com/app/getAppAccessToken", {
@@ -719,6 +984,95 @@ function resolveBridgeCredentials(platform: any, credentials: any, existing: any
   });
 }
 
+function hasOwnBridgeField(value: any, field: string) {
+  return Boolean(value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, field));
+}
+
+function mergeDingTalkCredentialInput(existing: any, credentials: any) {
+  const source = credentials && typeof credentials === "object" ? credentials : {};
+  const saved = canonicalizeDingTalkBridgeConfig(
+    existing && typeof existing === "object" ? existing : {},
+  );
+  const merged: Record<string, any> = {
+    ...saved,
+    ...source,
+  };
+
+  // Patch precedence is request-local: canonical wins when both forms appear;
+  // otherwise a legacy field may intentionally replace or clear canonical
+  // state. Persist only the canonical form after the merge.
+  if (hasOwnBridgeField(source, "clientId")) merged.clientId = source.clientId;
+  else if (hasOwnBridgeField(source, "appKey")) merged.clientId = source.appKey;
+
+  if (hasOwnBridgeField(source, "clientSecret")) {
+    merged.clientSecret = isMaskedSecretValue(source.clientSecret)
+      ? saved.clientSecret
+      : source.clientSecret;
+  } else if (hasOwnBridgeField(source, "appSecret")) {
+    merged.clientSecret = isMaskedSecretValue(source.appSecret)
+      ? saved.clientSecret
+      : source.appSecret;
+  }
+
+  if (hasOwnBridgeField(source, "apiBaseUrl")) merged.apiBaseUrl = source.apiBaseUrl;
+  else if (hasOwnBridgeField(source, "restBaseUrl")) merged.apiBaseUrl = source.restBaseUrl;
+
+  merged.appKey = null;
+  merged.appSecret = null;
+  merged.restBaseUrl = null;
+  return canonicalizeDingTalkBridgeConfig(merged);
+}
+
+function preferredDingTalkSecret(value: any) {
+  if (hasOwnBridgeField(value, "clientSecret")) return cleanBridgeString(value.clientSecret);
+  return cleanBridgeString(value?.appSecret);
+}
+
+function mergeQQCredentialInput(existing: any, credentials: any) {
+  const saved = existing && typeof existing === "object" ? existing : {};
+  const source = credentials && typeof credentials === "object" ? credentials : {};
+  const savedSecret = preferredQQSecret(saved);
+  const merged: Record<string, any> = { ...saved, ...source };
+
+  if (hasOwnBridgeField(source, "appSecret")) {
+    merged.appSecret = isMaskedSecretValue(source.appSecret)
+      ? savedSecret
+      : source.appSecret;
+  } else if (hasOwnBridgeField(source, "token")) {
+    merged.appSecret = isMaskedSecretValue(source.token)
+      ? savedSecret
+      : source.token;
+  } else {
+    merged.appSecret = savedSecret;
+  }
+  merged.token = null;
+  return merged;
+}
+
+function preferredQQSecret(value: any) {
+  if (hasOwnBridgeField(value, "appSecret")) return cleanBridgeString(value.appSecret);
+  return cleanBridgeString(value?.token);
+}
+
+function hasPlaintextDingTalkSecret(credentials: any) {
+  const source = credentials && typeof credentials === "object" ? credentials : {};
+  return (hasOwnBridgeField(source, "clientSecret") && !isMaskedSecretValue(source.clientSecret))
+    || (hasOwnBridgeField(source, "appSecret") && !isMaskedSecretValue(source.appSecret));
+}
+
+function resolveDingTalkDiagnosticSecret(credentials: any, existing: any) {
+  const source = credentials && typeof credentials === "object" ? credentials : {};
+  const incomingClientSecret = source.clientSecret;
+  const incomingAppSecret = source.appSecret;
+  if (incomingClientSecret !== undefined && !isMaskedSecretValue(incomingClientSecret)) {
+    return { label: "incoming", value: incomingClientSecret };
+  }
+  if (incomingAppSecret !== undefined && !isMaskedSecretValue(incomingAppSecret)) {
+    return { label: "incoming", value: incomingAppSecret };
+  }
+  return { label: "saved", value: preferredDingTalkSecret(existing) };
+}
+
 function hasMaskedBridgeCredentials(platform: any, credentials: any) {
   const secretKeys = bridgeSecretKeys(platform);
   return secretKeys.some((key) => isMaskedSecretValue(credentials?.[key]));
@@ -732,7 +1086,7 @@ function bridgeSecretKeys(platform: any): any {
   return platform === "feishu"
     ? ["appSecret"]
     : platform === "dingtalk"
-      ? ["clientSecret"]
+      ? ["clientSecret", "appSecret", "webhookToken", "webhookSecret", "token", "secret"]
       : platform === "qq"
         ? ["appSecret", "token"]
         : platform === "wechat"

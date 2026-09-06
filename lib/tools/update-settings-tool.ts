@@ -12,10 +12,7 @@ import themeRegistry from "../../desktop/src/shared/theme-registry.cjs";
 import { parseModelRef } from "../../shared/model-ref.ts";
 import { emitAppEvent } from "../../server/app-events.ts";
 import {
-  EDITABLE_MEMORY_EXPERIMENT_ID,
-  getResolvedExperimentValue,
-} from "../experiments/registry.ts";
-import {
+  migrateLegacyEditableFacts,
   readEditableFactsText,
   writeEditableFactsSection,
 } from "../memory/compile.ts";
@@ -39,7 +36,6 @@ const THEME_I18N = Object.fromEntries(
 THEME_I18N[themeRegistry.AUTO_OPTION.id] = themeRegistry.AUTO_OPTION.i18nName;
 
 const THINKING_I18N = {
-  "auto": "settings.agent.thinkingLevels.auto",
   "off": "settings.agent.thinkingLevels.off",
   "low": "settings.agent.thinkingLevels.low",
   "medium": "settings.agent.thinkingLevels.medium",
@@ -115,14 +111,6 @@ function requireAgentId(agent, key) {
   const agentId = agent?.id || null;
   if (!agentId) throw new Error(`${key} requires target agent`);
   return agentId;
-}
-
-function isEditableMemoryEnabled(engine) {
-  try {
-    return getResolvedExperimentValue(engine?.preferences, EDITABLE_MEMORY_EXPERIMENT_ID) === true;
-  } catch {
-    return false;
-  }
 }
 
 function resolveAgentMemoryPaths(agent, key) {
@@ -209,7 +197,7 @@ const SETTINGS_REGISTRY = {
   thinking_level: {
     type: "list",
     get label() { return t("toolDef.updateSettings.thinkingBudget"); },
-    options: ["auto", "off", "low", "medium", "high", "max"],
+    options: ["off", "low", "medium", "high", "max"],
     get optionLabels() { return i18nLabels(THINKING_I18N); },
     searchTerms: ["reasoning", "推理", "思考", "推論"],
     get: (engine, _agent) => {
@@ -248,9 +236,11 @@ const SETTINGS_REGISTRY = {
     searchTerms: ["facts", "editable memory", "memory facts", "记忆事实", "重要事实", "可编辑记忆"],
     get: (engine, agent) => {
       if (!agent) return null;
-      if (!isEditableMemoryEnabled(engine)) return t("toolDef.updateSettings.memoryFactsDisabled");
       try {
         const { memoryDir } = resolveAgentMemoryPaths(agent, "memory.facts");
+        // 幂等：即使该 agent 从未跑起过 memoryTicker，也要在首次读取时把
+        // 遗留的 editable-facts.md 并入规范的 facts.md。
+        migrateLegacyEditableFacts(memoryDir);
         return readEditableFactsText(memoryDir);
       } catch {
         return null;
@@ -258,10 +248,8 @@ const SETTINGS_REGISTRY = {
     },
     apply: async (engine, agent, v) => {
       if (!agent) throw new Error("no active agent");
-      if (!isEditableMemoryEnabled(engine)) {
-        throw new Error(t("toolDef.updateSettings.memoryFactsDisabled"));
-      }
       const { memoryDir, memoryMdPath } = resolveAgentMemoryPaths(agent, "memory.facts");
+      migrateLegacyEditableFacts(memoryDir);
       writeEditableFactsSection(memoryDir, v, {
         summaryManager: agent.summaryManager,
         memoryMdPath,
@@ -291,15 +279,13 @@ const SETTINGS_REGISTRY = {
       agent.updateConfig({ agent: { name: v } });
     },
   },
+  // 用户的名字描述的是使用者本人，不是某个 agent 的属性：改一次，所有 agent
+  // 都跟着改口。所以这里写全局 preferences，而不是当前 agent 的 config。
   "user.name": {
     type: "text",
     get label() { return t("toolDef.updateSettings.userName"); },
-    scope: "agent",
-    get: (engine, agent) => agent?.userName || null,
-    apply: (engine, agent, v) => {
-      if (!agent) throw new Error("no active agent");
-      agent.updateConfig({ user: { name: v } });
-    },
+    get: (engine, agent) => agent?.userName || engine.getUserName?.() || null,
+    apply: (engine, _agent, v) => engine.setUserName(v),
   },
   home_folder: {
     type: "text",
@@ -522,7 +508,34 @@ export function createUpdateSettingsTool(deps: Record<string, any> = {}) {
   return {
     name: "update_settings",
     userFacingName: "Settings",
-    description: "Modify HanaAgent's settings. When the user mentions changing settings without naming a specific app, assume this application. For preferences like appearance/theme, language/region, model selection, memory, personal info, working directory, or MCP connectors, use this tool, and do not search the web or edit config files directly. Sandbox and execution-boundary controls are user-only: tell the user to open Settings > Security instead of applying them. Two actions available:\n- search + query: Search settings by keyword, see current values and options\n- apply + key + value: Change a setting (requires user confirmation)\n\nIf you already know the exact key, you can apply directly. When intent is clear, apply directly and report the result in one sentence; when unsure, search first.",
+    description: "Modify HanaAgent's settings. When the user mentions changing settings without naming a specific app, assume this application. For preferences like appearance/theme, language/region, model selection, memory, personal info, working directory, or MCP connectors, use this tool, and do not search the web or edit config files directly. Sandbox and execution-boundary controls are user-only: tell the user to open Settings > Security instead of applying them. Two actions available:\n- search + query: Search settings by keyword, see current values and options\n- apply + key + value: Change a setting (Auto reviews the boundary in the background; Ask may request confirmation)\n\nIf you already know the exact key, you can apply directly. When intent is clear, apply directly and report the result in one sentence; when unsure, search first.",
+    sessionPermission: {
+      resolveInvocation: (params: any = {}) => {
+        if (params.action === "search") {
+          return {
+            action: "search",
+            kind: "read",
+            capability: "update_settings.search",
+          };
+        }
+        if (params.action === "apply") {
+          const key = typeof params.key === "string" ? params.key : "";
+          if (!key || key !== key.trim() || params.value === undefined) return null;
+          const isUserOnly = Object.hasOwn(USER_ONLY_SETTINGS, key);
+          const isMcpAction = Object.hasOwn(MCP_SETTINGS_ACTIONS, key);
+          const isRegistered = Object.hasOwn(SETTINGS_REGISTRY, key);
+          if (!isUserOnly && !isMcpAction && !isRegistered) return null;
+
+          return {
+            action: "apply",
+            kind: "review",
+            capability: "update_settings.apply",
+            target: { type: "setting", id: key, label: key },
+          };
+        }
+        return null;
+      },
+    },
     parameters: Type.Object({
       action: StringEnum(
         ["search", "apply"],

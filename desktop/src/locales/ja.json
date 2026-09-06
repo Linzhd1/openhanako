@@ -7,7 +7,22 @@
       "defaultModelInvalid": "デフォルト画像モデルが利用できません。設定で再設定してください。",
       "imageGenUnavailable": "画像生成ツールが無効です。先に設定で有効にしてください。",
       "agentUnavailable": "メインエージェントが一時的に利用できないため、Agent 生成を開始できません。",
-      "disabled": "現在 Agent 生成は利用できません。"
+      "disabled": "現在 Agent 生成は利用できません。",
+      "label": "Agent 生成"
+    },
+    "gallery": {
+      "title": "Hana Gallery",
+      "upload": "自分の画像をアップロード",
+      "close": "Hana Gallery を閉じる"
+    },
+    "notice": {
+      "taskCreated": "Cover バックグラウンドタスクを作成しました。",
+      "generateFailed": "Cover 生成に失敗しました：{error}",
+      "applySuccess": "アップロードした画像を cover として適用しました。",
+      "applySuccessGallery": "「{title}」を cover として適用しました。",
+      "applyFailed": "Cover の適用に失敗しました：{error}",
+      "selectImageFile": "cover 用の画像ファイルを選択してください。",
+      "readImageFailed": "画像の読み込みに失敗しました。"
     }
   },
   "selection": {
@@ -76,6 +91,12 @@
     "noAvailableMembers": "追加できる Agent はありません",
     "agentActivity": "Agent の動き",
     "agentSettings": "チャット設定",
+    "exportTitle": "現在のチャットを保存",
+    "exportDescription": "現在のグループチャットまたはダイレクトメッセージを Markdown ファイルとしてダウンロードフォルダへ保存します。",
+    "exportAction": "現在のチャットをエクスポート",
+    "exporting": "エクスポート中…",
+    "exportSuccess": "チャット履歴をダウンロードしました：{filename}",
+    "exportFailed": "チャット履歴をエクスポートできませんでした：{message}",
     "toolPermission": "ツール権限",
     "agentIdle": "待機中",
     "phoneReceivedNewMessages": "新しいグループチャットメッセージを受信",
@@ -101,7 +122,13 @@
     "toolReadOnly": "読取",
     "toolWrite": "書込",
     "filesUnsupported": "チャンネルは現在テキストのみ対応しています。ファイルはチャット添付に追加されません",
-    "createIntroOptional": "説明"
+    "createIntroOptional": "説明",
+    "unpinPluginTab": "「{label}」の固定を解除"
+  },
+  "announcement": {
+    "title": "アップデート完了 · v{version}",
+    "fallbackBody": "HanaAgent は v{version} に更新されました。",
+    "confirm": "OK"
   },
   "skills": {
     "panel": {
@@ -132,6 +159,9 @@
     "searchingContent": "本文を検索中…",
     "searchNoResults": "一致するチャットがありません",
     "searchFailed": "検索に失敗しました",
+    "metaRecoveryNoticeTitle": "一部のチャットは復旧待ちです",
+    "metaRecoveryNoticeBody": "チャットのメタデータに異常が検出されました。本文はディスクに保存されていますが、一部のチャット属性が一時的に欠けている可能性があります",
+    "metaRecoveryEmpty": "チャット一覧を今は完全に表示できません。本文はディスクに残っています",
     "view": {
       "time": "時間順",
       "project": "プロジェクト順",
@@ -174,7 +204,12 @@
     "unpin": "ピン留めを解除",
     "pinFailed": "セッションのピン留めに失敗しました",
     "unpinFailed": "ピン留め解除に失敗しました",
+    "reorderFailed": "ピン留めの並び替えに失敗しました",
     "archive": "アーカイブ",
+    "copyId": "Session ID をコピー",
+    "copyIdDone": "Session ID をコピーしました",
+    "copyIdFailed": "Session ID をコピーできませんでした",
+    "copyIdUnavailable": "この Session にはコピー可能な ID がありません",
     "deletedAgent": {
       "title": "Agent は削除済みです",
       "description": "このチャットは読み取り専用の履歴として保持されます。続行すると、主 Agent で新しいセッションを作成し、古いコンテキストの圧縮を試みます。",
@@ -210,20 +245,9 @@
       "deleteFailed": "削除に失敗しました",
       "daysAgo": "{days} 日前にアーカイブ"
     },
-    "capabilityDrift": {
-      "title": "ツール構成が更新されています",
-      "addedTools": "新しいツール {count} 件",
-      "removedTools": "{count} 件のツールが利用不可",
-      "promptUpdated": "プロンプト更新",
-      "separator": "、",
-      "refreshButton": "エージェントのツールを更新",
-      "dismissButton": "閉じる",
-      "confirmText": "更新すると古い会話は要約に圧縮され、詳細が失われる可能性があります。続行しますか？",
-      "confirmButton": "更新する",
-      "cancelButton": "キャンセル",
-      "refreshing": "会話を圧縮してツールを更新中…",
-      "refreshFailed": "更新に失敗しました"
-    }
+    "rcTakingOver": "{platform} 接続中",
+    "subagentRunStateUnrecoverable": "過去のサブセッションの実行状態は復元できません",
+    "subagentLinkUnrecoverable": "過去のサブセッションへのリンクは復元できません"
   },
   "common": {
     "on": "オン",
@@ -234,6 +258,7 @@
     "close": "閉じる",
     "loading": "読み込み中...",
     "regenerate": "再生成",
+    "forkSession": "新しいセッションに分岐",
     "confirm": "確認",
     "cancel": "キャンセル",
     "approve": "承認",
@@ -262,14 +287,20 @@
     "screenshotFailed": "スクリーンショットの保存に失敗しました",
     "selectedCount": "{count} 件選択中",
     "allDone": "すべて完了",
-    "markAllComplete": "すべて完了にする"
+    "markAllComplete": "すべて完了にする",
+    "back": "戻る"
   },
   "chat": {
+    "find": {
+      "locateFailed": "メッセージを特定できませんでした",
+      "placeholder": "会話内を検索"
+    },
     "send": "送信",
     "steer": "操舵",
     "stop": "停止",
     "browserScreenshot": "ブラウザスクリーンショット",
     "compacting": "コンテキスト圧縮中",
+    "instantSimpleCompaction": "瞬時簡易コンパクション",
     "visionAuxiliary": "補助ビジョン",
     "fileExpired": "ファイル期限切れ",
     "fileActions": {
@@ -277,6 +308,37 @@
       "revealInFinder": "ファイルマネージャーで表示",
       "copyPath": "ファイルパスをコピー",
       "downloadToDevice": "この端末にダウンロード"
+    },
+    "media": {
+      "kindVideo": "動画",
+      "kindImage": "画像",
+      "generationFailed": "{kind}の生成に失敗しました",
+      "generationInProgress": "{kind}を生成中",
+      "retryFailed": "再生成に失敗しました",
+      "submitting": "送信中",
+      "retryLabel": "{kind}を再生成"
+    },
+    "subagentPreview": {
+      "historyUnrecoverable": "過去のサブセッションへのリンクは復元できません",
+      "noSession": "開けるサブ Agent セッションがありません",
+      "connecting": "サブ Agent セッションに接続中…",
+      "loadingSession": "セッションを読み込み中…",
+      "waitingContent": "セッションの内容を待機中…",
+      "noContent": "セッションの内容がありません"
+    },
+    "timeline": {
+      "navAriaLabel": "ターン移動",
+      "jumpTo": "{label}へ移動",
+      "fallbackUser": "ユーザーメッセージ",
+      "fallbackAssistant": "アシスタントメッセージ"
+    },
+    "modelSwitching": "モデルを切り替え中です。しばらくお待ちください",
+    "unknownCommand": "[不明なコマンド] {text}",
+    "workflowInline": {
+      "running": "◐ 実行中",
+      "done": "✓ 完了",
+      "failed": "✗ 失敗",
+      "aborted": "⊘ 停止"
     }
   },
   "time": {
@@ -349,7 +411,8 @@
       "medium": "中",
       "high": "深い",
       "xhigh": "最大",
-      "max": "最大"
+      "max": "最大",
+      "low": "浅思"
     },
     "thinkingDesc": {
       "off": "推論なし",
@@ -357,14 +420,45 @@
       "medium": "バランス推論",
       "high": "深い推論",
       "xhigh": "最大推論",
-      "max": "最大推論"
+      "max": "最大推論",
+      "low": "軽量推論"
     },
     "contextWindow": "コンテキスト {windowK}k",
     "tokensUsed": "使用済み {tokensK}k ({pct}%)",
     "contextActions": "コンテキスト操作",
-    "refreshAndCompact": "更新して圧縮",
-    "refreshAndCompactTooltip": "最新の記憶とツールセットに更新",
-    "compact": "圧縮"
+    "refreshAndCompact": "圧縮して更新",
+    "refreshAndCompactTooltip": "会話を圧縮し、最新のメモリとツールセットに更新",
+    "refreshAndCompactBusy": "会話を圧縮して更新中…",
+    "refreshAndCompactFailed": "圧縮と更新に失敗しました",
+    "compact": "圧縮",
+    "noAskThisConversation": "この会話では今後確認しない",
+    "confirmMoreOptions": "その他の確認オプション",
+    "attachmentDirectory": "[ディレクトリ] {label}",
+    "attachmentFile": "[添付] {label}",
+    "referenceDocument": "[参考ドキュメント] {path}",
+    "mention": {
+      "title": "メンション",
+      "tab": {
+        "files": "ファイル",
+        "sessions": "会話",
+        "agents": "エージェント"
+      },
+      "empty": "一致する項目はありません",
+      "singleAgent": "1 回のターンで招待できる Agent レビュアーは 1 人です"
+    }
+  },
+  "agentReview": {
+    "running": "この Session をレビュー中",
+    "completed": "別の Agent によるレビュー",
+    "failed": "レビューに失敗しました。メイン Agent はまだ回答していません",
+    "cancelled": "レビューをキャンセルしました",
+    "openSession": "レビュー Session を開く",
+    "sessionUnavailable": "レビュー Session が見つかりません",
+    "requestReceived": "別の Session からレビュー依頼を受け取りました",
+    "openReviewedSession": "レビュー対象 Session を開く",
+    "reviewedSessionFallback": "元の会話",
+    "reviewSessionFallback": "{name} のレビュー会話",
+    "interjectionUnavailable": "Agent レビューは割り込みとして送信できません。現在の返信が終わるまでお待ちください"
   },
   "slash": {
     "diary": "今日の日記を書く",
@@ -374,9 +468,10 @@
     "xing": "会話からスキルを作成",
     "compact": "コンテキストを圧縮",
     "compactBusy": "圧縮中...",
-    "stop": "現在の返信を停止",
-    "new": "新しいセッションを開始（履歴を保管）",
-    "reset": "セッションをリセット（履歴を消去）"
+    "loop": "このセッションでループタスクを実行",
+    "commandError": "[コマンドエラー] {message}",
+    "usage": "使い方: {usage}",
+    "commandTimeout": "コマンドがタイムアウトしました（>{ms}ms）"
   },
   "welcome": {
     "messages": [
@@ -474,7 +569,8 @@
         "avatar": "Ming.png"
       },
       "kong": {
-        "label": "素のまま",
+        "label": "発散的な思考モジュール（MOOD など）を持たず、ほかの Agent と同じ体験です。",
+        "shortLabel": "思考ブロックなし。直接回答します。",
         "avatar": "Kong.png"
       }
     },
@@ -616,16 +712,6 @@
       "done": "✏️ {name} 直った",
       "failed": "✏️ {name} 直そうとしたら余計に…"
     },
-    "edit-diff": {
-      "running": "✏️ {name} は手直ししている",
-      "done": "✏️ {name} 直った",
-      "failed": "✏️ {name} 直そうとしたら余計に…"
-    },
-    "glob": {
-      "running": "🔍 {name} はファイルを探している",
-      "done": "🔍 {name} 見つけた",
-      "failed": "🔍 {name} 隅々まで探したけど見つからない"
-    },
     "grep": {
       "running": "🔍 {name} はファイルの中を探し回っている",
       "done": "🔍 {name} 見つけた",
@@ -641,15 +727,10 @@
       "done": "📂 {name} 確認した",
       "failed": "📂 {name} このフォルダ開けない"
     },
-    "truncate": {
-      "running": "✂️ {name} はファイルを整理している",
-      "done": "✂️ {name} きれいになった",
-      "failed": "✂️ {name} 片付けられなかった"
-    },
     "stage_files": {
-      "running": "📎 {name} はファイルを準備している",
-      "done": "📎 はい、どうぞ！",
-      "failed": "📎 ファイルを渡せなかった"
+      "running": "📎 ファイルを用意中",
+      "done": "📎 ファイルが用意できた",
+      "failed": "📎 ファイルは用意できなかった"
     },
     "browser": {
       "running": "🌐 {name} はブラウザを操作している",
@@ -657,144 +738,264 @@
       "failed": "🌐 {name} ブラウザが言うことを聞かない"
     },
     "subagent": {
-      "running": "🧭 {name} 分身が調査中",
-      "done": "🧭 分身を送り出した",
-      "failed": "🧭 分身がトラブった"
+      "running": "🧭 サブエージェントが作業中",
+      "done": "🧭 サブエージェントが終わった",
+      "failed": "🧭 サブエージェントは終わらなかった"
     },
     "check_pending_tasks": {
-      "running": "📋 {name} はやり残しを探している",
-      "done": "📋 {name} 確認おわり",
-      "failed": "📋 確認できなかった"
-    },
-    "cron": {
-      "running": "⏰ {name} はタイマーをセット中",
-      "done": "⏰ セット完了",
-      "failed": "⏰ セットできなかった"
+      "running": "📋 バックグラウンドの進み具合を確認中",
+      "done": "📋 バックグラウンドの進み具合を確認した",
+      "failed": "📋 バックグラウンドの進み具合が分からなかった"
     },
     "notify": {
-      "running": "🔔 {name} は通知を送っている",
-      "done": "🔔 通知おくった",
-      "failed": "🔔 通知が送れなかった"
+      "running": "🔔 {name} は通知を送信中",
+      "done": "🔔 {name} は通知を送った",
+      "failed": "🔔 通知は届かなかった"
     },
     "create_artifact": {
-      "running": "🖼️ {name} はお絵描き中",
-      "done": "🖼️ できた",
-      "failed": "🖼️ 崩れちゃった"
+      "running": "🖼️ {name} は画像を作成中",
+      "done": "🖼️ {name} は画像を仕上げた",
+      "failed": "🖼️ 画像はできあがらなかった"
     },
     "dm": {
-      "running": "✉️ {name} はスマホを手に取った",
-      "done": "✉️ 送信した",
-      "failed": "✉️ 送れなかった"
+      "running": "✉️ {name} はダイレクトメッセージを送信中",
+      "done": "✉️ {name} はダイレクトメッセージを送った",
+      "failed": "✉️ ダイレクトメッセージは届かなかった"
     },
     "channel": {
       "running": "📢 {name} はチャンネルに投稿中",
-      "done": "📢 投稿した",
-      "failed": "📢 投稿できなかった"
+      "done": "📢 {name} はチャンネルに投稿した",
+      "failed": "📢 メッセージはチャンネルに届かなかった",
+      "heading": "# チャンネル",
+      "ambiguousName": "チャンネル名「{name}」が一意ではありません。チャンネル ID を使用してください: {choices}"
     },
     "install_skill": {
-      "running": "📥 {name} はスキルをインストール中",
-      "done": "📥 インストール完了",
-      "failed": "📥 インストールできなかった"
+      "running": "📥 {name} はスキルを導入中",
+      "done": "📥 {name} はスキルを導入した",
+      "failed": "📥 スキルは導入されなかった"
     },
     "update_settings": {
       "running": "⚙️ {name} は設定を変更中",
-      "done": "⚙️ 変更した",
-      "failed": "⚙️ 変更できなかった"
+      "done": "⚙️ {name} は設定を変えた",
+      "failed": "⚙️ 設定は変わらなかった"
     },
     "automation": {
-      "running": "🤖 {name} はショートカットを実行中",
-      "done": "🤖 ショートカット完了",
-      "failed": "🤖 ショートカットの実行に失敗"
+      "running": "🤖 {name} は自動化の段取り中",
+      "done": "🤖 {name} は自動化の段取りを済ませた",
+      "failed": "🤖 自動化の段取りができなかった"
     },
     "computer": {
-      "running": "🖥️ {name} は画面を操作中",
-      "done": "🖥️ 操作完了",
-      "failed": "🖥️ 画面操作に失敗"
+      "running": "🖥️ {name} はパソコンを操作中",
+      "done": "🖥️ {name} はパソコンの操作を終えた",
+      "failed": "🖥️ パソコンは言うことを聞かなかった"
     },
     "terminal": {
-      "running": "💻 {name} はコマンドを実行中",
-      "done": "💻 コマンド完了",
-      "failed": "💻 コマンドの実行に失敗"
+      "running": "💻 {name} はコマンドを打っている",
+      "done": "💻 {name} はコマンドを打ち終えた",
+      "failed": "💻 コマンドは動かなかった"
     },
     "current_status": {
-      "running": "🕐 {name} は今の状況を確認中",
-      "done": "🕐 把握した",
-      "failed": "🕐 情報を取得できなかった"
+      "running": "🕐 今の状況を確認中",
+      "done": "🕐 今の状況がつかめた",
+      "failed": "🕐 今の状況がつかめなかった"
     },
     "pin_memory": {
-      "running": "📌 {name} はこれをピン留め中",
-      "done": "📌 ピン留めした",
-      "failed": "📌 ピン留めに失敗"
+      "running": "📌 {name} はこれを覚え込んでいる",
+      "done": "📌 {name} はこれを覚え込んだ",
+      "failed": "📌 {name} は覚えきれなかった"
     },
     "unpin_memory": {
-      "running": "📌 {name} はピンを外し中",
-      "done": "📌 外した",
-      "failed": "📌 ピンを外せなかった"
+      "running": "📌 {name} はこれを手放している",
+      "done": "📌 {name} はもうこれを特別扱いしない",
+      "failed": "📌 {name} は手放せなかった"
     },
     "recall_experience": {
-      "running": "🧠 {name} は経験ノートをめくっている",
-      "done": "🧠 見つけた",
-      "failed": "🧠 関連する経験がなかった"
+      "running": "🧠 経験ノートをめくり中",
+      "done": "🧠 関係する経験が見つかった",
+      "failed": "🧠 関係する経験は見つからなかった"
     },
     "record_experience": {
-      "running": "🧠 {name} は経験を書き留めている",
-      "done": "🧠 メモした",
-      "failed": "🧠 記録できなかった"
+      "running": "🧠 {name} は今回の経験を書き留め中",
+      "done": "🧠 {name} は今回の経験を書き留めた",
+      "failed": "🧠 経験は書き留められなかった"
     },
     "session_folders": {
-      "running": "📁 {name} はフォルダ権限を調整中",
-      "done": "📁 調整した",
-      "failed": "📁 調整に失敗"
+      "running": "📁 {name} はフォルダの権限を調整中",
+      "done": "📁 {name} はフォルダの権限を整えた",
+      "failed": "📁 フォルダの権限は変わらなかった"
     },
     "stop_task": {
-      "running": "🛑 {name} はバックグラウンドタスクを停止中",
-      "done": "🛑 止めた",
-      "failed": "🛑 停止できなかった"
+      "running": "🛑 {name} はバックグラウンド処理を止めにいっている",
+      "done": "🛑 {name} はバックグラウンド処理を止めた",
+      "failed": "🛑 バックグラウンド処理は止まらなかった"
     },
     "todo_write": {
-      "running": "📝 {name} はチェックリストを書いている",
-      "done": "📝 書けた",
-      "failed": "📝 チェックリストの書き込みに失敗"
+      "running": "📝 {name} はリストを書いている",
+      "done": "📝 リストができた",
+      "failed": "📝 リストは保存されなかった"
     },
     "workflow": {
-      "running": "🔄 {name} はワークフローを編成中",
-      "done": "🔄 編成完了",
-      "failed": "🔄 ワークフローの実行に失敗"
-    },
-    "generate-image": {
-      "running": "🎨 {name} は画像を作成中",
-      "done": "🎨 できた",
-      "failed": "🎨 画像生成に失敗"
-    },
-    "generate-video": {
-      "running": "🎬 {name} は動画を生成中",
-      "done": "🎬 動画できた",
-      "failed": "🎬 動画生成に失敗"
-    },
-    "create-cover": {
-      "running": "🎨 {name} はカバーをデザイン中",
-      "done": "🎨 カバーできた",
-      "failed": "🎨 カバー生成に失敗"
-    },
-    "apply-cover-candidate": {
-      "running": "🖼️ {name} はカバーを適用中",
-      "done": "🖼️ 適用した",
-      "failed": "🖼️ カバーの適用に失敗"
-    },
-    "get-cover-style-guide": {
-      "running": "📖 {name} はスタイルガイドを確認中",
-      "done": "📖 見つけた",
-      "failed": "📖 スタイルガイドが見つからなかった"
-    },
-    "list-capabilities": {
-      "running": "📋 {name} は機能を確認中",
-      "done": "📋 確認した",
-      "failed": "📋 機能の確認に失敗"
+      "running": "🔄 {name} は workflow を組み立て中",
+      "done": "🔄 {name} は workflow を組み立てた",
+      "failed": "🔄 workflow は完走しなかった",
+      "scriptInvalid": "ワークフロースクリプトが無効です: {message}",
+      "dispatched": "ワークフロー「{summary}」をバックグラウンド実行にディスパッチしました（タスク {taskId}）。完了すると結果が自動的に会話に返されます。",
+      "syncComplete": "ワークフロー「{name}」が完了しました。{count} 件の Agent をディスパッチしました。\n\n結果:\n{result}",
+      "executionFailed": "ワークフローの実行に失敗しました: {message}",
+      "resumeFromRunIdDesc": "以前のワークフローの runId（taskId）。チェックポイントからの再開に使用します: prompt+opts が変更されていない完了済み Agent ノードはキャッシュ結果を即座に返し、再実行は最初に変更された位置から始まります。",
+      "journalResuming": "{count} 件のキャッシュエントリから再開中"
     },
     "_fallback": {
       "running": "🔧 {name} は作業中…",
       "done": "🔧 {name} 終わった",
       "failed": "🔧 {name} うまくいかなかった"
+    },
+    "checkDeferred": {
+      "storeNotInitialized": "遅延タスクストアが初期化されていません。",
+      "noActiveSession": "アクティブなセッションがありません。",
+      "noTasks": "現在の会話にバックグラウンドタスクはありません{qualifier}。",
+      "noTasksQualifier": "（ステータス: {status}）"
+    },
+    "loopControl": {
+      "serviceUnavailable": "ループサービスは利用できません。",
+      "noActiveSession": "アクティブなセッションがありません。",
+      "noActiveLoop": "このセッションにアクティブなループはありません。/loop <タスク> で開始してください。",
+      "delayRequired": "action=schedule には delay_seconds が必要です。",
+      "scheduled": "{seconds} 秒後のウェイクアップを予約しました（{wakeAt} 発火）。以前のアラームは置き換えられます。",
+      "completed": "ループを完了して終了しました。"
+    },
+    "installSkill": {
+      "safetyBlocked": "[セキュリティポリシー] Skill の安全審査に失敗しました。インストールはブロックされました。\n理由: {reason}\n\nこの Skill が安全審査を通過しなかったことをユーザーに伝え、具体的な理由を説明してください。設定で安全審査を無効にできます（非推奨）。"
+    },
+    "file": {
+      "running": "📄 ファイルを操作中",
+      "done": "📄 ファイルの用が済んだ",
+      "failed": "📄 ファイルの操作に失敗"
+    },
+    "session": {
+      "running": "💬 別のセッションを確認中",
+      "done": "💬 別のセッションを確認した",
+      "failed": "💬 そのセッションを開けなかった"
+    },
+    "subagent_reply": {
+      "running": "🧭 {name} はサブエージェントに新しい仕事を渡している",
+      "done": "🧭 {name} はサブエージェントに新しい仕事を渡した",
+      "failed": "🧭 仕事はサブエージェントに渡らなかった"
+    },
+    "subagent_close": {
+      "running": "🧭 {name} はサブエージェントを切り上げている",
+      "done": "🧭 {name} はサブエージェントを切り上げた",
+      "failed": "🧭 サブエージェントを閉じられなかった"
+    },
+    "loop_control": {
+      "running": "⏱️ {name} は loop の目覚ましをセット中",
+      "done": "⏱️ loop の目覚ましをセットした",
+      "failed": "⏱️ loop の目覚ましをセットできなかった"
+    },
+    "materialize": {
+      "running": "🧲 ファイルを手元に取り寄せ中",
+      "done": "🧲 ファイルが手元に届いた",
+      "failed": "🧲 ファイルを取り寄せられなかった"
+    },
+    "channel_read_context": {
+      "running": "💬 チャンネルのメッセージを確認中",
+      "done": "💬 チャンネルのメッセージを読んだ",
+      "failed": "💬 チャンネルのメッセージを読めなかった"
+    },
+    "channel_reply": {
+      "running": "💬 {name} はチャンネルに投稿中",
+      "done": "💬 {name} はチャンネルに投稿した",
+      "failed": "💬 メッセージはチャンネルに届かなかった"
+    },
+    "channel_pass": {
+      "running": "⏭️ {name} は今回は黙っているつもり",
+      "done": "⏭️ {name} は目を通したが今回は投稿しなかった",
+      "failed": "⏭️ 見送りを記録できなかった"
+    },
+    "hana_card_guide": {
+      "running": "🎴 カードの作り方を確認中",
+      "done": "🎴 カードの作り方が分かった",
+      "failed": "🎴 カードの作り方が見つからなかった"
+    },
+    "show_card": {
+      "running": "🎴 {name} はカードを並べている",
+      "done": "🎴 {name} はカードを並べた",
+      "failed": "🎴 カードを出せなかった"
+    },
+    "media_generate-image": {
+      "running": "🎨 {name} は画像を作成中",
+      "done": "🎨 {name} は画像を仕上げた",
+      "failed": "🎨 画像はできあがらなかった"
+    },
+    "media_generate-video": {
+      "running": "🎬 {name} は動画を生成中",
+      "done": "🎬 {name} は動画を仕上げた",
+      "failed": "🎬 動画はできあがらなかった"
+    },
+    "media_describe-options": {
+      "running": "🎨 画像の選択肢を確認中",
+      "done": "🎨 画像の選択肢が分かった",
+      "failed": "🎨 画像の選択肢を確認できなかった"
+    },
+    "media_get-guide": {
+      "running": "🎨 画像づくりの手引きを確認中",
+      "done": "🎨 画像づくりの手引きを読んだ",
+      "failed": "🎨 画像づくりの手引きが見つからなかった"
+    },
+    "beautify_create-cover": {
+      "running": "🖼️ {name} は記事にカバーを付けている",
+      "done": "🖼️ {name} は記事にカバーを付けた",
+      "failed": "🖼️ カバーは付けられなかった"
+    },
+    "beautify_apply-cover-candidate": {
+      "running": "🖼️ {name} はカバーを差し替え中",
+      "done": "🖼️ {name} はカバーを差し替えた",
+      "failed": "🖼️ カバーは差し替えられなかった"
+    },
+    "beautify_get-cover-style-guide": {
+      "running": "🖼️ カバーの作法を確認中",
+      "done": "🖼️ カバーの作法が分かった",
+      "failed": "🖼️ カバーの作法が見つからなかった"
+    },
+    "beautify_get-html-style-guide": {
+      "running": "🖼️ 組版の作法を確認中",
+      "done": "🖼️ 組版の作法が分かった",
+      "failed": "🖼️ 組版の作法が見つからなかった"
+    },
+    "beautify_list-capabilities": {
+      "running": "🖼️ どう整えられるか確認中",
+      "done": "🖼️ どう整えられるか分かった",
+      "failed": "🖼️ どう整えられるか確認できなかった"
+    },
+    "office_read-document": {
+      "running": "📑 この書類を読んでいる",
+      "done": "📑 この書類を読み終えた",
+      "failed": "📑 この書類は読み取れなかった"
+    },
+    "office_html-to-pdf": {
+      "running": "📑 {name} は PDF を書き出し中",
+      "done": "📑 {name} は PDF を書き出した",
+      "failed": "📑 PDF は書き出せなかった"
+    },
+    "office_list-capabilities": {
+      "running": "📑 扱える書類を確認中",
+      "done": "📑 扱える書類が分かった",
+      "failed": "📑 扱える書類を確認できなかった"
+    },
+    "_plugin": {
+      "running": "🧩 {name} はプラグインで作業中",
+      "done": "🧩 {name} はプラグインでの作業を終えた",
+      "failed": "🧩 プラグインは役に立たなかった"
+    },
+    "session_send": {
+      "running": "💬 別のセッションへのメッセージを下書き中",
+      "done": "💬 メッセージの下書きができた。確認待ち",
+      "failed": "💬 メッセージを下書きできなかった"
+    },
+    "session_create": {
+      "running": "💬 新しいセッションを下書き中",
+      "done": "💬 新しいセッションの下書きができた。確認待ち",
+      "failed": "💬 新しいセッションを下書きできなかった"
     }
   },
   "file_output": {
@@ -806,9 +1007,20 @@
     "notSelected": "モデルを選択",
     "noneConfigured": "モデル未設定",
     "unavailable": "モデルは利用できません",
+    "removed": "モデルは削除されました",
+    "providerNotConfigured": "プロバイダー未設定",
+    "unavailableReason": {
+      "modelRemoved": "この会話で使用していたモデルは削除されました。続行するには利用可能なモデルを選択してください。",
+      "providerNotConfigured": "この会話のモデルプロバイダーまたは認証情報が未設定です。設定を完了するか、別のモデルを選択してください。",
+      "temporarilyUnavailable": "この会話のモデルは現在利用できません。プロバイダーを確認するか、別のモデルを選択してください。"
+    },
     "offline": "オフライン",
     "switchFailed": "モデルの切り替えに失敗しました",
-    "switchWhileStreaming": "返信中はモデルを切り替えられません"
+    "switchWhileStreaming": "返信中はモデルを切り替えられません",
+    "adaptation": {
+      "compacted": "新しいモデル向けに会話履歴をコンパクト化しました",
+      "truncated": "新しいモデル向けに以前の会話を切り詰めました"
+    }
   },
   "splash": {
     "lines": [
@@ -823,7 +1035,11 @@
       "{name} はある午後のオレンジの香りがしました",
       "あの会話はまだ温もりを残しています"
     ],
-    "installing": "{name} を v{version} に更新しています。少々お待ちください……"
+    "installing": "{name} を v{version} に更新しています。少々お待ちください……",
+    "preparing": {
+      "named": "{name} が新しい住まいを準備しています……",
+      "anonymous": "あなたのアシスタントが新しい住まいを準備しています……"
+    }
   },
   "settings": {
     "title": "設定",
@@ -831,6 +1047,7 @@
     "save": "保存",
     "saved": "保存しました ✿",
     "saveFailed": "保存に失敗しました",
+    "refreshFailed": "更新に失敗しました",
     "fileChangedOnDisk": "ファイルが外部で変更されたため、古い保存をスキップしました",
     "noChanges": "変更はありません",
     "autoSaved": "自動保存しました ✿",
@@ -858,7 +1075,9 @@
       "access": "アクセスとデバイス",
       "plugins": "プラグイン",
       "about": "概要",
-      "security": "セキュリティ"
+      "security": "セキュリティ",
+      "experiments": "実験機能",
+      "pluginMarketplace": "プラグインマーケット"
     },
     "browser": {
       "cookiesTitle": "Cookies",
@@ -894,10 +1113,13 @@
       },
       "notifications": {
         "title": "通知",
-        "turnCompletion": "ターン完了通知",
-        "turnCompletionNever": "通知しない",
-        "turnCompletionWhenUnfocused": "HanaAgent にフォーカスがないとき",
-        "turnCompletionWhenSessionUnfocused": "完了した Session にフォーカスしていないとき"
+        "chatCompletion": "チャット返信の完了",
+        "scheduledTaskCompletion": "スケジュールタスクの完了",
+        "patrolCompletion": "巡回の完了",
+        "never": "通知しない",
+        "whenUnfocused": "HanaAgent にフォーカスがないとき",
+        "whenSessionUnfocused": "完了したチャットにフォーカスしていないとき",
+        "always": "常に"
       }
     },
     "computerUse": {
@@ -981,6 +1203,9 @@
       "system": "システム",
       "hardwareAcceleration": "ハードウェアアクセラレーション",
       "hardwareAccelerationHint": "GPU でウィンドウを描画します。オフにすると次回起動からソフトウェア描画を使い、Windows の GPU ドライバー起因の起動クラッシュ復旧に役立ちます。",
+      "sidebar": "サイドバー",
+      "sessionListSingleLine": "セッション一覧を 1 行表示",
+      "sessionListSingleLineHint": "オンにすると各セッションを 1 行で表示します。ホバー時に右側の操作が現れ、タイトルは省略記号で短くなります。",
       "shortcuts": "ショートカット",
       "voiceRecordingShortcut": "音声録音/送信",
       "voiceRecordingShortcutHint": "メインチャット画面にフォーカスがあるとき、1 回押すと録音開始、もう 1 回押すと終了して送信します。"
@@ -1016,7 +1241,12 @@
       "language": "言語",
       "languageHint": "切り替え後、ページがリロードされます",
       "timezone": "タイムゾーン",
-      "timezoneHint": "記憶のタイムスタンプや日記などに使用されます"
+      "timezoneHint": "記憶のタイムスタンプや日記などに使用されます",
+      "zhCN": "简体中文",
+      "zhTW": "繁體中文",
+      "ja": "日本語",
+      "ko": "한국어",
+      "en": "English"
     },
     "agent": {
       "title": "エージェント",
@@ -1026,10 +1256,10 @@
       "agentNameHint": "エージェントの呼び名",
       "identity": "アイデンティティ",
       "identityHint": "このエージェントがどんな存在で、何が得意かを簡単に説明します。他のエージェントがこの情報を参照します",
-      "ishiki": "意識",
-      "ishikiHint": "アシスタントの性格、口調、振る舞いを定義します。「元」とは分離されており、互いに影響しません。",
-      "publicIshiki": "パブリック意識",
-      "publicIshikiHint": "プライバシー保護のため、訪問者との会話ではアシスタントは記憶、個人情報、コンピュータ上のファイルやツールにアクセスできません。\nここで訪問者向けの応答スタイルとガイドラインを設定できます。",
+      "agentsMd": "AGENTS.md",
+      "agentsMdHint": "アシスタントの性格、口調、振る舞いを定義します。「元」とは分離されており、互いに影響しません。",
+      "publicAgentsMd": "公開 AGENTS.md",
+      "publicAgentsMdHint": "プライバシー保護のため、訪問者との会話ではアシスタントは記憶、個人情報、コンピュータ上のファイルやツールにアクセスできません。\nここで訪問者向けの応答スタイルとガイドラインを設定できます。",
       "chatModel": "モデル",
       "chatModelHint": "会話とタスクに使用するモデル",
       "modelUnavailable": "利用不可: {model}",
@@ -1097,9 +1327,21 @@
           "workflow": {
             "label": "Workflow",
             "summary": "Agent に複数 Agent のワークフロースクリプトをバックグラウンドタスクとして実行させる"
+          },
+          "office": {
+            "label": "Office",
+            "summary": "Agent にドキュメントの読み取りと HTML から PDF への変換を許可"
+          },
+          "session": {
+            "label": "セッション連携",
+            "summary": "他のセッションを一覧・閲覧し、確認カード経由でメッセージ送信やセッション作成を行う"
           }
         }
-      }
+      },
+      "generatingPreview": "プレビューを生成中",
+      "exportAgent": "Agent をエクスポート",
+      "generatingCardPreview": "キャラクターカードのプレビューを生成中",
+      "exportedTo": "{path} にエクスポートしました"
     },
     "about": {
       "title": "このアプリについて",
@@ -1110,22 +1352,68 @@
       "updateAvailable": "新しいバージョンがあります：v{version}",
       "updateDownload": "ダウンロード",
       "updateChecking": "アップデートを確認中…",
-      "updateDownloading": "{agentName}が新しいお家を準備中 {percent}%",
+      "updateDownloading": "{agentName}が新しいお家を準備中",
       "updateReadyInstall": "v{version} インストール準備完了",
       "updateInstalling": "アップデートをインストール中です。HanaAgent は自動で再起動します…",
       "updateInstallManualHint": "「再起動して更新」を押すとインストールします。終了だけでは自動インストールしません",
       "updateInstall": "再起動して更新",
       "updateInstallNow": "今すぐ再起動して更新",
+      "updateApply": "更新",
+      "updateApplyAutoHint": "クリックしなくても次回起動時に自動的に適用されます",
+      "trainStickerTitle": "新しいバージョンがあります",
+      "trainStickerDownloading": "ダウンロード中 {percent}%",
+      "trainStickerApplying": "更新を適用中…",
+      "shellStickerTitle": "プラットフォームの更新が利用可能です（再起動が必要）",
+      "shellStickerTitleBlocking": "この更新を完了しないと新しいバージョンを受信できません",
+      "fallbackStickerTitle": "バージョン {fromVersion} が連続して起動に失敗したため、{toVersion} にロールバックしました。問題のあったバージョンは隔離され、自動的に再試行されません。",
+      "fallbackStickerAckLabel": "わかりました",
+      "updateHistoryTitle": "更新履歴",
+      "updateHistorySubtitle": "最近公開された5つのバージョン",
+      "updateHistoryLoading": "更新履歴を読み込んでいます…",
+      "updateHistoryOffline": "リリースサイトに接続できないため、アプリに保存されたバージョンを表示しています。",
+      "updateHistoryPartial": "更新内容がある公開バージョンの一部のみ表示しています。",
+      "updateHistoryUnavailable": "更新履歴を一時的に読み込めません。後でもう一度お試しください。",
       "updateProgress": "{percent}%",
       "updateError": "アップデートの確認に失敗しました",
       "updateLatest": "最新バージョンです",
+      "updateLatestCheckedAt": "最新です（最終確認: {time}）",
+      "updateManifestReleasedAt": "配布マニフェストの発行日: {date}",
+      "updateManifestReleasedAtViaMirror": "配布マニフェストの発行日: {date}（バックアップ経由）",
       "updateCheckBtn": "アップデートを確認",
+      "updateRetryBtn": "再試行",
       "updateNeedInstall": "先に HanaAgent をアプリケーションフォルダに移動してください",
       "updateDiskSpace": "ディスク容量不足のため、アップデートをダウンロードできません",
+      "updateDigestCta": "このアップデートで得られるもの",
+      "updateDigestTitle": "このアップデートで得られるもの",
+      "updateDigestClose": "閉じる",
+      "updateDigestKind": {
+        "feature": "新機能",
+        "fix": "修正",
+        "improvement": "改善",
+        "migration": "移行"
+      },
       "launchAtLogin": "ログイン時に起動",
       "keepAwake": "ロック中も実行を継続",
       "betaUpdates": "ベータ版アップデートを受け取る",
-      "autoCheckUpdates": "アップデートを自動で確認"
+      "autoCheckUpdates": "アップデートを自動で確認",
+      "inviteSectionTitle": "ベータチャンネル",
+      "inviteCodeLabel": "招待コード",
+      "inviteCodePlaceholder": "招待コードを貼り付け",
+      "inviteRedeemBtn": "引き換える",
+      "inviteRedeeming": "引き換え中…",
+      "inviteErrorInvalid": "この招待コードは無効か、すでに使い切られています。",
+      "inviteErrorNetwork": "引き換えサービスに接続できません。通信環境を確認してもう一度お試しください。",
+      "inviteErrorActivate": "チャンネルの状態を保存できませんでした。",
+      "inviteConfirmTitle": "ベータチャンネルに切り替えますか？",
+      "inviteConfirmBody": "切り替えると、アプリはテスト版に更新されます。テスト版がデータ形式を更新したあとは、現在の正式版には戻れません。確認すると即座に反映されます。",
+      "inviteConfirmOk": "切り替える",
+      "inviteConfirmCancel": "正式版のままにする",
+      "inviteChannelActive": "現在のチャンネル：ベータチャンネル",
+      "inviteCodesLabel": "あなたの招待コード",
+      "inviteCodesHint": "各コードは1回だけ、1台の端末で使えます。",
+      "inviteCopy": "コピー",
+      "platformCheckLabel": "プラットフォーム更新を確認",
+      "platformCheckBtn": "確認"
     },
     "access": {
       "networkAccess": "LAN アクセス",
@@ -1254,7 +1542,8 @@
       "changeAvatar": "変更",
       "userNameHint": "アシスタントがあなたを呼ぶ名前",
       "userProfile": "ユーザープロフィール",
-      "userProfileHint": "アシスタントがあなたを理解する手がかり：興味、習慣、好みなど。システムプロンプトに挿入されます"
+      "userProfileHint": "アシスタントがあなたを理解する手がかり：興味、習慣、好みなど。システムプロンプトに挿入されます",
+      "nameLabel": "名前"
     },
     "crop": {
       "title": "アバターを調整",
@@ -1376,7 +1665,18 @@
       "models": "画像モデル",
       "globalDefault": "グローバルデフォルト",
       "followGlobal": "グローバルデフォルトに従う",
-      "default": "デフォルト"
+      "default": "デフォルト",
+      "videoGeneration": "動画生成",
+      "defaultVideoModel": "デフォルト動画モデル",
+      "videoAdapterMissing": "動画アダプターがありません",
+      "addVideoModel": "動画モデルを追加",
+      "duration": "長さ",
+      "frameRate": "フレームレート",
+      "videoModels": "動画モデル",
+      "defaultOption": "デフォルト",
+      "qualityLow": "低",
+      "qualityMedium": "中",
+      "qualityHigh": "高"
     },
     "oauth": {
       "title": "クイックログイン",
@@ -1478,6 +1778,64 @@
       "compiledEmpty": "コンパイル済みの記憶はまだありません",
       "compiledClear": "クリア",
       "compiledCleared": "コンパイル済みの記憶をクリアしました",
+      "editableFactsLabel": "重要な事実",
+      "saveFacts": "Factsを保存",
+      "factsSaved": "Factsを保存しました",
+      "readonlyTimelineTitle": "タイムライン記憶",
+      "editEntry": "編集",
+      "editDone": "完了",
+      "editSave": "保存",
+      "saveToday": "今日を保存",
+      "todaySaved": "今日の記憶を保存しました",
+      "saveLongterm": "長期情報を保存",
+      "longtermSaved": "長期情報を保存しました",
+      "saveDay": "この日を保存",
+      "daySaved": "この日を保存しました",
+      "dream": {
+        "title": "Dream の整理",
+        "hint": "重要な事実と長期的な状況を1行1件に整理し、重複を統合して古い内容を除外します",
+        "autoLabel": "毎日の自動 Dream",
+        "autoHint": "この Agent のみに適用。既定はオフで、論理日ごとに最大1回実行します",
+        "run": "現在の記憶を整理",
+        "running": "整理中…",
+        "restore": "バージョンを復元",
+        "restoring": "復元中…",
+        "view": "整理結果を表示",
+        "success": "{time} に完了：{before} → {after} 文字、{merged} 件を統合、{forgotten} 件を除外。",
+        "unchanged": "{time} に確認完了。今回は書き戻す変更がありませんでした。",
+        "legacySuccess": "{time} に完了：{before} → {after} 文字。旧バージョンの実行記録のため、実際の統合件数は確認できません。",
+        "revisions": {
+          "title": "Dream バージョン",
+          "listLabel": "復元可能なバージョン",
+          "loading": "バージョンを読み込み中…",
+          "empty": "復元可能な Dream バージョンはまだありません",
+          "manual": "手動整理の前",
+          "automatic": "自動整理の前",
+          "preRestore": "復元操作の前",
+          "characters": "文字",
+          "noContent": "（内容なし）",
+          "restoreThis": "このバージョンに復元",
+          "confirmHint": "復元前に現在のバージョンを保存するため、あとから取り消せます。",
+          "confirmRestore": "復元を確認",
+          "cancel": "キャンセル",
+          "close": "閉じる",
+          "restored": "選択したバージョンを復元し、復元前の現在のバージョンも保存しました。"
+        },
+        "failed": "Dream に失敗しました。元の記憶は変更されていません",
+        "errors": {
+          "statusLoadFailed": "Dream の状態を一時的に読み取れません。しばらくしてからお試しください",
+          "startFailed": "Dream を開始できませんでした。しばらくしてからお試しください",
+          "autoSaveFailed": "毎日の自動 Dream 設定を保存できませんでした。しばらくしてからお試しください",
+          "revisionsLoadFailed": "Dream のバージョンを一時的に読み取れません。しばらくしてからお試しください",
+          "revisionLoadFailed": "この Dream バージョンを読み取れません。しばらくしてからお試しください",
+          "restoreFailed": "Dream バージョンを復元できませんでした。現在の記憶は変更されていません"
+        }
+      },
+      "sections": {
+        "today": "今日",
+        "week": "今週のこれまで",
+        "longterm": "長期的な状況"
+      },
       "health": {
         "healthy": "記憶の整理は正常です",
         "degraded": "記憶の整理に遅れがあります",
@@ -1587,7 +1945,14 @@
       "injectAgentsMd": "AGENTS.md を注入",
       "injectAgentsMdDesc": "オンにすると、新規セッションは現在の作業ディレクトリから Git ルートまでの AGENTS.md を読み込みます。",
       "injectClaudeMd": "CLAUDE.md を注入",
-      "injectClaudeMdDesc": "オンにすると、新規セッションは現在の作業ディレクトリから Git ルートまでの CLAUDE.md を読み込みます。"
+      "injectClaudeMdDesc": "オンにすると、新規セッションは現在の作業ディレクトリから Git ルートまでの CLAUDE.md を読み込みます。",
+      "projectSkillsTitle": "プロジェクトスキルの検出",
+      "projectSkillsDesc": "この Agent が新しいセッションに読み込むプロジェクトスキルのディレクトリを選択します。",
+      "discoverProjectSkills": "プロジェクトスキルを読み込む",
+      "discoverProjectSkillsDesc": "現在のプロジェクトの .agents/skills からスキルを検出して読み込みます。",
+      "discoverCompatibleProjectSkills": "他ツールのプロジェクトスキルを読み込む",
+      "discoverCompatibleProjectSkillsDesc": "Claude Code、Codex、OpenClaw のプロジェクトスキルも検出します。",
+      "agentDeskSection": "Agent デスク設定"
     },
     "toolCaps": {
       "title": "スキルインストール権限"
@@ -1647,7 +2012,46 @@
         "risk3": "ソーシャルエンジニアリングと権限昇格の試み",
         "body2": "無効にすると、すべてのスキルが審査なしでインストールされます。",
         "confirm": "リスクを理解した上で審査を無効にする"
-      }
+      },
+      "toggleEnable": "Skill を有効化",
+      "toggleDisable": "Skill を無効化",
+      "toggleEnableNamed": "{name} を有効化",
+      "toggleDisableNamed": "{name} を無効化",
+      "bundleDialog": {
+        "createTitle": "Bundle を作成",
+        "renameTitle": "Bundle の名前を変更",
+        "dissolveTitle": "Bundle を解体",
+        "cancel": "キャンセル",
+        "closeAriaLabel": "キャンセル",
+        "dissolveConfirm": "{name} を解体しますか？スキルは共有ライブラリに残り、単体スキルとして表示されます。",
+        "bundleNameLabel": "Bundle 名",
+        "cancelBtn": "キャンセル",
+        "createBtn": "作成",
+        "saveBtn": "保存",
+        "dissolveBtn": "解体"
+      },
+      "exportedWithSkipped": "{fileName} をエクスポートしました。不足しているスキル {count} 個をスキップしました",
+      "exported": "{fileName} をエクスポートしました",
+      "createBundleBtn": "Bundle を作成",
+      "createBundleTitle": "Skill Bundle を作成",
+      "createBundleAriaLabel": "Skill Bundle を作成",
+      "emptyBundle": "空の Bundle",
+      "skillNotFound": "このスキルは既に存在しません",
+      "noLooseSkills": "単体スキルはありません",
+      "collapseBundleAriaLabel": "Bundle を折りたたむ",
+      "expandBundleAriaLabel": "Bundle を展開",
+      "enableBundleTitle": "Bundle 全体を有効にする",
+      "disableBundleTitle": "Bundle 全体を無効にする",
+      "enableBundleAriaLabel": "{name} を有効にする",
+      "disableBundleAriaLabel": "{name} を無効にする",
+      "renameBundleTitle": "Bundle の名前を変更",
+      "renameBundleAriaLabel": "{name} の名前を変更",
+      "exportBundleTitle": "Skill Bundle をエクスポート",
+      "exportBundleAriaLabel": "{name} をエクスポート",
+      "dissolveBundleTitle": "Bundle を解体",
+      "dissolveBundleAriaLabel": "{name} を解体",
+      "removeFromBundleTitle": "Bundle から外して単体スキルにする",
+      "removeFromBundleAriaLabel": "{name} を Bundle から外す"
     },
     "plugins": {
       "title": "プラグイン",
@@ -1706,7 +2110,9 @@
       "marketDowngradeTo": "互換性のある v{version} のみインストールできます",
       "marketDowngradeConfirm": "現在のバージョンは v{from} です。v{to} にダウングレードしますか？",
       "marketReadmeLoading": "README を読み込み中…",
-      "marketSelectPlugin": "プラグインを選択して README を表示"
+      "marketSelectPlugin": "プラグインを選択して README を表示",
+      "manageTitle": "プラグイン管理",
+      "permissionTitle": "権限"
     },
     "mcp": {
       "masterTitle": "Master Switch",
@@ -1738,6 +2144,7 @@
       "headersHint": "One KEY=value pair per line. Values are stored for connector requests and masked after saving.",
       "statusRunning": "Running",
       "statusStopped": "Stopped",
+      "statusDisabled": "Disabled",
       "statusConnecting": "Connecting",
       "statusReconnecting": "Reconnecting",
       "statusFailed": "Reconnect failed",
@@ -1750,7 +2157,6 @@
       "env": "Environment Variables",
       "envHint": "One KEY=value pair per line. Values are passed only to local stdio MCP server processes.",
       "timeout": "Timeout Seconds",
-      "autoStart": "Auto Start",
       "addConnector": "Add Connector",
       "updateConnector": "Update Connector",
       "importJson": "Import JSON",
@@ -1765,7 +2171,56 @@
       "removeConfirm": "Remove this connector? Saved per-agent switches will remain but no longer take effect.",
       "agentTitle": "Agent Configuration",
       "agentConnectorDesc": "Enable for the selected agent, just like skills.",
-      "saveError": "Save failed"
+      "saveError": "Save failed",
+      "enabledAgentsCount": "件のアシスタントで有効",
+      "manage": "管理",
+      "removeTitle": "コネクタを削除",
+      "connectionTitle": "接続方法",
+      "permissionTitle": "権限",
+      "toolsTitle": "ツール",
+      "noTools": "ツールはまだありません。コネクタを起動して一度更新すると表示されます。",
+      "toolCollisionNotice": "{a} と {b} は正規化すると同じツール名になるため、両方とも無効になりました。コネクタ id を変更するか、サーバー側でツール名を変更してください。",
+      "toolCollisionSummary": "{count} 個のツールが {other} のツールと正規化後に同じ名前になり、すべて無効になりました。コネクタ id を変更してください。",
+      "toolCollisionHostNotice": "{a} は正規化すると組み込みのステータスツールと同じ名前になるため、このツールは無効になりました。名前を変更してください。",
+      "noToolMatches": "一致するツールがありません",
+      "toolSearch": "ツールを検索",
+      "selectAll": "すべて選択",
+      "selectNone": "選択を解除",
+      "selectInvert": "選択を反転",
+      "badgeReadOnly": "読み取り専用",
+      "badgeDestructive": "破壊的",
+      "permissionAllow": "審査なしで許可",
+      "pinTool": "常時読み込み",
+      "permissionMode": "呼び出しの審査",
+      "permissionModeHint": "既定ではすべての呼び出しを審査します。許可リストにすると、個別に許可したツールだけが審査を省きます。",
+      "permissionReviewAll": "すべて審査",
+      "permissionAllowlist": "許可リスト",
+      "trustReadOnly": "読み取り専用の申告を信頼する",
+      "trustReadOnlyHint": "読み取り専用かどうかはサーバー自身の申告で、Hana には確認できません。有効にすると、読み取り専用と申告されたツールは毎回の審査を省きます。",
+      "deferTitle": "遅延読み込み",
+      "deferScopeNote": "以下の設定はこのコネクタだけでなく、すべてのコネクタに適用されます。",
+      "deferEnabled": "遅延読み込みを許可",
+      "deferEnabledHint": "ツールが多いときは、まず目録だけをモデルに渡し、必要になったものだけ詳細を取り出します。",
+      "deferBuiltin": "内蔵ツールも遅延読み込み",
+      "deferBuiltinHint": "オンにすると内蔵ツールもカタログ経由で必要時に読み込まれます。直接読み込みの方がモデルは積極的に動くため、コンテキストが逼迫したときのみ推奨。",
+      "deferThreshold": "しきい値",
+      "deferThresholdHint": "有効なツールがこの数を超えたときだけ目録を使い、下回る場合はすべて直接読み込みます。",
+      "agentConnectorEnabled": "このアシスタントで有効",
+      "oauthWaiting": "ブラウザでの認可を待っています",
+      "oauthWaitingHint": "認可ページをブラウザで開きました。完了すると自動で反映されます。いつでも中止できます。",
+      "oauthFailed": "認可に失敗しました",
+      "oauthTimeout": "認可の待機がタイムアウトしました",
+      "importEmpty": "コネクタが見つかりませんでした",
+      "importPreviewHint": "取り込む内容を確認してください。チェックを外すとその項目は除外されます。",
+      "importParse": "解析",
+      "importConfirm": "{count} 件を取り込む",
+      "importItemOk": "追加しました",
+      "commandRequired": "コマンドがありません",
+      "urlRequired": "URL を入力してください",
+      "urlInvalid": "この URL は解釈できません。https:// のようにスキームを付けてください",
+      "urlScheme": "URL は http または https のみ対応しています",
+      "modeSwitchTitle": "接続タイプを変更",
+      "modeSwitchBody": "ローカルとリモートは別々の設定を使います。切り替えると他方の項目は消去され、稼働中の接続も切断されます。"
     },
     "screenshot": {
       "title": "スクリーンショット共有",
@@ -1795,14 +2250,19 @@
       "telegramToken": "Bot Token",
       "telegramHint": "@BotFather から取得",
       "feishu": "Feishu",
+      "feishuRegion": "リージョン",
+      "feishuRegionFeishuCn": "Feishu 中国",
+      "feishuRegionLarkGlobal": "Lark グローバル",
       "feishuAppId": "App ID",
       "feishuAppSecret": "App Secret",
       "feishuHint": "Feishu オープンプラットフォームから取得。イベントは長接続で受信するため、ローカル callback URL は不要です",
       "dingtalk": "DingTalk",
+      "dingtalkCorpId": "Corp ID",
       "dingtalkClientId": "Client ID / AppKey",
       "dingtalkClientSecret": "Client Secret / AppSecret",
       "dingtalkRobotCode": "Robot Code",
-      "dingtalkHint": "DingTalk の内部企業アプリとアプリロボットから取得します。イベントは Stream 長接続で受信するため、ローカル callback URL は不要です",
+      "dingtalkApiBaseUrl": "API Base URL",
+      "dingtalkHint": "Corp ID とアプリ認証情報は新しい token API に使います。Client ID と Client Secret は Stream 接続にも使い、Robot Code は返信送信に使います。API Base URL の既定値は https://api.dingtalk.com/v1.0 です",
       "whatsapp": "WhatsApp",
       "qq": "QQ",
       "qqAppId": "App ID",
@@ -1826,12 +2286,15 @@
       "connected": "接続済み",
       "disconnected": "未接続",
       "error": "接続に失敗しました",
+      "connectionToggle": "接続を有効または無効にする",
       "test": "接続テスト",
       "testOk": "接続に成功しました",
+      "dingtalkCredentialTestOk": "認証情報を確認しました。Stream 接続とロボット返信は有効化後に確認されます",
       "testFail": "テストに失敗しました",
+      "secretStoredPlaceholder": "保存済みです。置き換えるには新しい値を入力してください",
       "noToken": "先に Bot Token を入力してください",
       "noCredentials": "先に App ID と App Secret を入力してください",
-      "noDingtalkCredentials": "先に Client ID、Client Secret、Robot Code を入力してください",
+      "noDingtalkCredentials": "先に Corp ID、Client ID、Client Secret、Robot Code、API Base URL を入力してください",
       "globalSettings": "グローバル設定",
       "agentSettings": "エージェント",
       "permissionMode": "権限モード",
@@ -1875,12 +2338,112 @@
       ],
       "tutorialDtSteps": [
         "<code>open.dingtalk.com</code> にアクセスし、開発者コンソールを開きます",
+        "企業情報から <code>Corp ID</code> をコピーします",
         "内部企業アプリを作成し、アプリ認証情報から <code>Client ID/AppKey</code> と <code>Client Secret/AppSecret</code> をコピーします",
         "アプリロボット機能を追加し、ロボット詳細から <code>Robot Code</code> をコピーします",
         "ロボットのメッセージ送受信に必要な権限を確認し、対象企業範囲へ公開します",
-        "上の入力欄に Client ID、Client Secret、Robot Code を貼り付け、接続テスト後にスイッチをオンにします"
+        "DingTalk 互換ゲートウェイを明示的に使う場合を除き、API Base URL は <code>https://api.dingtalk.com/v1.0</code> のままにします",
+        "上の入力欄に Corp ID、Client ID、Client Secret、Robot Code、API Base URL を貼り付けます。新しい token テストと Stream 接続の両方が成功すると、メッセージを完全に送受信できます"
       ],
       "whatsappHint": "近日対応予定"
+    },
+    "experiments": {
+      "title": "実験機能",
+      "compactionTitle": "コンテキストコンパクション",
+      "compactionSectionDescription": "自動コンパクションの既定戦略と、チャットのコンテキストリングに実験的な一回限りの操作を表示するかを設定します。",
+      "modelPersonaTitle": "モデルとペルソナ",
+      "modelPersonaDescription": "各プロバイダーが Hana のペルソナ、ムード、出力契約にどう適応するかを観察します。",
+      "memoryTitle": "メモリ実験",
+      "memorySectionDescription": "実験的なメモリシステム機能。安定したら本来のメモリ設定に移行します。",
+      "toolsTitle": "Agent ツール",
+      "toolsSectionDescription": "Agent ツールが使用するファイルアクセスパスを制御します。有効にすると、新しいセッションのみ新しいパスを使用します。",
+      "description": "将来の機能はまずここに登場します。安定したら本来の設定ページに移行します。",
+      "empty": "表示できる実験機能はありません",
+      "owner": {
+        "memory": "メモリ",
+        "session": "セッション",
+        "provider": "プロバイダー"
+      },
+      "status": {
+        "alpha": "Alpha",
+        "beta": "Beta",
+        "deprecated": "非推奨",
+        "retired": "廃止"
+      },
+      "risk": {
+        "low": "低リスク",
+        "medium": "中リスク",
+        "high": "高リスク"
+      },
+      "restart": {
+        "immediate": "即時反映",
+        "new_session": "新しいセッションのみ",
+        "restart_server": "サーバーを再起動",
+        "restart_app": "アプリを再起動"
+      },
+      "cacheSnapshot": {
+        "title": "キャッシュメモリシステム",
+        "description": "キャッシュされたコンテキストでメモリを構築し、キャッシュヒット率を向上させ、コストを削減します。",
+        "off": "オフ",
+        "shadow": "観察",
+        "write": "書き込み",
+        "observeOnly": "観察のみ（メモリには書き込まない）",
+        "observationNote": "観察モードは正式なメモリに影響しません。新しいメモリシステムが期待どおり動作するかを確認するためだけに使用します。",
+        "writeWarning": "このモードは正式なメモリに書き込みます。",
+        "previewTitle": "メモリ MD プレビュー",
+        "summaryTitle": "ローリングサマリープレビュー",
+        "emptyPreview": "まだ観察データがありません",
+        "clearObservation": "観察データをクリア"
+      },
+      "compaction": {
+        "title": "コンパクションモード",
+        "description": "Auto はキャッシュ保持型コンパクションを優先します。通常コンパクションは Pi SDK のネイティブ要約を使用します。",
+        "auto": "自動",
+        "cachePreserving": "キャッシュ保持型コンパクション",
+        "piCompatible": "通常コンパクション"
+      },
+      "instantSimpleCompaction": {
+        "title": "瞬時簡易コンパクション",
+        "description": "有効にすると、チャット入力欄のコンテキストリングメニューに「瞬時簡易コンパクション」が追加されます。明示的に開始した一回だけに作用し、自動または通常コンパクションの動作は変更しません。"
+      },
+      "deepseekRoleplay": {
+        "title": "DeepSeek ペルソナ没入パッチ",
+        "description": "有効にすると、新しい DeepSeek V4 thinking セッションの最初の送信ユーザーメッセージに、一時的にペルソナ没入マーカーが付加されます。チャット履歴には表示・保存・復元されません。オフにすると従来の動作のままです。"
+      },
+      "proactiveSubagent": {
+        "title": "プロアクティブなサブ Agent 委任",
+        "description": "有効にすると、Agent は広範な探索や調査タスクをサブ Agent に積極的に委任し、メインチャットのコンテキスト注意力を節約します。複雑なタスクでより良い結果が得られる場合があります。"
+      },
+      "subagentTitle": "サブ Agent",
+      "subagentSectionDescription": "Agent がいつサブ Agent に作業を委任するかを制御します。"
+    },
+    "characterCard": {
+      "exportMemory": "メモリをエクスポート",
+      "importMemory": "メモリをインポート",
+      "noExportableMemory": "エクスポート可能なメモリがありません",
+      "noImportableMemory": "インポート可能なメモリがありません",
+      "confirm": "確認",
+      "exporting": "エクスポート中",
+      "importing": "インポート中",
+      "noDescription": "このキャラクターカードには説明がありません。",
+      "noAgentsMd": "AGENTS.md が設定されていません",
+      "viewDetail": "キャラクターカードの詳細を表示",
+      "memoryCount": "{count} 件のメモリ（{action}は任意）",
+      "memoryCountExport": "エクスポート",
+      "memoryCountImport": "インポート",
+      "noMemory": "メモリなし",
+      "factsSectionTitle": "重要な事実",
+      "todaySectionTitle": "今日",
+      "weekSectionTitle": "今週前半",
+      "longtermSectionTitle": "長期コンテキスト",
+      "emptySection": "なし",
+      "noIdentity": "Identity が設定されていません",
+      "noSkills": "スキルが含まれていません",
+      "cancel": "キャンセル",
+      "readingCard": "キャラクターカードを読み込み中",
+      "dropOrClick": "キャラクターカードをドロップするか、クリックして開く",
+      "readFailed": "キャラクターカードの読み込みに失敗しました",
+      "importFailed": "キャラクターカードのインポートに失敗しました"
     }
   },
   "onboarding": {
@@ -2104,7 +2667,21 @@
     "cut": "切り取り",
     "copy": "コピー",
     "paste": "貼り付け",
-    "selectAll": "すべて選択"
+    "selectAll": "すべて選択",
+    "undo": "元に戻す",
+    "redo": "やり直す",
+    "bold": "太字",
+    "italic": "斜体",
+    "strikethrough": "取り消し線",
+    "inlineCode": "インラインコード",
+    "heading1": "見出し 1",
+    "heading2": "見出し 2",
+    "heading3": "見出し 3",
+    "blockquote": "引用",
+    "codeBlock": "コードブロック",
+    "horizontalRule": "水平線",
+    "list": "リスト",
+    "blockActions": "ブロック操作"
   },
   "rightWorkspace": {
     "activity": {
@@ -2180,6 +2757,9 @@
     "cwdSkillsHint": ".agents/skills/ ディレクトリを作成して始めましょう",
     "cwdSkillsDesc": "スキルはワークスペースに連動します",
     "cwdSkillsDrop": "フォルダまたは .zip をドロップしてスキルをインストール",
+    "cwdSkillActive": "読み込み済み",
+    "cwdSkillInactive": "未読み込み",
+    "cwdSkillShadowed": "優先元により無効",
     "deleteSkill": "スキルを削除",
     "openInFinder": "フォルダを開く",
     "jianLabel": "Jian",
@@ -2203,7 +2783,8 @@
       "deleteSelected": "{count} 件を削除",
       "deleteN": "{n} 件を削除",
       "newMdFile": "新しい Markdown ドキュメント",
-      "newFolder": "新しいフォルダ"
+      "newFolder": "新しいフォルダ",
+      "history": "履歴"
     },
     "deleteConfirm": "「{name}」をシステムのゴミ箱に移動しますか？",
     "deleteSelectedConfirm": "選択した {count} 件をシステムのゴミ箱に移動しますか？",
@@ -2248,12 +2829,16 @@
   "browser": {
     "using": "ブラウザを使用中",
     "close": "ブラウザを閉じる",
+    "open": "ブラウザを開く",
+    "collapse": "折りたたむ",
+    "closeForSession": "このセッションのブラウザを閉じる",
     "closeBtn": "閉じる",
     "back": "戻る",
     "forward": "進む",
     "reload": "再読み込み",
     "newTab": "新しいタブ",
     "closeTab": "タブを閉じる",
+    "emptyWorkspace": "開いているタブはありません",
     "emergencyStop": "AI制御の緊急停止",
     "backgroundHint": "バックグラウンドブラウザ実行中、クリックして表示",
     "background": "バックグラウンドブラウザ"
@@ -2269,10 +2854,21 @@
     "resetContextTip": "次のメッセージから新しい会話が始まります",
     "replyInterrupted": "（応答が中断されました。上記の内容は不完全な可能性があります）",
     "replyFailed": "（応答の生成に失敗しました。しばらくしてからもう一度お試しください）",
-    "sessionBusy": "デスクトップセッションはまだ応答中です。しばらくしてから再送してください"
+    "sessionBusy": "デスクトップセッションはまだ応答中です。しばらくしてから再送してください",
+    "platform": {
+      "telegram": "Telegram",
+      "feishu": "Feishu",
+      "wechat": "WeChat",
+      "qq": "QQ",
+      "bridge": "Bridge"
+    }
   },
   "notification": {
-    "turnCompletionBody": "このターンは完了しました"
+    "chatCompletionBody": "このチャットターンは完了しました",
+    "scheduledTaskCompletionBody": "スケジュールタスクが完了しました：{label}",
+    "scheduledTaskCompletionFailedBody": "スケジュールタスクに失敗しました：{label}",
+    "patrolCompletionBody": "巡回が完了しました：{label}",
+    "patrolCompletionFailedBody": "巡回に失敗しました：{label}"
   },
   "error": {
     "pathsRequired": "paths 配列は必須です",
@@ -2328,6 +2924,7 @@
     "fetchError": "取得エラー: {msg}",
     "browserError": "エラー: {msg}",
     "browserAlreadyRunning": "ブラウザは既に実行中です",
+    "browserAuthorizationRevoked": "ユーザーがブラウザ使用の許可を停止しました",
     "browserLaunched": "ブラウザを起動しました",
     "browserNotRunning": "ブラウザは実行されていません",
     "browserClosed": "ブラウザを閉じました",
@@ -2444,9 +3041,9 @@
     "installSkillGithubApiError": "GitHub API へのアクセスに失敗しました：{msg}",
     "installSkillStarTooLow": "このリポジトリは {stars} stars のみ（しきい値 {min}）です。安全性が保証できないため、インストールを拒否しました。",
     "installSkillNoSkillMd": "{owner}/{repo} で SKILL.md が見つかりません（試行パス：{paths}）。",
-    "installSkillSafetyFailed": "[セキュリティ] スキル安全レビューに合格しませんでした。インストールをブロックしました。\n理由：{reason}\n\nユーザーにこのスキルが安全レビューに合格しなかったことと具体的な理由を説明してください。ユーザーは設定で安全レビューを無効にできます（非推奨）。",
+    "installSkillSafetyFailed": "[セキュリティ警告] スキル安全レビューに合格しなかったため、まだインストールしていません。\n理由：{reason}\n\nこのスキルの出所が不明な場合は、SKILL.md と同梱ファイルを先に確認するようユーザーに伝えてください。ユーザーがこのスキルを信頼し、続行を明確に確認した場合のみ、risk_accepted=true と返された risk_confirmation_token を指定して install_skill を再実行してください。",
     "installSkillNameInvalid": "スキル名が無効です{name}。英字、数字、アンダースコア、ハイフンのみ使用できます。",
-    "installSkillSuccess": "スキル「{name}」のインストールに成功しました！\nソース：{source}（⭐ {stars} stars）\n理由：{reason}",
+    "installSkillSuccess": "スキル「{name}」のインストールに成功しました！\nソース：{source}\n理由：{reason}",
     "installSkillNeedInput": "github_url、local_path、fileId、または source FileRef を提供してください。",
     "installSkillNeedName": "skill_content モードでは skill_name が必要です。",
     "installSkillSuccessLocal": "スキル「{name}」のインストールに成功しました！\n理由：{reason}",
@@ -2454,6 +3051,7 @@
     "installSkillNoUtility": "安全レビュー不可：utility モデルが設定されていません。設定で補助モデルを設定してください",
     "installSkillUtilityIncomplete": "安全レビュー不可：補助モデルの設定が不完全です（API key または base URL が不足）。設定で補完してください",
     "installSkillSafetyPassed": "✓ 安全レビューに合格しました",
+    "installSkillSafetyOverride": "⚠ 安全レビューには合格しませんでしたが、ユーザーの明確な確認に基づいてインストールを続行しました。\nリスク理由：{reason}",
     "installSkillSafetyEmpty": "安全レビューが空のレスポンスを返しました",
     "installSkillSafetyUnexpected": "安全レビューが予期しない形式を返しました: {reply}",
     "installSkillSafetyTimeout": "安全レビューがタイムアウトまたはネットワークエラー",
@@ -2468,6 +3066,7 @@
     "platformTestUnsupported": "このプラットフォームはテストに対応していません",
     "codexNoHealthCheck": "Codex API はヘルスチェックに対応していません",
     "modelNotFound": "モデルが見つかりません: {id}",
+    "modelContextTooLarge": "新しいモデルのコンテキスト枠では、この会話を収められません。先に会話を圧縮してから、もう一度モデルを切り替えてください。",
     "noUtilityModel": "utility モデルが設定されていません。設定で追加してください",
     "noUtilityLargeModel": "utility_large モデルが設定されていません。設定で追加してください",
     "modelNoProvider": "{role} モデル \"{model}\" にプロバイダーの関連付けがありません",
@@ -2530,13 +3129,54 @@
     "stopTaskNotFound": "タスク {taskId} が見つかりません。すでに完了しているか存在しない可能性があります",
     "stopTaskAlready": "タスク {taskId} はすでに終了しています",
     "stopTaskNoHandler": "タスク {taskId} は終了操作に対応していません",
-    "stopTaskDone": "タスク {taskId} を終了しました"
+    "stopTaskDone": "タスク {taskId} を終了しました",
+    "detailShow": "詳細",
+    "detailHide": "閉じる",
+    "code": {
+      "unexpected": "処理を完了できませんでした",
+      "sessionForkActiveTask": "この範囲にはまだ実行中のタスクがあります。終了を待つか、もっと前の位置から分岐してください",
+      "sessionForkUnavailable": "このバージョンでは分岐セッションを作成できません",
+      "subagentSessionForkCycle": "サブエージェントのセッションを自身の親へ分岐させることはできません",
+      "subagentRunBusy": "サブエージェントがまだ実行中です。終了を待ってください",
+      "subagentThreadBusy": "サブエージェントのスレッドが処理中です。しばらくしてからお試しください",
+      "workflowRunBusy": "ワークフローがまだ実行中です。終了を待ってください",
+      "workflowNodeBusy": "ワークフローのノードが処理中です。しばらくしてからお試しください",
+      "sessionCreateFailed": "セッションの作成に失敗しました。しばらくしてから再試行し、繰り返す場合は設定でモデルと認証情報を確認してください",
+      "sessionBusy": "このセッションは処理中です。現在の操作が終わるまでお待ちください",
+      "sessionNotLoaded": "セッションの読み込みが完了していません。しばらくしてからお試しください",
+      "sessionIdentityConflict": "セッションの識別が一致しません。再読み込みしてからお試しください",
+      "sessionIdentityUnresolved": "このメッセージがどのセッションのものか判別できません",
+      "sessionIdentityMismatch": "このメッセージは現在のセッションのものではありません",
+      "sessionManifestNotFound": "このセッションの記録が見つかりません。削除された可能性があります。一覧を更新して確認してください",
+      "sessionManifestUnavailable": "セッションの索引が一時的に利用できません。しばらくしてから再試行し、続くようならアプリを再起動してください",
+      "sessionLocatorNotActive": "このセッションは最新版ではありません。アーカイブまたは移動された可能性があります。一覧を更新して再試行してください",
+      "activeSessionConflict": "別のセッションがすでに進行中です",
+      "sessionDeleteStagedConflict": "このセッションは削除中のため、今は操作できません",
+      "fileTooLarge": "ファイルが上限のサイズを超えています",
+      "invalidUpload": "アップロードされた内容を読み取れません",
+      "invalidPath": "パスが正しくありません",
+      "noAvailableModel": "利用できる対話モデルがありません。まず設定でモデルと認証情報を設定してください",
+      "agentModelNotAvailable": "このアシスタントに設定されたモデルは現在利用できません。設定で別のモデルを選んでください",
+      "workspaceNotFound": "このワークスペースが見つかりません",
+      "capabilityDenied": "この操作は許可されていません",
+      "dreamUnavailable": "この Agent では Dream 整理を一時的に利用できません",
+      "dreamMemoryDisabled": "先にこの Agent の記憶を有効にしてください",
+      "dreamMemoryBusy": "記憶をバックグラウンドで整理しています。しばらくしてからお試しください",
+      "dreamAlreadyRunning": "この記憶では Dream 整理がすでに実行中です",
+      "dreamNoMemory": "整理できる重要な事実や長期記憶がまだありません",
+      "dreamMemoryChanged": "整理中に記憶が変更されました。Dream をもう一度実行してください",
+      "dreamRevisionNotFound": "この Dream バージョンが見つかりません。すでに整理された可能性があります",
+      "dreamRestoreFailed": "Dream バージョンを復元できませんでした。現在の記憶は変更されていません",
+      "dreamRunFailed": "Dream 整理に失敗しました。元の記憶は変更されていません",
+      "internalContract": "アプリ内部で問題が起きました。操作の誤りではありません。詳細は記録済みで、報告の際に添付できます"
+    }
   },
   "main": {
     "tray": {
       "show": "HanaAgent を表示",
       "settings": "設定",
-      "quit": "終了"
+      "quit": "終了",
+      "repairArtifacts": "コンポーネントを修復…"
     },
     "dialog": {
       "selectFolder": "作業フォルダを選択",
@@ -2552,10 +3192,16 @@
       "serverFilesNotReady": "自動アップデートが完了したばかりで、新バージョンのファイルがまだディスクに書き込まれていません（{missing} が見つかりません）。{waited} 秒待機しましたが完了しませんでした。しばらくしてから HanaAgent を再起動してください。",
       "serverModuleMissing": "Server 起動失敗：モジュール {module} が見つかりません。\n通常、自動アップデート完了直後にファイルがまだディスクに書き込み中の場合に発生します。\n推奨：1〜2 分待ってから HanaAgent を再起動してください。問題が続く場合は GitHub で報告してください。",
       "installFailedTitle": "HanaAgent アップデート",
-      "installFailedBody": "アップデートのインストールに失敗しました：\n{error}\n\nHanaAgent を再起動してからもう一度お試しください。または設定ページで手動でアップデートを確認してください。"
+      "installFailedBody": "アップデートのインストールに失敗しました：\n{error}\n\nHanaAgent を再起動してからもう一度お試しください。または設定ページで手動でアップデートを確認してください。",
+      "repairArtifactsTitle": "コンポーネントの修復",
+      "repairArtifactsBody": "この操作は HanaAgent のアプリコンポーネントをインストール時のバージョンにリセットし、アプリを再起動します。データ（エージェント、セッション、設定）は影響を受けません。",
+      "repairArtifactsConfirm": "修復して再起動",
+      "repairArtifactsCancel": "キャンセル",
+      "trainUpdateApplyFailedBody": "HanaAgent v{version}\n\n更新の適用に失敗しました：\n{error}\n\nアプリを再起動してください。"
     },
     "notification": {
-      "ready": "通知が有効になりました"
+      "ready": "通知が有効になりました",
+      "componentQuarantined": "コンポーネントは自動的に前のバージョンにロールバックされました。機能には影響ありません"
     }
   },
   "devtools": {
@@ -2652,6 +3298,7 @@
   },
   "sandbox": {
     "blocked": "[セキュリティ] {reason}\n\nこの操作は HanaAgent のサンドボックスセキュリティポリシーによりブロックされました。これはコマンドがパスまたは権限の境界を越えたことを示します。まず現在のワークスペース、具体的なパス表記、対象ファイルが許可されたワークスペースまたは session パスに属するべきかを確認してください。ブロックされたパスと理由をユーザーに説明し、サンドボックス設定の変更はユーザーが明示的に決めた場合にだけ相談してください。",
+    "blockedNeedsEscalation": "[セキュリティ] {reason}\n\nこのコマンドはサンドボックスモードでブロックされました。現在のタスクにとって重要で読み取り専用のクエリであれば、sandbox_permissions=\"require_escalated\" と一文の justification を添えて再実行してください。ユーザーが確認してから、サンドボックス外で実行されます。",
     "noSudo": "sudo の使用は禁止されています",
     "noSu": "su によるユーザー切り替えは禁止されています",
     "noChmod": "ファイル権限の変更は禁止されています",
@@ -2709,5 +3356,340 @@
   "preview.markdownPreview": "プレビュー",
   "preview.exitMarkdownPreview": "編集に戻る",
   "preview.markdownEditorStatus": "選択 {selected} 文字 · 合計 {total} 文字",
-  "preview.markdownAttachmentInsertFailed": "添付ファイルの挿入に失敗しました"
+  "preview.markdownAttachmentInsertFailed": "添付ファイルの挿入に失敗しました",
+  "link": {
+    "copyPath": "パスをコピー",
+    "copyLink": "リンクをコピー",
+    "openInSystemBrowser": "システムブラウザで開く"
+  },
+  "toolDef": {
+    "todoWrite": {
+      "summaryEmpty": "ToDo をクリアしました",
+      "summaryStats": "ToDo {total} 件: 完了 {completed}、進行中 {in_progress}、保留 {pending}"
+    },
+    "updateSettings": {
+      "searchResult": "{count} 件の設定が見つかりました:\n\n{results}\n\naction \"apply\" で key と value を指定して設定を変更してください。",
+      "searchNoResults": "「{query}」に一致する設定が見つかりません。より広いキーワードをお試しください。",
+      "searchMissingQuery": "search アクションには query パラメータが必要です。",
+      "applyMissingParams": "apply アクションには key と value の両方のパラメータが必要です。",
+      "frontendOnly": "クライアント側のみ",
+      "sandbox": "サンドボックスセキュリティ",
+      "sandboxDesc": "ファイルシステムの書き込み範囲を制限",
+      "sandboxNetwork": "サンドボックスネットワーク",
+      "sandboxNetworkDesc": "サンドボックス化されたコマンドのパブリックインターネットアクセスを許可します。Windows のコマンドサンドボックスはネットワーク分離をサポートせず、常に現在のユーザーのネットワークアクセスを維持します",
+      "locale": "言語",
+      "timezone": "タイムゾーン",
+      "timezoneDesc": "IANA タイムゾーン（例: Asia/Tokyo）",
+      "bridgeMediaPublicBaseUrl": "Bridge ファイル公開 URL",
+      "bridgeMediaPublicBaseUrlDesc": "外部プラットフォームがローカルのステージングファイルを取得するために使用する公開 HTTP/HTTPS ベース URL。通常はリバースプロキシまたはトンネルで提供します。空の場合は HANA_BRIDGE_PUBLIC_BASE_URL にフォールバックします。",
+      "computerUse": "Computer Use",
+      "computerUseDesc": "有効にすると、新しい会話でプライマリ Agent に computer ツールが公開されます。無効にすると新しい会話では表示されず、凍結された古い会話が呼び出した場合は拒否されます。",
+      "thinkingBudget": "思考の深さ",
+      "memory": "メモリシステム",
+      "memoryDesc": "現在の Agent のメモリを有効/無効にする",
+      "memoryFacts": "メモリ Facts",
+      "memoryFactsDesc": "この Agent の編集可能な現在メモリ Facts。",
+      "experience": "Experience",
+      "experienceDesc": "現在の Agent の Experience ライブラリを有効/無効にする",
+      "agentName": "Agent 名",
+      "userName": "ユーザー名",
+      "workingDir": "作業ディレクトリ",
+      "workingDirDesc": "Agent のファイルシステム作業ディレクトリ",
+      "theme": "テーマ",
+      "chatModel": "チャットモデル",
+      "fileBackup": "ファイルバックアップ",
+      "fileBackupDesc": "AI による変更前にファイルを自動バックアップ"
+    },
+    "generateImage": {
+      "description": "テキスト説明から画像を生成します。非ブロッキング: 送信後すぐに返り、完了すると自動的に表示されます。",
+      "promptDesc": "画像の説明（中国語または英語）",
+      "countDesc": "同時生成数。デフォルト 1、最大 9",
+      "imageDesc": "画像から画像への参照画像。{ kind: \"session_file\", fileId } のような現在のセッションオブジェクトを推奨します。",
+      "referenceImagesDesc": "参照画像の配列。{ kind: \"session_file\", fileId } のような現在のセッションオブジェクトを推奨します。複数参照にはこちらを使用し、単一画像の場合は image を使用できます。",
+      "ratioDesc": "アスペクト比: 1:1、16:9、9:16、4:3、3:4、3:2、2:3、21:9",
+      "resolutionDesc": "統一解像度ティア: 1k、2k、4k。アダプターが最も近いベンダーサイズにマッピングします",
+      "qualityDesc": "品質ティア: low、medium、high、auto（アダプターがベンダーパラメータにマッピング）",
+      "modelDesc": "モデル ID または短縮名（例: 5.0、dall-e-3）。通常の生成では省略し、設定されたデフォルトモデルを使用します。ユーザーが明示的にモデル名を指定した場合、または options discovery で必要と確認された場合のみ設定してください",
+      "modeDesc": "高度なモード上書き（text2image / image2image）。デフォルトでは省略。image/referenceImages から image2image を自動推論します。model にモード値を入れないでください",
+      "providerDesc": "プロバイダーを指定（任意）。通常の生成では省略し、設定されたデフォルトプロバイダーを使用します。ユーザーが明示的にプロバイダー名を指定した場合、または options discovery で必要と確認された場合のみ設定してください",
+      "suggestedFilenameDesc": "生成ファイル用の短い人間向けファイル名ヒント（拡張子なし）。完全なプロンプトではなく、簡潔なスラッグまたはタイトルを使用してください。",
+      "submitted": "{count} 件の画像生成を送信しました。完了すると下のカードに表示されます。"
+    },
+    "generateVideo": {
+      "description": "テキスト説明から動画を生成します。非ブロッキング: 送信後すぐに返り、完了すると自動的に表示されます。",
+      "promptDesc": "動画の説明（中国語または英語）",
+      "imageDesc": "画像から動画への参照画像。{ kind: \"session_file\", fileId } のような現在のセッションオブジェクトを推奨します。",
+      "durationDesc": "動画の長さ 4〜15 秒（デフォルト 5）",
+      "ratioDesc": "アスペクト比: 1:1、16:9、9:16、4:3、3:4、21:9",
+      "modelDesc": "モデル ID または短縮名。通常の生成では省略し、設定されたデフォルトモデルを使用します。ユーザーがモデルを明示するか、上書きを許可した場合のみ設定してください",
+      "providerDesc": "プロバイダーを指定（任意）。通常の生成では省略し、設定されたデフォルトプロバイダーを使用します。ユーザーがプロバイダーを明示するか、上書きを許可した場合のみ設定してください",
+      "notInitialized": "動画生成プラグインが初期化されていません",
+      "noProvider": "利用可能な動画生成プロバイダーがありません",
+      "submitFailed": "動画の送信に失敗しました: {error}",
+      "submitFailedUnknown": "動画の送信に失敗しました: 不明なエラー",
+      "submitted": "動画生成を送信しました。完了すると下のカードに表示されます。"
+    },
+    "getCoverStyleGuide": {
+      "description": "ユーザーが Markdown ドキュメントのカバー/ヘッダー画像を生成・置換・最適化したい場合、まずこのツールを呼び出して Hana のカバー美学ガイドラインを読み、記事内容に基づいて画像プロンプトを書くか画像を選択してください。",
+      "themeToneDesc": "現在の UI テーマの明るさ。不明な場合は light を渡してください。",
+      "userGuidanceDesc": "ユーザーからの追加スタイル指示（任意）。",
+      "workflow": {
+        "step1": "対象 Markdown パスを確認",
+        "step2": "beautify_get-cover-style-guide を呼び出す",
+        "step3": "記事を読み、スタイルガイドに従って画像プロンプトを書くか画像を選択",
+        "step4": "既存画像を準備",
+        "step5": "beautify_create-cover を呼び出して画像を適用"
+      }
+    },
+    "getHtmlStyleGuide": {
+      "description": "フルページ HTML（Web ページ、ランディングページ、レポート、組版記事）を生成する前に必ず呼び出し、Hana のデフォルト美学ガイドを取得してください。引数なしで呼び出すとセクションルーターを返します。section を渡すとセクションごとに実際のガイダンスを取得できます（color と typography は必読）。このツールはガイダンステキストのみを返し、HTML の生成や保存は行いません。チャット内のインタラクティブカードとは無関係です。",
+      "sectionDesc": "取得するガイドセクション。省略するとルーター（適用範囲 + 原則 + セクション索引、直接使える値は含まない）を返します。"
+    },
+    "applyCoverCandidate": {
+      "description": "既存の画像ファイルを Markdown カバーとして適用し、frontmatter に書き戻します。",
+      "targetFilePathDesc": "Markdown ファイルへの絶対パス。",
+      "generatedFilePathDesc": "既存画像への絶対パス。画像生成ツール、組み込みカバー、ユーザーのローカル画像から取得できます。",
+      "pixelWidthDesc": "画像のピクセル幅（任意）。",
+      "pixelHeightDesc": "画像のピクセル高さ（任意）。",
+      "targetFilePathRequired": "targetFilePath は Markdown ファイルへの絶対パスである必要があります。",
+      "generatedFilePathRequired": "generatedFilePath は画像ファイルへの絶対パスである必要があります。",
+      "applied": "カバーを適用し、Markdown frontmatter に書き込みました。",
+      "failed": "カバーの適用に失敗しました: {error}"
+    },
+    "createCover": {
+      "description": "既存の画像を Markdown の Notion 風カバーとして適用します。新しいカバーを生成する場合は、まず beautify_get-cover-style-guide を呼び出し、次に画像生成ツールで画像を準備し、最後にこのツールで Markdown に書き込みます。",
+      "targetFilePathDesc": "Markdown ファイルへの絶対パス。パスが不明な場合は先にユーザーに確認してください。",
+      "filePathDesc": "targetFilePath の互換エイリアス。",
+      "generatedFilePathDesc": "既存画像への絶対パス。画像生成ツール、組み込みカバー、ユーザーのローカル画像から取得できます。",
+      "imageFilePathDesc": "generatedFilePath の互換エイリアス。",
+      "pixelWidthDesc": "画像のピクセル幅（任意）。未指定の場合、ツールが画像ヘッダーから読み取りを試みます。",
+      "pixelHeightDesc": "画像のピクセル高さ（任意）。未指定の場合、ツールが画像ヘッダーから読み取りを試みます。",
+      "targetFilePathRequired": "Markdown ファイルへの明示的な絶対パスが必要です。通常のチャットから開始した場合は、先に対象ファイルパスを確認してください。",
+      "mustBeMarkdown": "対象ファイルは .md Markdown ファイルである必要があります。",
+      "generatedFilePathRequired": "既存画像（generatedFilePath）への絶対パスが必要です。先に media_generate-image を呼び出してタスクの完了を待つか、組み込み/ローカル画像を選択し、画像 filePath をこのツールに渡してください。",
+      "applied": "画像を Markdown カバーとして適用し、frontmatter に書き込みました。",
+      "failed": "カバーの適用に失敗しました: {error}"
+    },
+    "listCapabilities": {
+      "description": "Beautify ツールが現在サポートしている美学強化機能を一覧表示します。",
+      "text": "Beautify は現在 2 つの機能を提供しています。1) Markdown カバーワークフロー: まずカバースタイルガイドを読み、画像を準備（Media Generation、将来の組み込みギャラリー、またはローカルファイルから）、attachments フォルダーにコピーし、カバー frontmatter を書き込みます。2) フルページ HTML 美学ガイド: Web ページ/組版ページ/レポートを生成する前に beautify_get-html-style-guide を呼び出し、Hana のデフォルトアートディレクションを取得（引数なしでルーターを返し、必要に応じてセクションを取得）。"
+    }
+  },
+  "fileHistory": {
+    "title": "履歴",
+    "searchPlaceholder": "ファイルを検索…",
+    "deletedGroup": "削除されたファイル",
+    "empty": "履歴はまだありません",
+    "noVersions": "このファイルにはバージョンがありません",
+    "selectVersion": "バージョンを選択して変更を表示",
+    "restore": "このバージョンに戻す",
+    "restoreDone": "復元しました",
+    "error": "操作に失敗しました",
+    "origin": {
+      "event": "アプリ内編集",
+      "watcher": "外部変更",
+      "sweep": "ベースラインスナップショット",
+      "restore": "復元"
+    }
+  },
+  "preview": {
+    "fileHistory": "履歴",
+    "fileMovedOrDeleted": "原稿が移動または削除されました",
+    "legacyImageUpgrade": "この画像プレビューは更新されました。新しいビューアで開くにはクリックしてください。",
+    "coverLayoutSaveFailed": "Cover レイアウトの保存に失敗しました。ファイルが外部で変更された可能性があります。",
+    "coverDeleted": "Cover を削除しました。",
+    "coverDeleteFailed": "Cover の削除に失敗しました。ファイルが外部で変更された可能性があります。",
+    "cover": {
+      "saveImage": "画像を保存",
+      "regenerateWithPrompt": "カスタムプロンプトで画像を生成",
+      "deleteCover": "カバーを削除"
+    }
+  },
+  "subagent": {
+    "status": {
+      "interrupted": "中断",
+      "aborted": "停止",
+      "done": "完了",
+      "failed": "失敗",
+      "dispatched": "ディスパッチ済み",
+      "preparing": "準備中…",
+      "thinking": "思考中…",
+      "callingTool": "{name} を呼び出し中…",
+      "executing": "実行中…"
+    }
+  },
+  "computerUse": {
+    "overlay": {
+      "foregroundTakeover": "フォアグラウンド取得",
+      "foregroundMessage": "対象アプリはバックグラウンド操作をサポートしていません。フォアグラウンド取得が有効です。Esc で強制終了できます。"
+    }
+  },
+  "plugin": {
+    "widget": {
+      "loadFailed": "読み込みに失敗しました",
+      "retry": "再試行",
+      "hiddenPlugins": "非表示のプラグイン",
+      "show": "表示",
+      "desk": "デスク",
+      "hideTitle": "「{title}」を非表示"
+    },
+    "page": {
+      "notFound": "プラグインが見つかりません",
+      "loadFailed": "プラグインの読み込みに失敗しました",
+      "retry": "再試行"
+    },
+    "tab": {
+      "pinToBar": "タブバーに固定"
+    },
+    "imageGen": {
+      "notInitialized": "画像生成プラグインが初期化されていません",
+      "noSessionPath": "画像生成には明示的なセッションコンテキストが必要です。現在のツール呼び出しに sessionPath がありません",
+      "noProvider": "利用可能な画像生成プロバイダーがありません",
+      "noTaskIdOrFile": "画像生成プロバイダーが taskId も files も返しませんでした",
+      "unknownError": "不明なエラー",
+      "providerUnavailable": "指定された画像生成プロバイダー「{providerId}」は利用できません",
+      "providerUnavailableDetail": "指定された画像生成プロバイダー「{providerId}」は利用できません: {detail}",
+      "modelUnavailable": "指定された画像生成モデル「{modelId}」は利用できません",
+      "modelUnavailableDetail": "指定された画像生成モデル「{modelId}」は利用できません: {detail}",
+      "modePassedAsModel": "「{modeId}」はモデルではなくモードです。デフォルト生成では model を省略してください。モードを選択する必要がある場合は mode フィールドを使用するか、先に media_describe-options を呼び出して利用可能なモデルとモードを確認してください。",
+      "noConfiguredModel": "設定された利用可能な画像生成モデルがありません",
+      "modelNotFound": "モデルが見つかりません: {modelId}",
+      "noRegisteredProtocol": "登録されたプロトコルがありません: {protocolId}",
+      "multipleProvidersSameModel": "複数のプロバイダーが同じモデル名を持っています。provider も指定してください",
+      "modelNotInMediaProvider": "いずれのメディアプロバイダーにもモデルが見つかりません",
+      "referenceImageLimitExceeded": "画像生成プロバイダー「{providerId}」は参照画像を最大 {max} 枚までサポートしています。{count} 枚受信しました",
+      "providerNoApiKey": "プロバイダー「{providerId}」に API Key が設定されていません。設定 → プロバイダーで設定してください。",
+      "providerNotLoggedIn": "プロバイダー「{providerId}」にログインしていません。設定 → プロバイダーで OpenAI Codex にログインしてください。",
+      "apiKeyNotConfigured": "API Key が設定されていません",
+      "volcengineUnsupportedFormat": "Volcengine Seedream は png/jpeg 出力形式のみサポートしており、「{format}」はサポートしていません",
+      "volcengineAdapterName": "Volcengine Seedream"
+    },
+    "beautify": {
+      "coverStyleGuide": "Hana Markdown カバーのデフォルト美学ガイドライン:\n\n1. アートスタイル: モダンアニメ / アニメ映画のキービジュアル。伝統的な東洋的ステレオタイプ記号をデフォルトスタイルとして使用しない。\n2. テクスチャ: 強い紙の質感、印刷粒状感、微粒子、温かい素材感。紙の本に装丁された一コマのような仕上がり。\n3. ナラティブ: シネマティックで物語駆動、文学的な雰囲気。テーマを表現するには、要約の言葉通りのイラストではなく、実際のシーン、キャラクターの動作、照明、小道具の関係、環境の痕跡を優先する。\n4. コンテンツ: 記事を読んだ後にイメージのテーマを抽出する。要約を一字一句イラスト化するのではなく、記事の気質を視覚化する。\n5. ファンタジー: 星空、幻想、文学的イメージは登場してよいが、シーンに自然に載せ、現実世界の重みと感情的根拠を持たせる。\n6. 抑制: 安っぽい AI 風の浮遊シンボル堆積を避ける。超現実的要素はナラティブ上必要な場合のみ登場させる。\n7. テーマ: ライトモードは柔らかな暖色光、低コントラスト、清潔な余白、紙の繊維が見えること。ダークモードは低照度、抑制されたハイライト、暗部でも素材のレイヤーを保つこと。\n8. 出力: 画像生成ツールのデフォルトは横長 3:2。ベンダーがサポートしない場合は近い横長比率で可。画像を引き伸ばしてはならない。",
+      "htmlStyleGuide": {
+        "router": "Hana HTML 美学規律。フルページ HTML を生成する前に、必ず以下のセクションを取得してください。このルーターテキストだけから生成してはいけません。この規律はスタンドアロンのフルページ HTML（Web ページ、組版ページ、レポート、ランディングページ）のみを対象とし、チャット内のインタラクティブカードとは無関係です。\n\n適用範囲: ユーザーがスタイルを明示指定した場合はユーザーに従う（この規律は横で可読性のみ担保）。指定がなければこの規律に従う。\n\n気質: 文学的、洗練、静謐。装丁の行き届いた私的な手帳の一ページ。イメージ: 紙の原稿、宋体セリフ、水墨、宣紙の質感、書斎の静けさ。\n\n五原則:\n1. 紙から生まれる: 余白はページマージン、色はインクの濃淡として読む。\n2. 抑制が品質: 箱より線を一本、重ねたソリッドより透過レイヤリングを選ぶ。\n3. 静かなフィードバック: hover は穏やかな呼吸、トランジションはソフトフェード。バウンスも点滅もしない。\n4. 階層は秩序: フォントサイズ / ウェイト / 明度 / コンテナで階層を構築。読み物ページは純粋な組版、構造ページはカードグルーピング。\n5. 一貫性は信頼: 同じ要素はページ全体で同じサイズ / 余白 / 挙動を保つ。\n\nセクション索引（beautify_get-html-style-guide に section パラメータを渡して各セクションを取得）:\n- color: 必読\n- typography: 必読\n- layout: フルページ / 複数ブロック / 複雑レイアウトで必須\n- components: カード / テーブル / ボタン / バッジ / リンク使用時（<a> を含むページでは必ず読む）\n- imagery: アイコン / 画像がある場合\n- motion: インタラクティブページ / アニメーションがある場合\n- anti-patterns: 強く推奨。安っぽい AI ルックを避ける",
+        "color": "Hana HTML 美学 · カラー\n\n**単一アクセントカラー**: `#537D96`（スレートブルー）、hover `#456A80`、淡いウォッシュ `rgba(83,125,150,.08)`。ページ全体で唯一の有彩色アクセント。第二のプライマリを導入しない。アクセントの視覚占有率 ≤ 5%、塗りではなく句読点。\n\n**背景（純白禁止）**: ページベース `#F8F4ED`（暖色紙）、カード / 浮上サーフェス `#FCFAF5`。全体コントラストは低く保つ。\n\n**テキスト（暖色ニュートラル、冷たい青灰色禁止）**: プライマリ `#3B3D3F`、セカンダリ `#6B6F73`、ミュート / メタデータ `#8E9196`。純黒 `#000` 禁止。\n\n**線とボーダー**: 暖色のヘアライン `rgba(122,96,88,.18)`。ソリッドブロックではなく、線 + 余白で領域を分割。\n\n**オーバーレイ（透過レイヤリング、ソリッド重ね禁止）**: 四段階 `rgba(0,0,0,.03 / .05 / .08 / .15)`。\n\n**セマンティックカラー（低彩度、抑制）**: 成功 `#7BAE7F`、危険 `#8B3A3A`、コーラルアクセント `#EC8F8D`（控えめに）。必要な場合のみ。\n\n**厳格ルール**: グレーは暖色（タン系アンダートーン）、冷たい青灰色禁止。大面積の純白背景 / 純黒テキスト禁止。グラデーション背景、高彩度、ネオン禁止。\n\nこのガイドは暖色紙パレットのみを定義。ユーザーがダークモードや別スタイルを明示要求した場合はユーザー指示に従う（このガイドは横で、可読性とコントラストのみ担保）。",
+        "typography": "Hana HTML 美学 · タイポグラフィ\n\n**セリフ（主力、見出しと本文の階層を担う）**: `'EB Garamond','Noto Serif SC','Source Han Serif SC','Songti SC','STSong','SimSun',serif`\n\nスタック内のシステムフォールバック（`Songti SC` / `SimSun` / serif 等）はバックストップとして維持: 先行フォントがカバーしない文字はシステムセリフにフォールバックし、レイアウトを崩さない。\n\n**UI / 機能テキスト（ボタン、ラベル、フォーム、ナビゲーション）**: `system-ui,-apple-system,'PingFang SC',sans-serif`\n\n**コード / 数値メトリクス**: `'JetBrains Mono',ui-monospace,monospace`; 桁揃えに `font-variant-numeric:tabular-nums` を追加。\n\n**フォントウェイト**: 400 / 500 のみ。600+ 禁止、合成太字禁止。階層はサイズ + 明度 + 字間で構築し、太字の積み重ね禁止。\n\n**タイプスケール**:\n\n| レベル | rem | 用途 |\n|---|---|---|\n| display | 2 – 2.4 | ページメインタイトル / hero |\n| h1 | 1.6 | 章見出し |\n| h2 | 1.25 | セクション見出し（左ルール `border-left:2px solid #537D96;padding-left:8px;border-radius:0` 任意） |\n| h3 | 1.05 | 小見出し |\n| body | 1 (16px) | 本文、`line-height:1.7` |\n| small | 0.85 | 補助 / キャプション |\n\n**CJK / ラテン混在テキスト**: 中国語セリフ本文はやや高い行間（1.7 – 1.8）。CJK 見出しには `letter-spacing:.01em` を追加可。",
+        "layout": "Hana HTML 美学 · レイアウト\n\n**余白リズム**: `4 / 8 / 16 / 24 / 40`。スケール外の魔法値禁止。\n\n**コンテンツ幅**: 読み物本文 `max-width:60–72ch`（約 680–760px）、中央揃え。ランディングページは広くてもよいが、すべてのテキスト領域は読みやすい行長を保つ。\n\n**ホワイトスペース**: ブロック間 40、ブロック内 16 – 24。余白は階層ツールであり、無駄ではない。\n\n**レスポンシブ**: モバイルは単一列、行間を広く、タッチターゲット ≥ 44px。狭画面ブレークポイント ~880 / ~480。\n\n**レイアウトモード（コンテンツタイプごとに一つ選択）**:\n\n| タイプ | 方向性 | 手段 |\n|---|---|---|\n| 読み物 / エディトリアル | 純粋な組版レイヤー | 余白 + タイプスケール、カードなし。中央揃え本文、読みやすい行長 |\n| 構造 / ダッシュボード | カード / グルーピング | `#FCFAF5` カード + ヘアラインボーダー。グループ見出し |\n| ランディング / ショーケース | エディトリアル hero + セクション | 大見出し + 抑制されたイメージ + 単一アクセントを句読点として。マーケティング clutter 禁止 |\n| インタラクティブ | 中央コンテンツ、抑制されたコントロール | 静かなモーション、明確な状態 |\n\n連続読み物は純粋な組版で流れを保つ。密度の高い機能シーンはカードでブロックを強化。一つを選び、両方は使わない。",
+        "components": "Hana HTML 美学 · コンポーネント\n\n背景変数はカラーセクションに従う。デフォルトは以下。\n\n```css\n/* ブロック見出し */\nh2 { font-family: serif; font-size: 1.25rem; font-weight: 500; color: #3B3D3F;\n     border-left: 2px solid #537D96; padding-left: 8px; border-radius: 0; margin: 1.6em 0 .6em; }\n\n/* カード / パネル（構造型シーンのみ） */\n.card { background: #FCFAF5; border: 1px solid rgba(122,96,88,.18); border-radius: 4px;\n        padding: 1rem 1.25rem; }\n\n/* 区切り線 */\nhr { border: none; border-top: 1px solid rgba(122,96,88,.18); margin: 1.5rem 0; }\n\n/* テーブル: 細線、コンパクト、左揃えヘッダー */\ntable { width: 100%; border-collapse: collapse; font-size: .9rem; }\nth { text-align: left; font-weight: 500; color: #6B6F73; padding: 6px 8px;\n     border-bottom: 1px solid rgba(122,96,88,.18); }\ntd { padding: 5px 8px; border-bottom: 1px solid rgba(0,0,0,.05); color: #3B3D3F; }\ntr:last-child td { border-bottom: none; }\n\n/* リスト */\nul, ol { padding-left: 18px; }\nli { margin: .2em 0; }\nli::marker { color: #537D96; }\n\n/* 引用 */\nblockquote { border-left: 2px solid #537D96; padding: 4px 0 4px 12px;\n             color: #6B6F73; font-style: italic; border-radius: 0; }\n\n/* コード */\npre { background: #F8F4ED; border: 1px solid rgba(122,96,88,.18); border-radius: 4px;\n      padding: 8px 12px; overflow-x: auto; }\ncode { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: .85rem; color: #3B3D3F; }\n\n/* ボタン: 角ばり、枠線優先、hover は微底色、:active スケールなし */\n.btn { font-family: sans-serif; border: 1px solid rgba(122,96,88,.18); border-radius: 4px;\n       background: transparent; color: #537D96; padding: 6px 14px; cursor: pointer;\n       transition: background .15s cubic-bezier(.16,1,.3,1); }\n.btn:hover { background: rgba(83,125,150,.08); }\n/* 主アクションボタンは background:#537D96;color:#FCFAF5 ソリッド可。ただし画面あたり ≤ 1 */\n\n/* バッジ / タグ */\n.tag { display: inline-flex; padding: 2px 8px; font-size: .75rem; font-weight: 500;\n       border-radius: 4px; background: rgba(83,125,150,.08); color: #456A80; }\n\n/* リンク: アクセント色 + 細下線、hover で濃く。ボタン化・下線除去禁止 */\na { color: #537D96; text-decoration: underline; text-decoration-thickness: 1px;\n    text-underline-offset: 2px; text-decoration-color: rgba(83,125,150,.4);\n    transition: color .15s cubic-bezier(.16,1,.3,1), text-decoration-color .15s cubic-bezier(.16,1,.3,1); }\na:hover { color: #456A80; text-decoration-color: currentColor; }\n\n/* focus: 見えるが抑制（motion セクション原則の具体値） */\n:focus-visible { outline: 1px solid #537D96; outline-offset: 2px; }\n```\n\n**奥行きとシャドウ**: 主にヘアライン + 余白 + わずかな背景シフトで階層を構築。elevation が必要な場合は最も淡いシャドウ `box-shadow: 0 1px 4px rgba(59,61,63,.09)`。重いドロップシャドウ、グロー、多層 drop-shadow 禁止。",
+        "imagery": "Hana HTML 美学 · イメージ\n\n- **アイコン**: 純粋なインライン SVG、ストロークベースのラインスタイル（feather 風）、`stroke=\"currentColor\" stroke-width=\"1.5\" fill=\"none\"`。**絵文字禁止**、ソリッド塗りつぶしアイコン禁止。\n- **装飾**: 浮遊シンボル / 星 / バブル等の安っぽい AI ガーニッシュの堆積禁止。淡いグローモチーフ（柔らかく、まぶしくない）は句読点として控えめに登場可。\n- **画像比率**: hero 16:9、エディトリアルイラスト 4:3、グリッドサムネイル 3:2。`object-fit:cover` + 適切な `object-position`、引き伸ばし禁止。\n- **角丸**: 画像 / カードは小さな 4px 半径（角ばり寄り）。大きなピル型角丸禁止。\n- **実画像アセットがない場合**: **外部画像ホストへのホットリンク禁止**（unsplash / picsum 等。プライバシー露出、オフラインで画像破損）。プレースホルダーはソリッドブロック（`#FCFAF5` + ヘアラインボーダー）または自描きインライン SVG（線形、低彩度、カラーセクション準拠）。外部リンクより余白を優先。ユーザー提供のローカル / 既存アセットは除外。",
+        "motion": "Hana HTML 美学 · モーション\n\n- **静か**: トランジションはソフトで短い。三段階 `0.1 / 0.15 / 0.25`。イージング: 入場 `cubic-bezier(.16,1,.3,1)`、退場 `cubic-bezier(.7,0,.84,0)`。\n- **hover は穏やかな呼吸**（わずかな色 / 不透明度変化）。スケールなし、バウンスなし。\n- **禁止**: `:active` スケールバウンス、点滅、回転ショー、注意を奪う自動カルーセル。\n- **状態は明確で予測可能**: focus は見えるが抑制されたインジケーター（components セクションの :focus-visible 具体値参照）。disabled は不透明度を下げる。\n- `prefers-reduced-motion: reduce` を尊重し、非必須モーションをオフにする。",
+        "antiPatterns": "Hana HTML 美学 · アンチパターン\n\n| ❌ 避ける | ✅ 代わりに使う |\n|---|---|\n| Material Design 感 / リップル | 紙の手帳の抑制 |\n| グラスモーフィズム frosted glass、blur ショー | ソリッド地 + ヘアライン |\n| 大面積の純白 `#fff` 背景 | 暖色紙 `#F8F4ED` |\n| 純黒 `#000` テキスト | 暖色インク `#3B3D3F` |\n| 冷たい青灰色ニュートラル | 暖色調グレー |\n| 第二プライマリ / 色の積み重ね | 単一アクセント `#537D96` |\n| ネオン、高彩度、グラデーション背景 | 低彩度、低コントラスト |\n| 重いドロップシャドウ / グロー | 最も淡いシャドウ、またはヘアラインのみ |\n| 大きなピル型角丸 | 角ばり / 小さな 4px 半径 |\n| 絵文字をアイコン / 装飾に | SVG ストロークアイコン |\n| 600+ 太字で階層を積む | サイズ + 明度 + 400/500 |\n| バウンス / スケール / スピンアニメ | ソフトフェード、呼吸 |\n| 浮遊装飾シンボルの堆積 | 余白 + 抑制された淡いグロー |",
+        "mustReadFirst": "先に必読セクションを読んでから {section} を取得してください。未取得: {missing}。beautify_get-html-style-guide で必読セクションを先に取得してください（すべての Hana ページに必要）。その後 {section} に戻ってください。",
+        "invalidSection": "不明なセクション {section}。有効なセクション: {valid}。section を省略してルーターを取得してください。"
+      },
+      "themeTone": {
+        "dark": "ダークテーマ: 低照度、抑制されたハイライト、暗部でも紙の繊維と素材レイヤーを保つ。",
+        "light": "ライトテーマ: 柔らかな暖色光、低コントラスト、清潔な余白、紙の繊維が見える。"
+      },
+      "userGuidancePrefix": "ユーザー追加指示: {guidance}",
+      "attachmentDirName": "添付ファイル"
+    }
+  },
+  "mediaViewer": {
+    "ariaLabel": "メディアプレビュー",
+    "close": "閉じる",
+    "prev": "前へ",
+    "next": "次へ"
+  },
+  "mobile": {
+    "startupFailed": "HanaAgent の起動に失敗しました",
+    "auth": {
+      "scopeError": "このログイン権限は期限切れです。ユーザー名とパスワードでもう一度サインインしてください。",
+      "loginFailed": "ログインに失敗しました",
+      "title": "Hana モバイルアクセス",
+      "deviceHelp": "旧アクセスキーでのサインインです。古いデータとの互換性のためだけに残されています。",
+      "passwordHelp": "デスクトップアプリで設定したローカルアカウントとパスワードでサインインしてください。",
+      "tabLabel": "ログイン方法",
+      "deviceTab": "旧アクセスキー",
+      "passwordTab": "ユーザー名とパスワード",
+      "deviceField": "旧アクセスキー",
+      "usernameField": "ユーザー名",
+      "passwordField": "パスワード",
+      "plaintextWarning": "アカウントとパスワードはログインのみに使われ、ログイン後は HttpOnly セッションに引き継がれます。",
+      "submit": "ログイン"
+    },
+    "loading": "Hana に接続しています...",
+    "closeSidebar": "サイドバーを閉じる"
+  },
+  "approval": {
+    "toolAction": {
+      "title": "Hana にこの操作を許可",
+      "body": "現在のセッションは ask-first モードです。この操作はローカルまたは外部の状態を変更します。"
+    },
+    "confirm": "許可",
+    "reject": "拒否",
+    "computerApp": {
+      "title": "Hana のコンピューター使用を許可",
+      "body": "Hana が現在のタスクを続けるためにこのアプリを操作しようとしています。",
+      "controlTitle": "Hana が {appName} を操作することを許可しますか",
+      "defaultAppName": "このアプリ"
+    },
+    "sessionFolders": {
+      "title": "Hana にこの会話のフォルダー認可変更を許可",
+      "body": "確認すると、このフォルダーは現在の会話の追加サンドボックスディレクトリになります。作業ディレクトリやプロンプトは変更されません。",
+      "addLabel": "認可ディレクトリを追加",
+      "removeLabel": "認可ディレクトリを削除"
+    },
+    "mcpElicitation": {
+      "unsupportedField": "未対応のフィールド型",
+      "choose": "選択してください",
+      "requiredMissing": "* の付いた必須項目を入力してください"
+    },
+    "mcpTool": {
+      "allowForSession": "このセッションでは今後聞かない",
+      "allowAlways": "このツールを常に許可",
+      "grantFailed": "この許可を記憶できませんでした"
+    }
+  },
+  "auth": {
+    "oauthTimeout": "OAuth がタイムアウトしました: ブラウザコールバックを受信できませんでした。ポート 1455 がファイアウォールでブロックされているか、既に使用中か確認してください。Windows ユーザーは localhost が IPv6 に解決されていないかも確認してください。",
+    "oauthConnectFailed": "OAuth サーバーに接続できません{detail}。設定 > セキュリティでグローバルアウトバウンドプロキシを設定するか、HTTPS_PROXY 環境変数を確認してください。"
+  },
+  "deferred": {
+    "typeLabel": {
+      "subagent": "サブアシスタント",
+      "imageGeneration": "画像生成",
+      "videoGeneration": "動画生成",
+      "backgroundTask": "バックグラウンドタスク"
+    },
+    "interlude": {
+      "subagent": {
+        "success": "{receiver} が {source} から返信を受け取りました",
+        "failed": "{receiver} が {source} から返信を受け取りました",
+        "aborted": "{receiver} が {source} から返信を受け取りました"
+      },
+      "workflow": {
+        "success": "{receiver} が {source} ワークフローから結果を受け取りました",
+        "failed": "{receiver} が {source} ワークフローから結果を受け取りました",
+        "aborted": "{receiver} が {source} ワークフローから結果を受け取りました"
+      },
+      "tool": {
+        "success": "{receiver} が {source} ツールから結果を受け取りました",
+        "failed": "{receiver} が {source} ツールから結果を受け取りました",
+        "aborted": "{receiver} が {source} ツールから結果を受け取りました"
+      }
+    },
+    "noReason": "バックグラウンドタスクは表示可能な理由を返しませんでした。",
+    "noPreviewText": "バックグラウンドタスクは完了しましたが、プレビュー可能なテキストを返しませんでした。",
+    "fileSummaryMore": "- 他 {count} 件のファイル",
+    "fileSummaryHeader": "生成されたファイル:",
+    "mediaNoDisplayableFiles": "生成結果に表示可能なファイルがありません"
+  },
+  "sessionCollab": {
+    "messagePrefix": "[エージェント「{name}」からのメッセージです。ユーザー本人ではありません]",
+    "fromAgent": "{name} からのメッセージ",
+    "expand": "展開",
+    "collapse": "折りたたむ",
+    "confirmSend": "送信",
+    "confirmCreate": "作成して送信",
+    "ignore": "無視",
+    "expired": "下書きの期限が切れました。エージェントに再作成させてください",
+    "inFlight": "実行中です",
+    "halfCreated": "セッションは作成されました（{id}）が、最初のメッセージの送信に失敗しました。再試行するか、セッションを開いて手動で送信してください",
+    "createdSession": "セッションを作成しました {id}",
+    "sendFailed": "送信に失敗しました：{error}",
+    "rejectFailed": "無視に失敗しました：{error}",
+    "messageField": "メッセージ内容"
+  }
 }

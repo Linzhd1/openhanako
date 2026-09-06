@@ -84,6 +84,36 @@ describe("ProviderCatalogStore", () => {
     });
   });
 
+  it.skipIf(process.platform === "win32")("keeps the catalog and its audit backup readable only by their owner", () => {
+    writeLegacyAddedModels({
+      providers: {
+        zhipu: {
+          api_key: "sk-legacy",
+          base_url: "https://open.bigmodel.cn/api/paas/v4",
+          api: "openai-completions",
+          models: ["glm-4"],
+        },
+      },
+    });
+
+    const store = new ProviderCatalogStore(tmpDir);
+    store.load();
+    store.saveProviders({ zhipu: { api_key: "sk-rotated", api: "openai-completions", models: ["glm-4"] } });
+
+    const catalogPath = path.join(tmpDir, "provider-catalog.json");
+    expect(fs.statSync(catalogPath).mode & 0o777).toBe(0o600);
+
+    const backupsRoot = path.join(tmpDir, "migration-backups");
+    const backupDir = path.join(
+      backupsRoot,
+      fs.readdirSync(backupsRoot).find((name) => name.startsWith("provider-catalog-v1-"))!,
+    );
+    expect(fs.statSync(backupDir).mode & 0o777).toBe(0o700);
+    for (const entry of fs.readdirSync(backupDir)) {
+      expect(fs.statSync(path.join(backupDir, entry)).mode & 0o777).toBe(0o600);
+    }
+  });
+
   it("uses provider-catalog.json as the only live write target after migration", () => {
     writeLegacyAddedModels({
       providers: {
@@ -137,5 +167,31 @@ describe("ProviderCatalogStore", () => {
 
     expect(catalog.capabilities["web.search"].providers).toEqual([{ id: "brave", source: "api" }]);
     expect(catalog.capabilities["future.action"].providers).toEqual([{ id: "future", mode: "adapter" }]);
+  });
+
+  it("loads provider-catalog.json files that start with a UTF-8 BOM", () => {
+    const store = new ProviderCatalogStore(tmpDir);
+    fs.writeFileSync(
+      store.catalogPath,
+      "\uFEFF" + JSON.stringify({
+        catalogVersion: 2,
+        providers: {
+          deepseek: {
+            api_key: "sk-bom",
+            base_url: "https://api.deepseek.com",
+            api: "openai-completions",
+            models: ["deepseek-v4-pro"],
+          },
+        },
+      }, null, 2) + "\n",
+      "utf-8",
+    );
+
+    const catalog = store.load();
+
+    expect(catalog.providers.deepseek).toMatchObject({
+      api_key: "sk-bom",
+      models: ["deepseek-v4-pro"],
+    });
   });
 });

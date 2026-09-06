@@ -56,7 +56,7 @@ function writeAgentFixture(memoryEnabled) {
     "utf-8",
   );
   fs.writeFileSync(path.join(agentDir, "identity.md"), "IDENTITY_FALLBACK_BEACON\n", "utf-8");
-  fs.writeFileSync(path.join(agentDir, "ishiki.md"), "ISHIKI_FALLBACK_BEACON\n", "utf-8");
+  fs.writeFileSync(path.join(agentDir, "AGENTS.md"), "AGENTS_MD_FALLBACK_BEACON\n", "utf-8");
   fs.writeFileSync(path.join(agentDir, "memory", "memory.md"), "MEMORY_FALLBACK_BEACON\n", "utf-8");
   fs.writeFileSync(path.join(productDir, "yuan", "hanako.md"), "YUAN_FALLBACK_BEACON\n", "utf-8");
   fs.writeFileSync(path.join(userDir, "user.md"), "USER_PROFILE_BEACON\n", "utf-8");
@@ -90,16 +90,17 @@ function makeRouter(paths, options: any = {}) {
         agents: undefined,
         usageLedger: options.usageLedger ?? null,
         getAgent: () => null,
-        resolveUtilityConfig: () => ({
+        resolveUtilityConfigFresh: options.resolveUtilityConfigFresh || (async () => ({
           utility: "test-model",
           utility_large: "test-model-large",
           api_key: "test-key",
           base_url: "https://test.api",
           api: "openai-completions",
+          headers: { "X-Provider-Protocol": "channel" },
           large_api_key: "test-key",
           large_base_url: "https://test.api",
           large_api: "openai-completions",
-        }),
+        })),
       },
       eventBus: { emit: vi.fn() },
     },
@@ -172,6 +173,7 @@ describe("ChannelRouter memory master fallback", () => {
       source: { subsystem: "memory", operation: "channel_memory_summary", surface: "channel" },
       attribution: { kind: "memory", agentId: "hana" },
     });
+    expect(request.headers).toEqual({ "X-Provider-Protocol": "channel" });
     expect(request.systemPrompt).toContain("NO_MEMORY");
     expect(request.messages[0].content).toContain("黎: 请把摘要洗干净。");
     expect(request.messages[0].content).toContain("Butter: 先把摘要洗干净。");
@@ -236,5 +238,17 @@ describe("ChannelRouter memory master fallback", () => {
         attribution: { kind: "memory", agentId: "hana" },
       },
     });
+  });
+
+  it("does not call the channel memory network boundary when fresh credentials fail", async () => {
+    const paths = writeAgentFixture(true);
+    const router = makeRouter(paths, {
+      resolveUtilityConfigFresh: async () => { throw new Error("oauth refresh failed"); },
+    });
+
+    await router._memorySummarize("hana", "general", "context");
+
+    expect(callTextMock).not.toHaveBeenCalled();
+    expect(factAddMock).not.toHaveBeenCalled();
   });
 });

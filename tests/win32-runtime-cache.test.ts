@@ -1,10 +1,14 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  detectWin32PowerShellFlavor,
+  getSandboxPowerShellProbeResult,
   prepareSandboxRuntime,
+  resetSandboxPowerShellProbeCacheForTests,
   sandboxRuntimeCacheRoot,
+  setSandboxPowerShellProbeResult,
 } from "../lib/sandbox/win32-runtime-cache.ts";
 
 const tempRoots = [];
@@ -101,5 +105,71 @@ describe("win32 sandbox runtime cache", () => {
 
     expect(second).toEqual(first);
     expect(fs.statSync(marker).mtimeMs).toBe(markerBefore);
+  });
+});
+
+describe("sandbox PowerShell startup probe cache", () => {
+  afterEach(() => {
+    resetSandboxPowerShellProbeCacheForTests();
+  });
+
+  it("returns null for an executable that has not been probed yet", () => {
+    expect(getSandboxPowerShellProbeResult("C:\\Program Files\\PowerShell\\7\\pwsh.exe")).toBeNull();
+  });
+
+  it("caches a probe verdict per executable path independently", () => {
+    const pwsh = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+    const legacy = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+    setSandboxPowerShellProbeResult(pwsh, "unsupported");
+    setSandboxPowerShellProbeResult(legacy, "ok");
+
+    expect(getSandboxPowerShellProbeResult(pwsh)).toBe("unsupported");
+    expect(getSandboxPowerShellProbeResult(legacy)).toBe("ok");
+  });
+
+  it("is case-insensitive on Windows-style paths", () => {
+    const executable = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+    setSandboxPowerShellProbeResult(executable, "ok");
+    expect(getSandboxPowerShellProbeResult(executable.toUpperCase())).toBe("ok");
+  });
+});
+
+describe("win32 PowerShell flavor detection for the exec_command tool description", () => {
+  it("returns null on non-win32 platforms without probing", () => {
+    const spawn = vi.fn();
+    expect(detectWin32PowerShellFlavor({ platform: "darwin", spawn })).toBeNull();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("returns pwsh when where.exe finds pwsh.exe on PATH", () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: "C:\\Program Files\\PowerShell\\7\\pwsh.exe\r\n" }));
+    expect(detectWin32PowerShellFlavor({ platform: "win32", spawn: spawn as any })).toBe("pwsh");
+  });
+
+  it("returns windows-powershell when where.exe does not find pwsh.exe", () => {
+    const spawn = vi.fn(() => ({ status: 1, stdout: "" }));
+    expect(detectWin32PowerShellFlavor({ platform: "win32", spawn: spawn as any })).toBe("windows-powershell");
+  });
+
+  it("returns windows-powershell when the probe throws", () => {
+    const spawn = vi.fn(() => { throw new Error("boom"); });
+    expect(detectWin32PowerShellFlavor({ platform: "win32", spawn: spawn as any })).toBe("windows-powershell");
+  });
+
+  it("probes fresh on every call instead of memoizing across tool-set builds", () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: "pwsh.exe\r\n" }));
+    detectWin32PowerShellFlavor({ platform: "win32", spawn: spawn as any });
+    detectWin32PowerShellFlavor({ platform: "win32", spawn: spawn as any });
+    expect(spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("queries where.exe pwsh.exe with a bounded timeout and a hidden window", () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: "pwsh.exe\r\n" }));
+    detectWin32PowerShellFlavor({ platform: "win32", spawn: spawn as any });
+    expect(spawn).toHaveBeenCalledWith("where.exe", ["pwsh.exe"], expect.objectContaining({
+      timeout: 3000,
+      windowsHide: true,
+    }));
   });
 });

@@ -10,23 +10,50 @@
 import { useStore } from './index';
 import { sessionScopedKey, sessionScopedListIncludes, sessionScopedValue } from './session-slice';
 import { hanaFetch, hanaUrl } from '../hooks/use-hana-fetch';
+import { hydrateInputDrafts } from './input-draft-persistence';
+import { HOME_DRAFT_KEY } from '../../../../shared/input-drafts.ts';
 import { buildItemsFromHistory } from '../utils/history-builder';
 import { migrateLegacyTodos } from '../utils/todo-compat';
-import { loadAvatars as loadAvatarsAction, clearChat as clearChatAction } from './agent-actions';
+import { clearChat as clearChatAction } from './agent-actions';
 import { activateWorkspaceDesk } from './desk-actions';
 import { loadModels } from '../utils/ui-helpers';
 import { browserStateForPath, setBrowserStateForPath } from './browser-slice';
 import { computerOverlayForSession } from './computer-overlay-slice';
 import { snapshotStreamBuffer, type StreamBufferSnapshot } from './stream-invalidator';
+import { errorWithCode, presentError, presentErrorWithLabel } from '../errors/error-presenter';
+import { normalizeSessionRouteError } from '../../../../shared/error-user-messages.ts';
 import { renderMarkdown } from '../utils/markdown';
 import type { ChatMessage, ContentBlock } from './chat-types';
 import { readMessageLiveVersion } from './message-live-version';
-import type { SessionPermissionMode } from '../types';
+import type { SessionMetaRecoveryStatus, SessionPermissionMode } from '../types';
+import { findPrimaryAgent, resolveAgentWorkspace } from '../utils/agent-workspace';
 
 // ── 防竞争计数器 ──
 
 let _switchVersion = 0;
 let _switchAbortController: AbortController | null = null;
+let _pendingDraftSequence = 0;
+
+export interface SessionRef {
+  sessionId: string;
+  sessionPath: string;
+  agentId: string;
+}
+
+function nextPendingDraftId(): string {
+  _pendingDraftSequence += 1;
+  return `pending-${Date.now().toString(36)}-${_pendingDraftSequence.toString(36)}`;
+}
+
+/**
+ * pending 新会话身份补丁：任何把 store 切入 "welcome / 待建会话" 态的入口都必须
+ * 展开这个补丁，而不是裸设 `pendingNewSession: true`。currentPendingSessionDraft()
+ * 要求 pendingDraftId 非空才认这是一个有效的待建草稿；裸设会让身份残缺，
+ * submitEditorMessage 的 ensureSession 门槛就此失效，发送静默无响应（#2101）。
+ */
+export function pendingNewSessionIdentityPatch(): { pendingNewSession: true; pendingDraftId: string } {
+  return { pendingNewSession: true, pendingDraftId: nextPendingDraftId() };
+}
 
 function invalidateSessionSwitches(): void {
   _switchVersion += 1;
@@ -58,6 +85,44 @@ function sessionIdForPathFromState(state: Record<string, any>, path: string | nu
   if (!path) return null;
   const session = (state.sessions || []).find((item: any) => item?.path === path);
   return normalizeSessionId(session?.sessionId);
+}
+
+function frozenSessionRefFromState(state: Record<string, any>): Readonly<SessionRef> | null {
+  const sessionPath = typeof state.currentSessionPath === 'string' && state.currentSessionPath.trim()
+    ? state.currentSessionPath
+    : null;
+  if (!sessionPath) return null;
+  const projection = sessionByIdentityOrPath(
+    state,
+    normalizeSessionId(state.currentSessionId),
+    sessionPath,
+  );
+  const sessionId = normalizeSessionId(state.currentSessionId)
+    || normalizeSessionId(projection?.sessionId)
+    || sessionIdForPathFromState(state, sessionPath);
+  const agentId = normalizeSessionId(projection?.agentId) || normalizeSessionId(state.currentAgentId);
+  if (!sessionId || !agentId) return null;
+  return Object.freeze({ sessionId, sessionPath, agentId });
+}
+
+function frozenSessionRefFromCreateResponse(data: any): Readonly<SessionRef> | null {
+  const sessionId = normalizeSessionId(data?.sessionId);
+  const sessionPath = typeof data?.path === 'string' && data.path.trim() ? data.path : null;
+  const agentId = normalizeSessionId(data?.agentId);
+  if (!sessionId || !sessionPath || !agentId) return null;
+  return Object.freeze({ sessionId, sessionPath, agentId });
+}
+
+function sessionByIdentityOrPath(state: Record<string, any>, sessionId: string | null, sessionPath: string | null): any | null {
+  const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+  if (sessionId) {
+    const byId = sessions.find((item: any) => normalizeSessionId(item?.sessionId) === sessionId);
+    if (byId) return byId;
+  }
+  if (sessionPath) {
+    return sessions.find((item: any) => item?.path === sessionPath) || null;
+  }
+  return null;
 }
 
 function currentSessionIdentityPatch(state: Record<string, any>, path: string | null, sessionId: unknown) {
@@ -228,6 +293,7 @@ function clearSessionRuntimeCaches(path: string): void {
     const attachedFilesBySession = deleteSessionScopedStateValue(s, s.attachedFilesBySession || {}, path);
     const sessionRegistryFilesByPath = deleteSessionScopedStateValue(s, s.sessionRegistryFilesByPath || {}, path);
     const drafts = deleteSessionScopedStateValue(s, s.drafts || {}, path);
+    const draftDocs = deleteSessionScopedStateValue(s, s.draftDocs || {}, path);
     const activeSessionStreams = deleteSessionScopedStateValue(s, s.activeSessionStreams || {}, path);
     const computerOverlayBySession = deleteSessionScopedStateValue(s, s.computerOverlayBySession || {}, path);
     const scrollPositions = deleteSessionScopedStateValue(s, s.scrollPositions || {}, path);
@@ -236,7 +302,6 @@ function clearSessionRuntimeCaches(path: string): void {
     const todosBySession = deleteSessionScopedStateValue(s, s.todosBySession || {}, path);
     const todosLiveVersionBySession = deleteSessionScopedStateValue(s, s.todosLiveVersionBySession || {}, path);
     const sessionAuthorizedFoldersByPath = deleteSessionScopedStateValue(s, s.sessionAuthorizedFoldersByPath || {}, path);
-    const capabilityDriftBySession = deleteSessionScopedStateValue(s, s.capabilityDriftBySession || {}, path);
     let inlineErrors = s.inlineErrors;
     if (inlineErrors) {
       inlineErrors = deleteSessionScopedStateValue(s, inlineErrors || {}, path);
@@ -247,6 +312,7 @@ function clearSessionRuntimeCaches(path: string): void {
       attachedFilesBySession,
       sessionRegistryFilesByPath,
       drafts,
+      draftDocs,
       sessionStreams,
       activeSessionStreams,
       browserBySession,
@@ -257,7 +323,6 @@ function clearSessionRuntimeCaches(path: string): void {
       todosBySession,
       todosLiveVersionBySession,
       sessionAuthorizedFoldersByPath,
-      capabilityDriftBySession,
       capabilityRefreshingSessions: filterSessionScopedStateList(s, s.capabilityRefreshingSessions || [], path),
       inlineErrors,
     };
@@ -279,6 +344,10 @@ export async function loadMessages(forPath?: string): Promise<void> {
   // messages 维度的竞态护栏：rapid switch 或并发 load 时，只有最新一次调用
   // 的响应允许 apply initSession，stale 响应直接丢弃。
   const myVersion = useStore.getState().bumpLoadMessagesVersion(targetPath);
+  // SessionFile flight 记录（issue #2188）：hydrate 期间到达的 upsert / branch
+  // reset 会被下面的 HTTP 快照整表覆盖。开一条 flight 记录桥接两者，hydrate
+  // 通过后按 flight 结果决定是丢弃快照还是应用快照 + 重放 flight 期间的 upsert。
+  useStore.getState().beginSessionFilesFlight(targetPath, myVersion);
   try {
     const res = await hanaFetch(sessionMessagesUrl(targetPath));
     const data = await res.json();
@@ -288,6 +357,24 @@ export async function loadMessages(forPath?: string): Promise<void> {
       // 已经有更新的 loadMessages 在途，stale 响应不应覆盖新状态。
       // todos 与 messages 必须作为同一份 hydrate 快照一起生效或一起丢弃。
       return;
+    }
+    // SessionFile hydrate（issue #2188）：必须放在 stale 检查之后、
+    // messages/todos 的 live-version 早退检查之前——文件 registry 不受这两个
+    // 护栏保护范围约束，否则 mid-flight 收到 live message/todo 更新时整次
+    // hydrate 被放弃，registry 就会像 bugfix 前那样永远写不进去。
+    // 只有 flight 期间没出现过 branch reset 才应用 HTTP 快照——reset 是全量权威
+    // 替换，出现过就说明 registry 已经是权威状态（含 reset 后的 upsert），旧
+    // 快照绝不能覆盖它。没有 reset 时应用快照后，重放 flight 期间记录的 upsert
+    // （upsert 是逐文件权威最新，必须后写生效，恢复被整表快照覆盖掉的增量）。
+    const flight = useStore.getState().consumeSessionFilesFlight(targetPath, myVersion);
+    if (!flight || !flight.resetSeen) {
+      useStore.getState().setSessionRegistryFiles(
+        targetPath,
+        Array.isArray(data.sessionFiles) ? data.sessionFiles : [],
+      );
+      for (const f of flight?.upserts ?? []) {
+        useStore.getState().upsertSessionRegistryFile(targetPath, f);
+      }
     }
     const messageLiveVersionNow = readMessageLiveVersion(targetPath);
     if (messageLiveVersionNow !== messageLiveVersionBefore) {
@@ -312,10 +399,6 @@ export async function loadMessages(forPath?: string): Promise<void> {
     const items = buildItemsFromHistory(data);
     // 修订点 stamp：记录本次快照对应的磁盘修订点，后续 reconcile 与列表投影对比。
     const revision = typeof data.revision === 'string' ? data.revision : null;
-    useStore.getState().setSessionRegistryFiles(
-      targetPath,
-      Array.isArray(data.sessionFiles) ? data.sessionFiles : [],
-    );
     useStore.getState().setSessionTodosForPath(targetPath, migratedTodos);
     if (items.length > 0) {
       useStore.getState().initSession(targetPath, items, data.hasMore ?? false, revision);
@@ -336,7 +419,12 @@ export async function loadMessages(forPath?: string): Promise<void> {
         data: buildInflightAssistantMessage(snapshot),
       });
     }
-  } catch (err) { console.error('[loadMessages] error:', err); }
+  } catch (err) {
+    console.error('[loadMessages] error:', err);
+    // fetch 失败也要清理本次 flight 记录，避免残留记录被后续 load 误判 version 冲突
+    // （不消费返回值：失败路径不需要重放任何东西）。
+    useStore.getState().consumeSessionFilesFlight(targetPath, myVersion);
+  }
 }
 
 export async function completeSessionTodos(sessionPath: string): Promise<boolean> {
@@ -354,8 +442,13 @@ export async function completeSessionTodos(sessionPath: string): Promise<boolean
     useStore.getState().bumpTodosLiveVersion(sessionPath);
     return true;
   } catch (err) {
-    const message = errorMessage(err);
-    useStore.getState().addToast(message, 'error', 6000);
+    const presented = presentError(err);
+    useStore.getState().addToast(
+      presented.text,
+      'error',
+      6000,
+      presented.code ? { errorCode: presented.code } : undefined,
+    );
     return false;
   }
 }
@@ -459,23 +552,180 @@ export function reconcileCurrentSessionMessages(reason = 'unknown'): Promise<voi
 // Session 列表
 // ══════════════════════════════════════════════════════
 
-export async function loadSessions(): Promise<void> {
+// 与 /api/sessions 并行探测 session 元数据待恢复状态（/api/health 的
+// sessionStore 附块）。失败/超时一律静默忽略——这只是一个附加提示信号，绝不能
+// 让健康检查探测的失败反过来拖垮或延后会话列表本身的加载。
+async function fetchSessionMetaRecoveryStatus(): Promise<SessionMetaRecoveryStatus | null> {
   try {
-    const res = await hanaFetch('/api/sessions');
+    const res = await hanaFetch('/api/health');
     const data = await res.json();
-    const sessions = data || [];
+    return (data && typeof data === 'object' && data.sessionStore) || null;
+  } catch {
+    return null;
+  }
+}
 
-    const s = useStore.getState();
-    useStore.setState((state: any) => ({
-      sessions,
-      sessionLocatorsById: mergeSessionLocators(state.sessionLocatorsById || {}, sessions),
-    }));
+export async function loadSessions(): Promise<void> {
+  // 先发起 /api/sessions（调用顺序上排在前面，保持它是 loadSessions() 触发的
+  // 第一个 hanaFetch 调用——调用方/测试对"/api/sessions 是这次加载的第一个
+  // 请求"这个顺序有既有假设），紧接着不等待地发起 /api/health 探测：两个请求
+  // 仍然背靠背同时打到网络上，只是调用顺序固定，不会因为并行而变得不确定。
+  const sessionsFetchPromise = hanaFetch('/api/sessions');
+  const metaRecoveryPromise = fetchSessionMetaRecoveryStatus();
+  try {
+    const res = await sessionsFetchPromise;
+    const data = await res.json();
+    const serverSessions = Array.isArray(data) ? data.map(normalizeServerSessionProjection) : [];
+    const localSessions = useStore.getState().sessions || [];
+    const sessions = mergeSessionsWithOptimisticFirstMessages(serverSessions, localSessions);
 
-    if (sessions.length > 0 && !s.currentSessionPath && !s.pendingNewSession && !s.pendingSessionSwitchPath) {
+    useStore.setState((state: any) => {
+      const sessionLocatorsById = mergeSessionLocators(state.sessionLocatorsById || {}, sessions);
+      const currentSessionId = typeof state.currentSessionId === 'string' && state.currentSessionId.trim()
+        ? state.currentSessionId.trim()
+        : null;
+      const currentLocatorPath = currentSessionId
+        && !state.pendingNewSession
+        && !state.pendingSessionSwitchPath
+        ? sessionLocatorsById[currentSessionId]?.path || null
+        : null;
+      return {
+        sessions,
+        sessionLocatorsById,
+        ...(currentLocatorPath && currentLocatorPath !== state.currentSessionPath
+          ? { currentSessionPath: currentLocatorPath }
+          : {}),
+      };
+    });
+
+    const latest = useStore.getState();
+    if (
+      sessions.length > 0
+      && !latest.currentSessionPath
+      && !latest.pendingNewSession
+      && !latest.pendingSessionSwitchPath
+    ) {
       // 首次加载：走完整的 switchSession 确保后端同步 + 消息加载
       await switchSession(sessions[0].path);
     }
   } catch { /* ignore */ }
+  useStore.getState().setSessionMetaRecovery(await metaRecoveryPromise);
+}
+
+const EMPTY_FIRST_MESSAGE_PLACEHOLDER = '(no messages)';
+
+function nonPlaceholderText(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return trimmed === EMPTY_FIRST_MESSAGE_PLACEHOLDER ? '' : trimmed;
+}
+
+function normalizeServerSessionProjection(session: any): any {
+  if (!session || typeof session !== 'object') return session;
+  if (session.firstMessage === EMPTY_FIRST_MESSAGE_PLACEHOLDER) {
+    return { ...session, firstMessage: '' };
+  }
+  return session;
+}
+
+function withoutOptimisticFirstMessageMarker(session: any): any {
+  if (!session || typeof session !== 'object') return session;
+  if (!session._optimisticFirstMessage) return session;
+  const { _optimisticFirstMessage, ...rest } = session;
+  return rest;
+}
+
+function isOptimisticFirstMessageProjection(session: any): boolean {
+  return !!(session && session._optimisticFirstMessage && Number(session.messageCount || 0) > 0);
+}
+
+function serverProjectionHasPersistedContent(session: any): boolean {
+  return Number(session?.messageCount || 0) > 0
+    || !!nonPlaceholderText(session?.firstMessage)
+    || !!nonPlaceholderText(session?.title);
+}
+
+function shouldKeepOptimisticFirstMessage(serverSession: any, localSession: any): boolean {
+  return isOptimisticFirstMessageProjection(localSession)
+    && !serverProjectionHasPersistedContent(serverSession);
+}
+
+function mergeSessionsWithOptimisticFirstMessages(serverSessions: any[], localSessions: any[]): any[] {
+  const localByPath = new Map<string, any>();
+  for (const session of localSessions) {
+    if (typeof session?.path === 'string' && isOptimisticFirstMessageProjection(session)) {
+      localByPath.set(session.path, session);
+    }
+  }
+  if (localByPath.size === 0) return serverSessions.map(withoutOptimisticFirstMessageMarker);
+
+  const seenPaths = new Set<string>();
+  const merged = serverSessions.map((serverSession) => {
+    const path = typeof serverSession?.path === 'string' ? serverSession.path : null;
+    if (!path) return withoutOptimisticFirstMessageMarker(serverSession);
+    seenPaths.add(path);
+    const localSession = localByPath.get(path);
+    if (!shouldKeepOptimisticFirstMessage(serverSession, localSession)) {
+      return withoutOptimisticFirstMessageMarker(serverSession);
+    }
+    return {
+      ...localSession,
+      ...serverSession,
+      firstMessage: nonPlaceholderText(localSession.firstMessage),
+      messageCount: Math.max(Number(localSession.messageCount || 0), 1),
+      modified: localSession.modified,
+      _optimisticFirstMessage: true,
+    };
+  });
+
+  const localOnly = Array.from(localByPath.values()).filter((session) => !seenPaths.has(session.path));
+  return [...localOnly, ...merged];
+}
+
+export function upsertOptimisticSessionFirstMessage(
+  sessionPath: string | null | undefined,
+  messageText: string,
+  timestamp = new Date().toISOString(),
+): void {
+  const path = typeof sessionPath === 'string' && sessionPath.trim() ? sessionPath : null;
+  if (!path) return;
+
+  useStore.setState((state: any) => {
+    const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+    const existingIndex = sessions.findIndex((session: any) => session?.path === path);
+    const existing = existingIndex >= 0 ? sessions[existingIndex] : null;
+    if (existing && !isOptimisticFirstMessageProjection(existing) && serverProjectionHasPersistedContent(existing)) {
+      return {};
+    }
+    const sessionId = normalizeSessionId(existing?.sessionId)
+      || (state.currentSessionPath === path ? normalizeSessionId(state.currentSessionId) : null)
+      || sessionIdForPathFromState(state, path);
+    const firstMessage = nonPlaceholderText(existing?.firstMessage) || nonPlaceholderText(messageText);
+    const messageCount = Math.max(Number(existing?.messageCount || 0), 1);
+    const optimisticProjection = {
+      ...(existing || {}),
+      path,
+      ...(sessionId ? { sessionId } : {}),
+      agentId: existing?.agentId ?? state.currentAgentId ?? state.selectedAgentId ?? null,
+      agentName: existing?.agentName ?? state.agentName ?? '',
+      cwd: existing?.cwd ?? state.deskBasePath ?? state.selectedFolder ?? '',
+      projectId: existing?.projectId ?? state.pendingProjectId ?? null,
+      workspaceMountId: existing?.workspaceMountId ?? state.deskWorkspaceMountId ?? state.selectedWorkspaceMountId ?? null,
+      workspaceLabel: existing?.workspaceLabel ?? state.deskWorkspaceLabel ?? state.selectedWorkspaceLabel ?? null,
+      firstMessage,
+      messageCount,
+      modified: timestamp,
+      created: existing?.created ?? timestamp,
+      _optimisticFirstMessage: true,
+    };
+    const nextSessions = existingIndex >= 0
+      ? sessions.map((session: any, index: number) => (index === existingIndex ? optimisticProjection : session))
+      : [optimisticProjection, ...sessions];
+    return {
+      sessions: nextSessions,
+      sessionLocatorsById: mergeSessionLocators(state.sessionLocatorsById || {}, nextSessions),
+    };
+  });
 }
 
 // ══════════════════════════════════════════════════════
@@ -496,6 +746,7 @@ export async function switchSession(path: string): Promise<void> {
     return;
   }
 
+  useStore.getState().clearStaleMessageLocate(path);
   useStore.setState({ pendingSessionSwitchPath: path });
 
   if (isDeletedAgentSession(path)) {
@@ -527,9 +778,11 @@ export async function switchSession(path: string): Promise<void> {
     const data = await res.json();
     if (!isCurrentSwitch(myVersion, path)) return;
     if (data.error) {
-      console.error('[session] switch failed:', data.error);
+      // 带上错误码，呈现层才能把它翻成人话；没有码的原生崩溃走兜底文案 + 详情。
+      const routeError = normalizeSessionRouteError(data);
+      console.error('[session] switch failed:', routeError.message, routeError.code || '');
       useStore.setState({ pendingSessionSwitchPath: null });
-      showSessionSwitchError(path, data.error);
+      showSessionSwitchError(path, errorWithCode(routeError.message, routeError.code));
       return;
     }
 
@@ -560,6 +813,9 @@ export async function switchSession(path: string): Promise<void> {
       agentPatch.agentName = data.agentName || ag?.name || data.agentId;
       agentPatch.agentYuan = ag?.yuan || 'hanako';
       agentPatch.agentAvatarUrl = ag?.hasAvatar ? hanaUrl(`/api/agents/${data.agentId}/avatar?t=${Date.now()}`) : null;
+      agentPatch.homeFolder = typeof ag?.homeFolder === 'string' && ag.homeFolder.trim()
+        ? ag.homeFolder.trim()
+        : null;
     }
 
     // 保存当前 session 的附件到 keyed store
@@ -591,7 +847,10 @@ export async function switchSession(path: string): Promise<void> {
       ...currentSessionIdentityPatch(prev, path, data.sessionId),
       pendingSessionSwitchPath: null,
       pendingNewSession: false,
+      pendingDraftId: null,
       pendingProjectId: null,
+      pendingNewSessionThinkingLevel: null,
+      pendingNewSessionPermissionMode: null,
       selectedFolder: null,
       selectedWorkspaceMountId: null,
       selectedWorkspaceLabel: null,
@@ -669,11 +928,12 @@ export async function switchSession(path: string): Promise<void> {
         thinkingLevels: Array.isArray(data.currentModelThinkingLevels) ? data.currentModelThinkingLevels : undefined,
         defaultThinkingLevel: data.currentModelDefaultThinkingLevel ?? undefined,
         contextWindow: data.currentModelContextWindow ?? undefined,
+        available: data.currentModelAvailable !== false,
+        unavailableReason: data.currentModelAvailable === false
+          ? (data.currentModelUnavailableReason || 'temporarily_unavailable')
+          : null,
       });
     }
-
-    // #1624：服务端在 restore 时算好的工具能力漂移提示（无漂移 / 已 dismiss → null）
-    useStore.getState().setSessionCapabilityDrift(path, data.capabilityDrift || null);
 
     await requestActiveSessionStreamResume(path, isStreaming);
     if (myVersion !== _switchVersion) return;
@@ -702,7 +962,7 @@ export async function switchSession(path: string): Promise<void> {
       state.pendingSessionSwitchPath === path ? { pendingSessionSwitchPath: null } : {}
     ));
     console.error('[session] switch failed:', err);
-    showSessionSwitchError(path, errorMessage(err));
+    showSessionSwitchError(path, err);
   } finally {
     if (_switchAbortController === abortController) {
       _switchAbortController = null;
@@ -727,9 +987,11 @@ async function switchDeletedAgentSession(path: string, version: number): Promise
   }
 
   useStore.setState({
+    ...currentSessionIdentityPatch(state as Record<string, any>, path, projection?.sessionId),
     currentSessionPath: path,
     pendingSessionSwitchPath: null,
     pendingNewSession: false,
+    pendingDraftId: null,
     pendingProjectId: null,
     selectedFolder: null,
     selectedWorkspaceMountId: null,
@@ -778,6 +1040,93 @@ interface CreateNewSessionOptions {
   cwd?: string | null;
 }
 
+type PendingSessionCreateBody = Record<string, any>;
+
+function buildPendingSessionCreateBody(state: Record<string, any>): PendingSessionCreateBody {
+  const body: PendingSessionCreateBody = {
+    memoryEnabled: state.memoryEnabled,
+    recordWorkspaceHistory: true,
+  };
+  if (state.selectedWorkspaceMountId) {
+    body.workspaceMountId = state.selectedWorkspaceMountId;
+  } else if (state.selectedFolder) {
+    body.cwd = state.selectedFolder;
+  }
+  if (state.workspaceFolders?.length) {
+    body.workspaceFolders = state.workspaceFolders;
+  }
+  if (state.pendingProjectId) {
+    body.projectId = state.pendingProjectId;
+  }
+  if (state.pendingNewSessionThinkingLevel) {
+    body.thinkingLevel = state.pendingNewSessionThinkingLevel;
+  }
+  if (state.pendingNewSessionPermissionMode) {
+    body.permissionMode = state.pendingNewSessionPermissionMode;
+  }
+  if (state.selectedAgentId && state.selectedAgentId !== state.currentAgentId) {
+    body.agentId = state.selectedAgentId;
+  }
+  body.currentSessionPath = state.currentSessionPath;
+  return body;
+}
+
+function pendingSessionCreateKey(body: PendingSessionCreateBody): string {
+  return JSON.stringify(body);
+}
+
+function currentPendingSessionDraft(): { body: PendingSessionCreateBody; key: string } | null {
+  const state = useStore.getState() as Record<string, any>;
+  if (state.pendingNewSession !== true || !normalizeSessionId(state.pendingDraftId)) return null;
+  const body = buildPendingSessionCreateBody(state);
+  return { body, key: `${state.pendingDraftId}:${pendingSessionCreateKey(body)}` };
+}
+
+async function postPendingSessionCreate(body: PendingSessionCreateBody): Promise<any> {
+  const res = await hanaFetch('/api/sessions/new-detached', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    throwOnHttpError: false,
+  });
+  return res.json();
+}
+
+function stageDetachedSessionForActivation(data: any, ref: Readonly<SessionRef>, state: Record<string, any>): void {
+  const existing = sessionByIdentityOrPath(state, ref.sessionId, ref.sessionPath);
+  const projection = {
+    ...(existing || {}),
+    path: ref.sessionPath,
+    sessionId: ref.sessionId,
+    agentId: ref.agentId,
+    agentName: data.agentName || existing?.agentName || ref.agentId,
+    cwd: data.cwd || existing?.cwd || null,
+    workspaceMountId: data.workspaceMountId || existing?.workspaceMountId || null,
+    workspaceLabel: data.workspaceLabel || existing?.workspaceLabel || null,
+    title: existing?.title ?? null,
+    firstMessage: existing?.firstMessage ?? '',
+    modified: existing?.modified || new Date().toISOString(),
+    messageCount: existing?.messageCount ?? 0,
+    _optimistic: true,
+  };
+  const sessions = [projection, ...(state.sessions || []).filter((item: any) => (
+    normalizeSessionId(item?.sessionId) !== ref.sessionId && item?.path !== ref.sessionPath
+  ))];
+  const targetKey = ref.sessionId;
+  useStore.setState({
+    sessions,
+    sessionLocatorsById: {
+      ...(state.sessionLocatorsById || {}),
+      [ref.sessionId]: { path: ref.sessionPath },
+    },
+    attachedFilesBySession: {
+      ...(state.attachedFilesBySession || {}),
+      [targetKey]: [...(state.attachedFiles || [])],
+    },
+  });
+  useStore.getState().initSession?.(ref.sessionPath, [], false);
+}
+
 export async function loadPendingNewSessionPermissionDefault(): Promise<SessionPermissionMode> {
   try {
     const res = await hanaFetch('/api/preferences/session-permission-default');
@@ -803,10 +1152,15 @@ export async function createNewSession(options: CreateNewSessionOptions = {}): P
   }
 
   const s = useStore.getState();
+  const primaryAgent = findPrimaryAgent(s.agents);
+  const primaryWorkspace = resolveAgentWorkspace(primaryAgent);
   const requestedFolder = typeof options.cwd === 'string' && options.cwd.trim() ? options.cwd.trim() : null;
-  const defaultWorkspaceMountId = requestedFolder ? null : (s.deskWorkspaceMountId || null);
-  const defaultWorkspaceLabel = defaultWorkspaceMountId ? (s.deskWorkspaceLabel || null) : null;
-  const defaultFolder = requestedFolder || s.homeFolder || (defaultWorkspaceMountId ? null : s.deskBasePath) || null;
+  const defaultWorkspaceMountId = null;
+  const defaultWorkspaceLabel = null;
+  const defaultFolder = requestedFolder || primaryWorkspace || (!primaryAgent ? s.homeFolder : null) || null;
+  const selectedPrimaryAgentId = primaryAgent && primaryAgent.id !== s.currentAgentId
+    ? primaryAgent.id
+    : null;
   const pendingProjectId = typeof options.projectId === 'string' && options.projectId.trim()
     ? options.projectId.trim()
     : null;
@@ -814,15 +1168,16 @@ export async function createNewSession(options: CreateNewSessionOptions = {}): P
   useStore.setState({
     welcomeVisible: true,
     currentSessionPath: null,
+    currentSessionId: null,
     pendingSessionSwitchPath: null,
-    // 有显式 Agent home 时以 home 为准；没有绑定 workspace 的 agent
-    // 以当前 session cwd 延续工作流，不从其他 agent 的 home_folder 推导。
+    // 全局新建始终回到 Primary Agent。显式项目 cwd 只覆盖本次工作目录；
+    // 普通新建使用 Primary Agent 的有效工作区（显式 home 或服务端默认工作区）。
     selectedFolder: defaultFolder,
     selectedWorkspaceMountId: defaultWorkspaceMountId,
     selectedWorkspaceLabel: defaultWorkspaceLabel,
     workspaceFolders: [],
-    selectedAgentId: null,
-    pendingNewSession: true,
+    selectedAgentId: selectedPrimaryAgentId,
+    ...pendingNewSessionIdentityPatch(),
     pendingProjectId,
     pendingNewSessionThinkingLevel: null,
     pendingNewSessionPermissionMode: null,
@@ -861,128 +1216,44 @@ export async function createNewSession(options: CreateNewSessionOptions = {}): P
 // 确保 Session 存在（首次发消息时调用）
 // ══════════════════════════════════════════════════════
 
-export async function ensureSession(): Promise<boolean> {
-  const s = useStore.getState();
-  if (!s.pendingNewSession) return true;
-
+export async function ensureSession(expectedPendingDraftId?: string | null): Promise<Readonly<SessionRef> | null> {
   try {
-    const body: Record<string, any> = { memoryEnabled: s.memoryEnabled };
-    if (s.selectedWorkspaceMountId) {
-      body.workspaceMountId = s.selectedWorkspaceMountId;
-    } else if (s.selectedFolder) {
-      body.cwd = s.selectedFolder;
+    const initialState = useStore.getState() as Record<string, any>;
+    if (initialState.pendingNewSession !== true) return frozenSessionRefFromState(initialState);
+    const draft = currentPendingSessionDraft();
+    if (!draft) throw new Error('pending session draft identity is missing');
+    const draftId = normalizeSessionId(initialState.pendingDraftId);
+    if (expectedPendingDraftId && draftId !== expectedPendingDraftId) return null;
+
+    const data = await postPendingSessionCreate(draft.body);
+    // 带上错误码，呈现层才能把它翻成人话；没有码的原生崩溃走兜底文案 + 详情。
+    if (data?.error) {
+      const routeError = normalizeSessionRouteError(data);
+      throw errorWithCode(routeError.message, routeError.code);
     }
-    if (s.workspaceFolders?.length) {
-      body.workspaceFolders = s.workspaceFolders;
+    const ref = frozenSessionRefFromCreateResponse(data);
+    if (!ref) throw new Error('session creation returned an incomplete session identity');
+
+    const latestDraft = currentPendingSessionDraft();
+    const latestState = useStore.getState() as Record<string, any>;
+    const stillOwnsPendingView = latestDraft?.key === draft.key
+      && normalizeSessionId(latestState.pendingDraftId) === draftId;
+    if (!stillOwnsPendingView) return ref;
+
+    stageDetachedSessionForActivation(data, ref, latestState);
+    await switchSession(ref.sessionPath);
+    const activated = useStore.getState() as Record<string, any>;
+    if (activated.currentSessionId === ref.sessionId && activated.currentSessionPath === ref.sessionPath) {
+      activated.clearDraft?.(HOME_DRAFT_KEY);
+      activated.clearDraft?.(ref.sessionId);
+      activated.clearDraft?.(ref.sessionPath);
+      useStore.setState({ pendingDraftId: null });
     }
-    if (s.pendingProjectId) {
-      body.projectId = s.pendingProjectId;
-    }
-    if (s.pendingNewSessionThinkingLevel) {
-      body.thinkingLevel = s.pendingNewSessionThinkingLevel;
-    }
-    if (s.pendingNewSessionPermissionMode) {
-      body.permissionMode = s.pendingNewSessionPermissionMode;
-    }
-    if (s.selectedAgentId && s.selectedAgentId !== s.currentAgentId) {
-      body.agentId = s.selectedAgentId;
-    }
-    body.currentSessionPath = s.currentSessionPath;
-
-    const res = await hanaFetch('/api/sessions/new', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      throwOnHttpError: false,
-    });
-    const data = await res.json();
-    if (data.error) {
-      console.error('[session] create failed:', data.error);
-      showSessionCreationError(data.error);
-      return false;
-    }
-
-    const justSelected = s.selectedFolder;
-    const justSelectedMount = s.selectedWorkspaceMountId;
-
-    // 基础状态更新
-    const patch: Record<string, any> = {
-      pendingNewSession: false,
-      pendingSessionSwitchPath: null,
-      selectedFolder: null,
-      selectedWorkspaceMountId: null,
-      selectedWorkspaceLabel: null,
-      pendingProjectId: null,
-      pendingNewSessionThinkingLevel: null,
-      pendingNewSessionPermissionMode: null,
-      workspaceFolders: Array.isArray(data.workspaceFolders) ? data.workspaceFolders : [],
-      selectedAgentId: null,
-    };
-
-    if (data.agentId) {
-      const switched = data.agentId !== s.currentAgentId;
-      patch.currentAgentId = data.agentId;
-      if (data.agentName) patch.agentName = data.agentName;
-      if (switched) {
-        const ag = s.agents.find((a: any) => a.id === data.agentId);
-        if (ag?.yuan) patch.agentYuan = ag.yuan;
-        patch.agentAvatarUrl = null;
-        window.i18n.defaultName = data.agentName || s.agentName;
-        // 异步刷新头像
-        hanaFetch('/api/health').then((r: Response) => r.json()).then((d: any) => {
-          loadAvatarsAction(d.avatars);
-        }).catch(() => {
-          loadAvatarsAction();
-        });
-      }
-    }
-
-    if (data.path) {
-      Object.assign(patch, currentSessionIdentityPatch(useStore.getState() as Record<string, any>, data.path, data.sessionId));
-      patch.sessionAuthorizedFoldersByPath = {
-        ...putSessionScopedStateValue(
-          useStore.getState() as Record<string, any>,
-          useStore.getState().sessionAuthorizedFoldersByPath || {},
-          data.path,
-          Array.isArray(data.authorizedFolders) ? data.authorizedFolders : [],
-        ),
-      };
-      // 初始化空 session，ChatArea 自动渲染
-      useStore.getState().initSession(data.path, [], false);
-    }
-
-    useStore.setState(patch);
-    if (data.thinkingLevel) {
-      useStore.getState().setThinkingLevel(data.thinkingLevel);
-    }
-
-    await resetDeskForSessionWorkspace({
-      cwd: data.cwd || null,
-      workspaceMountId: data.workspaceMountId || justSelectedMount || null,
-      workspaceLabel: data.workspaceLabel || s.selectedWorkspaceLabel || null,
-    });
-
-    emitSessionPermissionMode(data.permissionMode || data.accessMode || s.pendingNewSessionPermissionMode);
-
-    await loadSessions();
-
-    // 刷新模型列表：session 创建后 activeModel 已绑定，需要同步到 UI
-    loadModels();
-
-    // 更新 cwdHistory
-    if (justSelected && !justSelectedMount) {
-      const currentState = useStore.getState();
-      let cwdHistory = currentState.cwdHistory.filter((p: string) => p !== justSelected);
-      cwdHistory = [justSelected, ...cwdHistory];
-      if (cwdHistory.length > 10) cwdHistory = cwdHistory.slice(0, 10);
-      useStore.setState({ cwdHistory });
-    }
-
-    return true;
+    return ref;
   } catch (err) {
     console.error('[session] create failed:', err);
-    showSessionCreationError(errorMessage(err));
-    return false;
+    showSessionCreationError(err);
+    return null;
   }
 }
 
@@ -995,9 +1266,15 @@ export async function continueDeletedAgentSession(path: string): Promise<boolean
     });
     const data = await res.json();
     if (!res.ok || data.error || !data.path) {
-      const message = data.error || res.statusText || 'continue failed';
-      console.error('[session] continue deleted-agent session failed:', message);
-      useStore.getState().addToast(`${tr('session.deletedAgent.continueFailed')}: ${message}`, 'error', 6000);
+      const routeError = normalizeSessionRouteError(data);
+      const message = routeError.message || res.statusText || 'continue failed';
+      console.error('[session] continue deleted-agent session failed:', message, routeError.code || '');
+      // 跟下面 catch 分支同一套呈现：错误码翻成人话，原始英文留在详情，toast 带码。
+      const entry = presentErrorWithLabel(
+        tr('session.deletedAgent.continueFailed'),
+        errorWithCode(message, routeError.code),
+      );
+      useStore.getState().addToast(entry.text, 'error', 6000, entry.code ? { errorCode: entry.code } : undefined);
       return false;
     }
 
@@ -1013,7 +1290,11 @@ export async function continueDeletedAgentSession(path: string): Promise<boolean
     return true;
   } catch (err) {
     console.error('[session] continue deleted-agent session failed:', err);
-    useStore.getState().addToast(`${tr('session.deletedAgent.continueFailed')}: ${errorMessage(err)}`, 'error', 6000);
+    useStore.getState().addToast(
+      presentErrorWithLabel(tr('session.deletedAgent.continueFailed'), err).text,
+      'error',
+      6000,
+    );
     return false;
   }
 }
@@ -1024,10 +1305,14 @@ export async function continueDeletedAgentSession(path: string): Promise<boolean
 
 export async function archiveSession(path: string): Promise<void> {
   try {
+    const localSessionId = sessionIdForPathFromState(useStore.getState() as Record<string, any>, path);
     const res = await hanaFetch('/api/sessions/archive', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({
+        path,
+        ...(localSessionId ? { sessionId: localSessionId } : {}),
+      }),
     });
     const data = await res.json();
     if (data.error) {
@@ -1041,7 +1326,7 @@ export async function archiveSession(path: string): Promise<void> {
     clearSessionRuntimeCaches(path);
     if (isCurrent) {
       clearChatAction();
-      useStore.setState({ currentSessionPath: null });
+      useStore.setState({ currentSessionPath: null, currentSessionId: null });
     }
 
     await loadSessions();
@@ -1064,14 +1349,21 @@ export async function archiveSession(path: string): Promise<void> {
 
 export interface ArchivedSession {
   path: string;
+  sessionId?: string | null;
   title: string | null;
   archivedAt: string;
   sizeBytes: number;
   agentId: string;
   agentName: string;
+  agentDeleted?: boolean;
+  readOnlyReason?: string | null;
+  deletedAt?: string | null;
 }
 
-export type RestoreResult = 'ok' | 'conflict' | 'error';
+export type RestoreResult =
+  | { status: 'ok'; restoredPath: string | null; sessionId: string | null }
+  | { status: 'conflict'; error?: string }
+  | { status: 'error'; error?: string };
 
 export async function listArchivedSessions(): Promise<ArchivedSession[]> {
   try {
@@ -1084,28 +1376,52 @@ export async function listArchivedSessions(): Promise<ArchivedSession[]> {
   }
 }
 
-export async function restoreSession(path: string): Promise<RestoreResult> {
+export async function restoreSession(target: string | Pick<ArchivedSession, 'path' | 'sessionId'>): Promise<RestoreResult> {
+  const sessionPath = typeof target === 'string' ? target : target.path;
+  const sessionId = typeof target === 'string' ? null : normalizeSessionId(target.sessionId);
   try {
     const res = await hanaFetch('/api/sessions/restore', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({
+        path: sessionPath,
+        ...(sessionId ? { sessionId } : {}),
+      }),
     });
-    if (res.status === 409) return 'conflict';
-    if (!res.ok) return 'error';
-    return 'ok';
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) return { status: 'conflict', error: data?.error };
+    if (!res.ok) return { status: 'error', error: data?.error || res.statusText };
+    const restoredPath = typeof data?.restoredPath === 'string' ? data.restoredPath : null;
+    const restoredSessionId = normalizeSessionId(data?.sessionId) || sessionId;
+
+    await loadSessions();
+    const restoredSession = sessionByIdentityOrPath(
+      useStore.getState() as Record<string, any>,
+      restoredSessionId,
+      restoredPath,
+    );
+    if (restoredSession?.path) {
+      await switchSession(restoredSession.path);
+    }
+    void hydrateInputDrafts();
+    return { status: 'ok', restoredPath, sessionId: restoredSessionId };
   } catch (err) {
     console.error('[archived] restore failed:', err);
-    return 'error';
+    return { status: 'error', error: errorMessage(err) };
   }
 }
 
-export async function deleteArchivedSession(path: string): Promise<boolean> {
+export async function deleteArchivedSession(target: string | Pick<ArchivedSession, 'path' | 'sessionId'>): Promise<boolean> {
+  const sessionPath = typeof target === 'string' ? target : target.path;
+  const sessionId = typeof target === 'string' ? null : normalizeSessionId(target.sessionId);
   try {
     const res = await hanaFetch('/api/sessions/archived/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({
+        path: sessionPath,
+        ...(sessionId ? { sessionId } : {}),
+      }),
     });
     return res.ok;
   } catch (err) {
@@ -1197,34 +1513,49 @@ export async function pinSession(path: string, pinned: boolean): Promise<boolean
   }
 }
 
-// ══════════════════════════════════════════════════════
-// #1624 工具能力漂移：dismiss / 显式刷新（fresh compact）
-// ══════════════════════════════════════════════════════
+/**
+ * 提交置顶区的完整新顺序。先按新顺序乐观改写本地 pinOrder（步长与服务端一致），
+ * 拖完立刻定位；服务端拒绝或请求失败就整体回滚到提交前的快照并提示，
+ * 不留下半套顺序。
+ */
+export async function reorderPinnedSessions(orderedSessionIds: string[]): Promise<boolean> {
+  const sessionIds = Array.isArray(orderedSessionIds)
+    ? orderedSessionIds.filter((id): id is string => typeof id === 'string' && !!id.trim())
+    : [];
+  if (sessionIds.length === 0) return false;
 
-/** 关闭当前 fingerprint 的提示；服务端持久化在 session-meta，指纹再变才重新提示 */
-export async function dismissSessionCapabilityDrift(path: string, fingerprint: string): Promise<boolean> {
-  // 乐观隐藏：dismiss 是低风险操作，失败时恢复提示
-  const prevDrift = sessionScopedValue(
-    useStore.getState() as Record<string, any>,
-    useStore.getState().capabilityDriftBySession,
-    path,
-  ) || null;
-  useStore.getState().setSessionCapabilityDrift(path, null);
+  const snapshot = useStore.getState().sessions;
+  const orderById = new Map(sessionIds.map((sessionId, index) => [sessionId, (index + 1) * 1024]));
+  useStore.setState({
+    sessions: snapshot.map(s => {
+      const sessionId = normalizeSessionId(s.sessionId);
+      const pinOrder = sessionId ? orderById.get(sessionId) : undefined;
+      return pinOrder === undefined ? s : { ...s, pinOrder };
+    }),
+  });
+
   try {
-    const res = await hanaFetch('/api/sessions/capability-drift/dismiss', {
+    const res = await hanaFetch('/api/sessions/pin-order', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, fingerprint }),
+      body: JSON.stringify({ sessionIds }),
     });
     const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || res.statusText);
+    if (!res.ok || data.error) {
+      throw new Error(data.error || res.statusText);
+    }
     return true;
   } catch (err) {
-    console.warn('[session] capability drift dismiss failed:', err);
-    useStore.getState().setSessionCapabilityDrift(path, prevDrift);
+    console.error('[session] pin reorder failed:', err);
+    useStore.setState({ sessions: snapshot });
+    showSidebarToast(window.t('session.reorderFailed'));
     return false;
   }
 }
+
+// ══════════════════════════════════════════════════════
+// 显式更新会话能力（fresh compact）
+// ══════════════════════════════════════════════════════
 
 /**
  * 显式刷新 Agent 工具：fresh compact——旧对话压缩成摘要 checkpoint，
@@ -1245,14 +1576,16 @@ export async function refreshSessionCapabilities(path: string): Promise<boolean>
       timeout: 180_000,
     });
     const data = await res.json();
-    if (!res.ok || data.error) throw new Error(data.error || res.statusText);
-    useStore.getState().setSessionCapabilityDrift(path, data.capabilityDrift || null);
+    if (!res.ok || data.error) {
+      const routeError = normalizeSessionRouteError(data);
+      throw errorWithCode(routeError.message || res.statusText, routeError.code);
+    }
     await loadMessages(path);
     return true;
   } catch (err) {
     console.error('[session] capability refresh failed:', err);
     const state = useStore.getState();
-    state.setInlineError?.(path, `${tr('session.capabilityDrift.refreshFailed')}: ${errorMessage(err)}`, 6000);
+    state.setInlineError?.(path, presentErrorWithLabel(tr('input.refreshAndCompactFailed'), err), 6000);
     return false;
   } finally {
     useStore.getState().setSessionCapabilityRefreshing(path, false);
@@ -1277,18 +1610,19 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err || 'Unknown error');
 }
 
-function showSessionCreationError(detail: unknown): void {
-  const label = tr('session.createFailed');
-  const message = `${label}: ${errorMessage(detail)}`;
+/** 内联错误说人话、原始报错留在展开区；toast 一闪而过，只带正文和错误码。 */
+function showSessionActionError(labelKey: string, path: string, detail: unknown): void {
+  const entry = presentErrorWithLabel(tr(labelKey), detail);
   const state = useStore.getState();
-  state.setInlineError?.(state.currentSessionPath || '', message, 6000);
-  state.addToast(message, 'error', 6000);
+  state.setInlineError?.(path, entry, 6000);
+  state.addToast(entry.text, 'error', 6000, entry.code ? { errorCode: entry.code } : undefined);
+}
+
+function showSessionCreationError(detail: unknown): void {
+  showSessionActionError('session.createFailed', useStore.getState().currentSessionPath || '', detail);
 }
 
 function showSessionSwitchError(targetPath: string, detail: unknown): void {
-  const label = tr('session.switchFailed');
-  const message = `${label}: ${errorMessage(detail)}`;
   const state = useStore.getState();
-  state.setInlineError?.(state.currentSessionPath || targetPath || '', message, 6000);
-  state.addToast(message, 'error', 6000);
+  showSessionActionError('session.switchFailed', state.currentSessionPath || targetPath || '', detail);
 }

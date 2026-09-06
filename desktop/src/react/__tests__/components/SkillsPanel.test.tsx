@@ -4,6 +4,7 @@ import '@testing-library/jest-dom/vitest';
 import React from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { installWindowTestT } from '../helpers/i18n-test-strings';
 import { useStore } from '../../stores';
 import { SkillsPanel } from '../../components/SkillsPanel';
 
@@ -25,10 +26,9 @@ async function flushMicrotasks(ticks = 3) {
 describe('SkillsPanel', () => {
   beforeEach(() => {
     fetchMock.mockReset();
-    window.t = ((key: string, vars?: Record<string, string | number>) => {
-      if (key === 'settings.skills.installSuccess') return `installed ${vars?.name || ''}`;
-      return key;
-    }) as typeof window.t;
+    installWindowTestT({
+      'settings.skills.installSuccess': 'installed {name}',
+    });
     window.platform = {
       getFilePath: vi.fn(() => '/tmp/new-skill.skill'),
       openSkillViewer: vi.fn(),
@@ -79,6 +79,12 @@ describe('SkillsPanel', () => {
 
     render(<SkillsPanel />);
     await flushMicrotasks(4);
+
+    expect(fetchMock.mock.calls.some((call) =>
+      typeof call[0] === 'string'
+      && call[0].includes('/api/skills?agentId=agent-a')
+      && call[0].includes('runtime=1'),
+    )).toBe(true);
 
     fireEvent.click(screen.getByRole('tab', { name: 'Mao' }));
 
@@ -244,8 +250,13 @@ describe('SkillsPanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Mao' }));
     await screen.findByText('Writing Bundle');
 
+    fireEvent.click(screen.getByRole('button', { name: 'settings.skills.expandBundleAriaLabel' }));
+    expect(screen.getByText('reader')).toBeTruthy();
+
     fireEvent.click(screen.getByTestId('skill-bundle-toggle-writing-bundle'));
 
     await waitFor(() => expect(bundleToggled).toBe(true));
+    expect(screen.getByText('reader')).toBeTruthy();
+    expect(screen.queryByText('status.loading')).toBeNull();
   });
 });

@@ -2,6 +2,10 @@ import fs from "fs/promises";
 import path from "path";
 import { isSessionJsonlFilename } from "../lib/session-jsonl.ts";
 import { readFileLikePaths } from "../shared/link-aware-fs.ts";
+import { createModuleLogger } from "../lib/debug-log.ts";
+import { stripSessionReminderBlocks } from "./session-reminders.ts";
+
+const log = createModuleLogger("session-list-cache");
 
 /**
  * Session 文件修订点：`${size}:${mtimeMs}` stat 签名。
@@ -41,7 +45,11 @@ export class SessionListProjectionCache {
       try {
         stat = await fs.stat(filePath);
       } catch (err) {
-        if (err?.code !== "ENOENT") throw err;
+        if (err?.code !== "ENOENT") {
+          // 单文件隔离（#414 同族拓扑加固）：EPERM/EIO 等非 ENOENT 错误
+          // 只跳过这一个文件，不让整个目录的 list() 调用 reject。
+          log.warn(`session projection stat failed for ${filePath}: ${err?.code || ""} ${err?.message || err}`);
+        }
         return null;
       }
 
@@ -100,7 +108,7 @@ async function buildSessionProjection(filePath, stat) {
       const message = entry.message;
       if (!isMessageWithContent(message)) continue;
       if (message.role !== "user" && message.role !== "assistant") continue;
-      const textContent = extractTextContent(message);
+      const textContent = stripSessionReminderBlocks(extractTextContent(message));
       if (!textContent) continue;
       allMessages.push(textContent);
       if (!firstMessage && message.role === "user") {
@@ -118,7 +126,7 @@ async function buildSessionProjection(filePath, stat) {
       modified: getSessionModifiedDate(entries, header, stat.mtime),
       revision: sessionFileRevision(stat),
       messageCount,
-      firstMessage: firstMessage || "(no messages)",
+      firstMessage,
       allMessagesText: allMessages.join(" "),
     };
   } catch {

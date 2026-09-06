@@ -7,10 +7,26 @@
 
 import { QUOTE_ORIGINAL_END, QUOTE_ORIGINAL_START } from './quoted-selection';
 import { moodLabelForYuan } from '../../../../shared/yuan-visuals.ts';
+import { parseLeadingInternalMoodBlock } from '../../../../shared/internal-mood-block.ts';
 
 // ── Mood 解析 ──
 
 const TAG_TO_YUAN: Record<string, string> = { mood: 'hanako', pulse: 'butter', reflect: 'ming' };
+// 当前块头是静态的；`at <时间戳>` 是历史 JSONL 里的旧块头，剥离端必须继续认
+const SESSION_REMINDER_HEADER_RE = /^\[hana_reminder(?: at \d{4}-\d{2}-\d{2} \d{2}:\d{2})?\]\r?\n/;
+const SESSION_REMINDER_END = '[/hana_reminder]';
+
+function stripLeadingSessionReminder(content: string): string {
+  const header = content.match(SESSION_REMINDER_HEADER_RE);
+  if (!header) return content;
+  const closingLine = `\n${SESSION_REMINDER_END}`;
+  const closingIndex = content.indexOf(closingLine, header[0].length);
+  if (closingIndex < 0) return content;
+  const blockEnd = closingIndex + closingLine.length;
+  const nextChar = content[blockEnd];
+  if (nextChar !== undefined && nextChar !== '\n' && nextChar !== '\r') return content;
+  return content.slice(blockEnd).replace(/^(?:\r?\n){0,2}/, '');
+}
 
 export function moodLabel(yuan: string): string {
   return moodLabelForYuan(yuan);
@@ -26,12 +42,11 @@ export function cleanMoodText(raw: string): string {
 
 export function parseMoodFromContent(content: string): { mood: string | null; yuan: string | null; text: string } {
   if (!content) return { mood: null, yuan: null, text: '' };
-  const moodRe = /<(mood|pulse|reflect)>([\s\S]*?)<\/(?:mood|pulse|reflect)>/;
-  const match = content.match(moodRe);
-  if (!match) return { mood: null, yuan: null, text: content };
-  const yuan = TAG_TO_YUAN[match[1]] || 'hanako';
-  const mood = cleanMoodText(match[2].trim());
-  const text = content.replace(moodRe, '').replace(/^\n+/, '').trim();
+  const block = parseLeadingInternalMoodBlock(content);
+  if (!block) return { mood: null, yuan: null, text: content };
+  const yuan = TAG_TO_YUAN[block.tag] || 'hanako';
+  const mood = cleanMoodText(block.content.trim());
+  const text = block.rest.replace(/^\n+/, '').trim();
   return { mood, yuan, text };
 }
 
@@ -85,6 +100,7 @@ function parseSessionFileMarker(line: string): { fileId: string; sessionPath?: s
 
 export function parseUserAttachments(content: string): ParsedAttachments {
   if (!content) return { text: '', files: [], attachedImages: [], attachedVideos: [], attachedAudios: [], sessionFileRefs: [], deskContext: null, quotedText: null };
+  content = stripLeadingSessionReminder(content);
   const lines = content.split('\n');
   const textLines: string[] = [];
   const files: Array<{ path: string; name: string; isDirectory: boolean }> = [];
@@ -230,8 +246,22 @@ export function extractToolDetail(name: string, args: Record<string, unknown> | 
       const p = (args.file_path || args.path || '') as string;
       return { text: truncatePath(p), href: p || undefined, hrefType: 'file' };
     }
-    case 'bash': {
-      const command = typeof args.command === 'string' ? args.command : '';
+    case 'bash':
+    case 'exec_command': {
+      const command = typeof args.command === 'string'
+        ? args.command
+        : typeof args.cmd === 'string'
+          ? args.cmd
+          : '';
+      return { text: truncateHead(command, 40), title: command || undefined };
+    }
+    case 'terminal':
+    case 'write_stdin': {
+      const command = typeof args.command === 'string'
+        ? args.command
+        : typeof args.chars === 'string'
+          ? args.chars
+          : '';
       return { text: truncateHead(command, 40), title: command || undefined };
     }
     case 'glob':
@@ -276,6 +306,12 @@ export function extractToolDetail(name: string, args: Record<string, unknown> | 
     }
     case 'update_settings':
       return { text: (args.key || args.setting || '') as string };
+    case 'session': {
+      // 目标会话名由渲染侧按 sessionId 查出来覆盖，这里只给查不到时的兜底
+      if (args.action === 'create') return { text: (args.agent || '') as string };
+      const sessionId = (args.sessionId || '') as string;
+      return { text: sessionId ? `…${sessionId.slice(-4)}` : '' };
+    }
     default: {
       // 插件工具：取第一个有意义的字符串参数作详情
       const first = Object.values(args).find(v => typeof v === 'string' && v.length > 0);

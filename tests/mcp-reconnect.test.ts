@@ -12,9 +12,11 @@
  *   - 扩展状态 connecting/reconnecting/needs-auth 经 getState 透出
  *   - autoReconnect=false 的连接器不重连
  */
+import os from "node:os";
+import path from "node:path";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { McpRuntime } from "../plugins/mcp/lib/mcp-runtime.ts";
-import { McpHttpError } from "../plugins/mcp/lib/mcp-http-client.ts";
+import { McpManager } from "../core/mcp/manager.ts";
+import { McpHttpError } from "../core/mcp/clients/http-client.ts";
 
 /**
  * 一个可被 runtime 通过 onClose 回调驱动的 fake client。
@@ -81,19 +83,19 @@ function makeFakeClientFactory() {
 
 function makeRuntime(stored, factory) {
   let current = stored;
-  const runtime = new McpRuntime({
-    dataDir: "/tmp/mcp-reconnect-test",
-    config: {
+  const runtime = new McpManager({
+    dataDir: path.join(os.tmpdir(), "hana-mcp-reconnect-test"),
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  }, {
+    clientFactory: factory,
+    configStore: {
       get: vi.fn(() => current),
       set: vi.fn((_key, value) => {
         // Mirror saveConfig semantics so getConfig() reflects writes.
         current = { ...current, ...value };
       }),
     },
-    registerTool: vi.fn(() => () => {}),
-    bus: { request: vi.fn() },
-    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-  }, { clientFactory: factory });
+  });
   return runtime;
 }
 
@@ -342,13 +344,13 @@ describe("MCP runtime establishing-phase suppression", () => {
     factory.instances = instances;
 
     let current = { enabled: true, connectors: [{ ...STDIO_CONNECTOR }] };
-    const runtime = new McpRuntime({
-      dataDir: "/tmp/mcp-establishing-test",
-      config: { get: () => current, set: (_k, v) => { current = { ...current, ...v }; } },
-      registerTool: vi.fn(() => () => {}),
-      bus: { request: vi.fn() },
+    const runtime = new McpManager({
+      dataDir: path.join(os.tmpdir(), "hana-mcp-establishing-test"),
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    }, { clientFactory: factory });
+    }, {
+      clientFactory: factory,
+      configStore: { get: () => current, set: (_k, v) => { current = { ...current, ...v }; } },
+    });
 
     // Manual start fails (the error propagates to the caller as before).
     await expect(runtime.startConnector("local")).rejects.toThrow(/child exited/);
@@ -360,6 +362,104 @@ describe("MCP runtime establishing-phase suppression", () => {
     expect(instances).toHaveLength(1);
     expect(runtime.clients.has("local")).toBe(false);
     expect(runtime.getState().connectors[0].status).toBe("stopped");
+
+    await runtime.dispose();
+  });
+});
+
+describe("MCP runtime auto-start initial failures", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("puts an auto-start transient failure into the reconnect backoff loop", async () => {
+    const factory = makeFakeClientFactory();
+    factory.failNextStart(new Error("network unavailable"));
+    const runtime = makeRuntime({
+      enabled: true,
+      connectors: [{ ...STDIO_CONNECTOR, enabled: true }],
+    }, factory);
+
+    await runtime.load();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(factory.instances).toHaveLength(1);
+    expect(runtime.clients.has("local")).toBe(false);
+    expect(runtime.getState().connectors[0]).toMatchObject({
+      status: "reconnecting",
+      error: "network unavailable",
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(factory.instances).toHaveLength(2);
+    expect(runtime.clients.get("local")).toBe(factory.instances[1]);
+    expect(runtime.getState().connectors[0].status).toBe("running");
+
+    await runtime.dispose();
+  });
+
+  it("marks auto-start auth failures as needs-auth without retrying", async () => {
+    const factory = makeFakeClientFactory();
+    factory.failNextStart(new McpHttpError("refresh token expired", {
+      status: 400,
+      oauthError: "invalid_grant",
+    }));
+    const runtime = makeRuntime({
+      enabled: true,
+      connectors: [{ ...STDIO_CONNECTOR, enabled: true }],
+    }, factory);
+
+    await runtime.load();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(runtime.getState().connectors[0]).toMatchObject({
+      status: "needs-auth",
+      error: "refresh token expired",
+    });
+
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(factory.instances).toHaveLength(1);
+    expect(runtime.clients.has("local")).toBe(false);
+
+    await runtime.dispose();
+  });
+
+  it("does not retry an auto-start failure when autoReconnect is false", async () => {
+    const factory = makeFakeClientFactory();
+    factory.failNextStart(new Error("network unavailable"));
+    const runtime = makeRuntime({
+      enabled: true,
+      connectors: [{ ...STDIO_CONNECTOR, enabled: true, autoReconnect: false }],
+    }, factory);
+
+    await runtime.load();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(factory.instances).toHaveLength(1);
+    expect(runtime.clients.has("local")).toBe(false);
+    expect(runtime.getState().connectors[0]).toMatchObject({
+      status: "stopped",
+      error: "network unavailable",
+    });
+
+    await runtime.dispose();
+  });
+
+  it("never dials or arms a reconnect for a connector that was added switched off", async () => {
+    const factory = makeFakeClientFactory();
+    const runtime = makeRuntime({ enabled: true, connectors: [] }, factory);
+    const connector = runtime.addConnector({ ...STDIO_CONNECTOR, enabled: false });
+
+    await runtime.autoStartAfterAdd(connector.id);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // Dialling one anyway is worse than a wasted connection: the start records
+    // "wanted running" in memory while the disk says off, and every drop after
+    // that reconnects forever against the user's stated intent.
+    expect(factory.instances).toHaveLength(0);
+    expect(runtime.desiredStates.get(connector.id)).toBeUndefined();
+    expect(runtime.reconnectState.size).toBe(0);
 
     await runtime.dispose();
   });

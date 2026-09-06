@@ -138,7 +138,7 @@ describe('handleAppEvent', () => {
     expect(mockState.channelHeaderMembersText).toBe('');
     expect(mockState.channelInfoName).toBe('');
     expect(mockState.channelIsDM).toBe(false);
-    expect(mockState.thinkingLevel).toBe('auto');
+    expect(mockState.thinkingLevel).toBe('high');
     expect(mockState.activities).toEqual([]);
     expect(mockState.homeFolder).toBe('/agent-home');
     expect(mockState.workspaceFolders).toEqual(['/reference']);
@@ -281,6 +281,24 @@ describe('handleAppEvent', () => {
 
     expect(mockApplyChatLayout).toHaveBeenCalledWith({
       contentWidth: 800,
+    });
+  });
+
+  it('experiment-changed forwards the setting into the main-window browser event', async () => {
+    const { handleAppEvent } = await import('../../services/app-event-actions');
+
+    handleAppEvent('experiment-changed', {
+      id: 'session.instant_simple_compaction',
+      value: true,
+    });
+
+    expect((globalThis as any).window.dispatchEvent).toHaveBeenCalledTimes(1);
+    const event = ((globalThis as any).window.dispatchEvent as any).mock.calls[0][0] as CustomEvent;
+    expect(event.type).toBe('hana-settings');
+    expect(event.detail).toEqual({
+      type: 'experiment-changed',
+      id: 'session.instant_simple_compaction',
+      value: true,
     });
   });
 

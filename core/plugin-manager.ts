@@ -6,7 +6,7 @@ import {
   isPluginBusCapabilityError,
 } from "./plugin-route-request-context.ts";
 import { freshImport } from "./fresh-import.ts";
-import { normalizePluginConfigSchema } from "./plugin-config.ts";
+import { createPluginConfigStore, normalizePluginConfigSchema } from "./plugin-config.ts";
 import { semverGte } from "../lib/plugin-versioning.ts";
 import { detectIncompatiblePluginFormat } from "../lib/plugin-format-guard.ts";
 import { createModuleLogger } from "../lib/debug-log.ts";
@@ -952,6 +952,18 @@ export class PluginManager {
   async _loadSkillPaths(entry) {
     const skillsDir = path.join(entry.pluginDir, "skills");
     if (!hasSkillSourceEntry(skillsDir)) return;
+    // 内置插件随服务端运行时一起分发，安装目录带版本号，每次服务端自更新就整体换一个新目录、
+    // 清掉旧的。skill 的绝对路径会被冻结进会话的 system prompt 快照，于是跨过一次更新的老会话
+    // 就会拿着一条指向已删除目录的路径去读盘，模型照着死路径扑空。内置插件的指南一律走工具
+    // （参考 beautify 的 style guide 工具）：工具在每次调用时解析自己的资源，路径永远不进上下文。
+    if (entry.source === "builtin") {
+      log.warn(
+        `builtin plugin "${entry.id}" contributes a skills/ directory; skipped. ` +
+        `Builtin plugins ship inside the versioned server runtime directory, so a frozen skill path ` +
+        `breaks after the next update. Expose the guidance through a tool instead.`
+      );
+      return;
+    }
     this._skillPaths.push({
       dirPath: skillsDir,
       label: `plugin:${entry.id}`,
@@ -1069,7 +1081,7 @@ export class PluginManager {
       const request = c.env?.pluginRouteRequest || null;
       const agentId = (typeof request?.agentId === "string" && request.agentId)
         ? request.agentId
-        : (c.req.header("X-Hana-Agent-Id") || null);
+        : null;
       c.set("agentId", agentId);
       c.set("pluginRequestContext", createPluginRouteRequestContext({
         pluginCtx: ctx,
@@ -1196,6 +1208,52 @@ export class PluginManager {
       values: entry.ctx.config.getAll({ ...options, redacted: true }),
       rawValues: nextValues,
     };
+  }
+
+  _uniqueSessionConfigStores() {
+    const stores = [];
+    const seenDataDirs = new Set();
+    for (const entry of this._plugins.values()) {
+      const dataDir = pluginDataDirForEntry(this._dataDir, entry);
+      const key = path.resolve(dataDir);
+      if (seenDataDirs.has(key)) continue;
+      seenDataDirs.add(key);
+      stores.push({
+        pluginId: entry.id,
+        pluginKey: entry.pluginKey,
+        store: createPluginConfigStore({ dataDir, schema: entry.configSchema }),
+      });
+    }
+    return stores;
+  }
+
+  forkSessionConfig(options: Record<string, any> = {}) {
+    const copied = [];
+    try {
+      for (const entry of this._uniqueSessionConfigStores()) {
+        const result = entry.store.forkSession(options);
+        if (result.copied) copied.push(entry);
+      }
+    } catch (error) {
+      for (const entry of copied.reverse()) {
+        try { entry.store.discardSession({ sessionId: options.targetSessionId }); } catch {}
+      }
+      throw error;
+    }
+    return {
+      copied: copied.length,
+      plugins: copied.map((entry) => ({ pluginId: entry.pluginId, pluginKey: entry.pluginKey })),
+    };
+  }
+
+  discardSessionConfig({ sessionId }: Record<string, any> = {}) {
+    const discarded = [];
+    for (const entry of this._uniqueSessionConfigStores()) {
+      if (entry.store.discardSession({ sessionId })) {
+        discarded.push({ pluginId: entry.pluginId, pluginKey: entry.pluginKey });
+      }
+    }
+    return { discarded: discarded.length, plugins: discarded };
   }
 
   // ── Page / Widget loader ──────────────────────────────────────────────────
@@ -1487,7 +1545,8 @@ export class PluginManager {
         return entry;
       }
       // Guard: unload before re-loading to prevent duplicate tool/command/route registration
-      if (entry.status === "loaded") {
+      const wasReload = entry.status === "loaded";
+      if (wasReload) {
         await this.unloadPlugin(entry.id, { pluginKey: entry.pluginKey });
       }
       try {
@@ -1565,7 +1624,6 @@ export class PluginManager {
   async unloadPlugin(pluginId, options: any = {}) {
     const entry = this._resolvePluginEntry(pluginId, options);
     if (!entry) return;
-
     entry._loadCancelled = true;
     await this._cleanupPluginEntry(entry);
 

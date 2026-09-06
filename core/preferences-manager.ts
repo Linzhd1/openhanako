@@ -46,14 +46,39 @@ import {
   normalizeBrowserPreferences,
 } from "../shared/browser-preferences.ts";
 import { createModuleLogger } from "../lib/debug-log.ts";
+import { isValidAgentId } from "../shared/agent-id.ts";
 import { normalizeSessionThinkingLevel } from "./session-thinking-level.ts";
 
 const log = createModuleLogger("preferences");
+const RETIRED_EXPERIMENT_IDS = new Set([
+  "memory.cache_snapshot_reflection",
+]);
+
+function stripRetiredExperimentValues(prefs) {
+  const experiments = prefs?.experiments;
+  if (!experiments || typeof experiments !== "object" || Array.isArray(experiments)) {
+    return prefs;
+  }
+
+  let nextExperiments = experiments;
+  for (const id of RETIRED_EXPERIMENT_IDS) {
+    if (!Object.prototype.hasOwnProperty.call(nextExperiments, id)) continue;
+    if (nextExperiments === experiments) nextExperiments = { ...experiments };
+    delete nextExperiments[id];
+  }
+  if (nextExperiments === experiments) return prefs;
+
+  const next = { ...prefs };
+  if (Object.keys(nextExperiments).length === 0) delete next.experiments;
+  else next.experiments = nextExperiments;
+  return next;
+}
 
 export class PreferencesManager {
   declare _agentsDir: any;
   declare _cache: any;
   declare _path: any;
+  declare _sourceReadFailure: any;
   declare _userDir: any;
   /**
    * @param {object} opts
@@ -64,9 +89,29 @@ export class PreferencesManager {
     this._userDir = userDir;
     this._agentsDir = agentsDir;
     this._path = path.join(userDir, "preferences.json");
+    this._sourceReadFailure = null;
     this._cache = this._readFromDisk();
-    this._migrateLegacyDefaults();
-    this.gcWorkspaceUiState();
+    if (this._sourceReadFailure) {
+      log.warn(`automatic preference maintenance skipped because the source is unreadable: ${this._path}`);
+    } else {
+      this._runConstructorMaintenance("retired experiments", () => this._migrateRetiredExperiments());
+      this._runConstructorMaintenance("legacy defaults", () => this._migrateLegacyDefaults());
+      this._runConstructorMaintenance("workspace state gc", () => this.gcWorkspaceUiState());
+    }
+  }
+
+  _runConstructorMaintenance(label, operation) {
+    try {
+      operation();
+    } catch (err) {
+      log.warn(`automatic preference maintenance failed (${label}); startup will continue: ${err.message}`);
+    }
+  }
+
+  _migrateRetiredExperiments() {
+    const next = stripRetiredExperimentValues(this._cache);
+    if (next === this._cache) return;
+    this.savePreferences(next);
   }
 
   /**
@@ -95,9 +140,10 @@ export class PreferencesManager {
 
   /** 写入全局 preferences（更新缓存 + 原子写磁盘） */
   savePreferences(prefs) {
-    const next = this._preserveDiskSetupComplete(structuredClone(prefs));
+    const next = this._preserveDiskSetupComplete(stripRetiredExperimentValues(structuredClone(prefs)));
     fs.mkdirSync(this._userDir, { recursive: true });
     try {
+      this._preserveUnreadableSourceBeforeWrite();
       atomicWriteSync(this._path, JSON.stringify(next, null, 2) + "\n");
       this._cache = this._readFromDiskStrict();
     } catch (err) {
@@ -112,8 +158,35 @@ export class PreferencesManager {
       return this._readFromDiskStrict();
     } catch (err) {
       if (err.code === "ENOENT") return {};
+      this._sourceReadFailure = err;
       log.warn(`failed to read ${this._path}: ${err.message}`);
       return {};
+    }
+  }
+
+  /**
+   * An unreadable preferences file is still user data. Before a later,
+   * explicit write replaces it with a usable document, preserve the exact
+   * original bytes beside it. Constructor maintenance never reaches this
+   * path because it is skipped while the source is unreadable.
+   */
+  _preserveUnreadableSourceBeforeWrite() {
+    if (!this._sourceReadFailure) return;
+    try {
+      if (!fs.existsSync(this._path)) {
+        this._sourceReadFailure = null;
+        return;
+      }
+      let timestamp = Date.now();
+      let backupPath = `${this._path}.corrupt-${timestamp}`;
+      while (fs.existsSync(backupPath)) {
+        backupPath = `${this._path}.corrupt-${++timestamp}`;
+      }
+      fs.copyFileSync(this._path, backupPath, fs.constants.COPYFILE_EXCL);
+      this._sourceReadFailure = null;
+      log.warn(`preserved unreadable preferences before replacement: ${backupPath}`);
+    } catch (err) {
+      throw new Error(`cannot preserve unreadable preferences before write: ${err.message}`, { cause: err });
     }
   }
 
@@ -184,6 +257,26 @@ export class PreferencesManager {
       prefs.hardware_acceleration = !!enabled;
     }
     this.savePreferences(prefs);
+  }
+
+  /**
+   * 只消费旧版 GPU 自动安全模式写下的 `false`。
+   *
+   * 该操作由 server 在数据版本闸门通过后调用。比较当前缓存值再删除，
+   * 避免桌面启动阶段持有的旧快照覆盖用户随后作出的新选择。
+   */
+  compareAndDeleteLegacyHardwareAccelerationPreference() {
+    if (!Object.prototype.hasOwnProperty.call(this._cache, "hardware_acceleration")) {
+      return { status: "already-absent" };
+    }
+    if (this._cache.hardware_acceleration !== false) {
+      return { status: "value-changed" };
+    }
+
+    const prefs = this._mutableCopy();
+    delete prefs.hardware_acceleration;
+    this.savePreferences(prefs);
+    return { status: "deleted" };
   }
 
   /** 读取新会话默认权限模式。首次安装没有该字段时默认 auto。 */
@@ -423,6 +516,21 @@ export class PreferencesManager {
     this.savePreferences(prefs);
   }
 
+  /**
+   * 读取用户名（全局）。名字描述的是使用者本人，不属于任何一个 agent，
+   * 所以正源在这里，而不是各 agent 的 config.yaml。
+   */
+  getUserName() {
+    return this._cache.userName || "";
+  }
+
+  /** 保存用户名（全局） */
+  setUserName(name) {
+    const prefs = this._mutableCopy();
+    prefs.userName = typeof name === "string" ? name.trim() : "";
+    this.savePreferences(prefs);
+  }
+
   /** 读取编辑器排版偏好 */
   getEditor() {
     return normalizeEditorTypography(this._cache.editor);
@@ -627,6 +735,27 @@ export class PreferencesManager {
     return prefs.plugin_dev_tools.enabled;
   }
 
+  /**
+   * 读取内置/插件工具的延迟加载开关（全局，默认关闭）。
+   *
+   * 默认关闭是刻意的：内置工具是 Agent 的基本能力，把它们移出前缀会改变
+   * 每个 session 的既有行为。外部 MCP 工具默认延迟，内置工具需要显式 opt-in。
+   */
+  getBuiltinToolDeferEnabled() {
+    return this._cache.builtin_tool_defer?.enabled === true;
+  }
+
+  /** 保存内置/插件工具的延迟加载开关 */
+  setBuiltinToolDeferEnabled(value) {
+    const prefs = this._mutableCopy();
+    prefs.builtin_tool_defer = {
+      ...(prefs.builtin_tool_defer || {}),
+      enabled: value === true,
+    };
+    this.savePreferences(prefs);
+    return prefs.builtin_tool_defer.enabled;
+  }
+
   /** 读取用户手动禁用的插件 ID 列表 */
   getDisabledPlugins() {
     return this._cache.disabled_plugins || [];
@@ -806,6 +935,7 @@ export class PreferencesManager {
       const entries = fs.readdirSync(this._agentsDir, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
+        if (!isValidAgentId(entry.name)) continue;
         if (fs.existsSync(path.join(this._agentsDir, entry.name, "config.yaml"))) {
           return entry.name;
         }

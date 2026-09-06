@@ -49,13 +49,13 @@ describe("AgentToolsSection", () => {
         disabled={[]}
       />
     );
-    expect(container.querySelectorAll("[data-tool-name]")).toHaveLength(8);
+    expect(container.querySelectorAll("[data-tool-name]")).toHaveLength(7);
     expect(getRow(container, "automation")).toBeTruthy();
     expect(getRow(container, "beautify")).toBeTruthy();
     expect(getRow(container, "browser")).toBeTruthy();
     expect(getRow(container, "computer")).toBeNull();
     expect(getRow(container, "cron")).toBeNull();
-    expect(getRow(container, "dm")).toBeTruthy();
+    expect(getRow(container, "dm")).toBeNull();
     expect(getRow(container, "install_skill")).toBeTruthy();
     expect(getRow(container, "office")).toBeTruthy();
     expect(getRow(container, "update_settings")).toBeTruthy();
@@ -76,10 +76,11 @@ describe("AgentToolsSection", () => {
     expect(getRow(container, "browser")).toBeTruthy();
     expect(getRow(container, "computer")).toBeNull();
     expect(getRow(container, "office")).toBeTruthy();
+    expect(getRow(container, "session")).toBeTruthy();
     expect(getRow(container, "workflow")).toBeTruthy();
   });
 
-  it("hides dm row when dm is not in availableTools (single agent env)", () => {
+  it("never renders the retired dm row", () => {
     const { container } = render(
       <AgentToolsSection
         availableTools={["beautify", "browser", "computer", "cron", "install_skill", "office", "update_settings", "read"]}

@@ -13,59 +13,28 @@ import path from "path";
 import { createHeartbeat } from "../lib/desk/heartbeat.ts";
 import { createCronScheduler } from "../lib/desk/cron-scheduler.ts";
 import { getAutomationExecutor } from "../lib/desk/automation-executors.ts";
-import { getLocale } from "../lib/i18n.ts";
+import {
+  automationExecutionScopeKey,
+  normalizeAutomationExecutionContext,
+} from "../lib/desk/automation-execution-context.ts";
+import { getLocale, t } from "../lib/i18n.ts";
 import { createFreshCompactDailyScheduler } from "../lib/fresh-compact/daily-scheduler.ts";
 import { FreshCompactMaintainer } from "./fresh-compact-maintainer.ts";
 import { createModuleLogger } from "../lib/debug-log.ts";
 import { WORKSPACE_OUTPUT_ROOT_DIRNAME } from "../shared/workspace-output.ts";
+import { sessionLocatorKey } from "../core/session-manifest/path-normalizer.ts";
 
 const log = createModuleLogger("scheduler");
 const freshCompactLog = createModuleLogger("fresh-compact");
 
-function normalizeCronExecutionContext(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {
-      kind: "missing",
-      cwd: null,
-      workspaceFolders: [],
-      sourceSessionPath: null,
-    };
-  }
-  return {
-    kind: typeof value.kind === "string" && value.kind.trim() ? value.kind.trim() : "session_workspace",
-    cwd: typeof value.cwd === "string" && value.cwd.trim() ? value.cwd : null,
-    workspaceFolders: Array.isArray(value.workspaceFolders)
-      ? value.workspaceFolders.filter(p => typeof p === "string" && p.trim())
-      : [],
-    sourceSessionPath: typeof value.sourceSessionPath === "string" && value.sourceSessionPath.trim()
-      ? value.sourceSessionPath
-      : null,
-    notificationContext: normalizeNotificationContext(value.notificationContext),
-  };
-}
-
-function normalizeNotificationContext(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const target = normalizeBridgeDeliveryTarget(value.bridgeDeliveryTarget || value.deliveryTarget);
-  return target ? { bridgeDeliveryTarget: target } : null;
-}
-
-function normalizeBridgeDeliveryTarget(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (value.kind && value.kind !== "bridge") return null;
-  const platform = typeof value.platform === "string" && value.platform.trim() ? value.platform.trim() : null;
-  const chatId = typeof value.chatId === "string" && value.chatId.trim() ? value.chatId.trim() : null;
-  const sessionKey = typeof value.sessionKey === "string" && value.sessionKey.trim() ? value.sessionKey.trim() : null;
-  if (!platform || (!chatId && !sessionKey)) return null;
-  const agentId = typeof value.agentId === "string" && value.agentId.trim() ? value.agentId.trim() : null;
-  return {
-    kind: "bridge",
-    platform,
-    chatType: "dm",
-    ...(chatId ? { chatId } : {}),
-    ...(sessionKey ? { sessionKey } : {}),
-    ...(agentId ? { agentId } : {}),
-  };
+function scopedCronJobKey(job) {
+  const studioId = typeof job?.studioId === "string" && job.studioId.trim()
+    ? job.studioId.trim()
+    : "missing-studio";
+  const jobId = typeof job?.id === "string" && job.id.trim()
+    ? job.id.trim()
+    : "missing-job";
+  return `${studioId}\u0000${jobId}`;
 }
 
 export class Scheduler {
@@ -83,7 +52,7 @@ export class Scheduler {
     this._hub = hub;
     this._heartbeats = new Map(); // agentId → heartbeat instance
     this._cronScheduler = null; // Studio CronScheduler
-    this._executingJobs = new Map(); // jobId → AbortController（per-job 锁 + abort 控制）
+    this._executingJobs = new Map(); // Studio + jobId → AbortController（per-job 锁 + abort 控制）
     this._freshCompactMaintainer = new FreshCompactMaintainer({ hub });
     this._freshCompactScheduler = createFreshCompactDailyScheduler({
       runDaily: (opts) => this._freshCompactMaintainer.runDaily(opts),
@@ -230,14 +199,16 @@ export class Scheduler {
     const sched = createCronScheduler({
       cronStore,
       executeJob: (job) => this._executeCronJob(job),
-      abortJob: (jobId) => {
-        const ac = this._executingJobs.get(jobId);
-        if (ac) { ac.abort(); log.log(`cron abort ${jobId} (timeout)`); }
+      abortJob: (job) => {
+        const key = scopedCronJobKey(job);
+        const ac = this._executingJobs.get(key);
+        if (ac) { ac.abort(); log.log(`cron abort ${job.studioId}/${job.id} (timeout)`); }
       },
       onJobDone: (job, result) => {
         this._hub.eventBus.emit(
           {
             type: "cron_job_done",
+            studioId: job.studioId,
             jobId: job.id,
             label: job.label,
             agentId: job.actorAgentId,
@@ -260,9 +231,28 @@ export class Scheduler {
     if (executor.kind !== "agent_session") {
       throw new Error(`unsupported automation executor: ${executor.kind}`);
     }
-    const actorAgentId = executor.agentId || job.actorAgentId || job.legacyRef?.agentId || null;
+    const actorAgentId = typeof job.actorAgentId === "string" && job.actorAgentId.trim()
+      ? job.actorAgentId.trim()
+      : null;
     if (!actorAgentId) {
       throw new Error(`cron job ${job.id} missing actorAgentId`);
+    }
+    if (executor.agentId !== actorAgentId) {
+      throw new Error(`cron job ${job.id} executor does not match actorAgentId`);
+    }
+    if (!this._engine.getAgent?.(actorAgentId) || this._engine.isAgentDeleted?.(actorAgentId) === true) {
+      throw new Error(`cron job ${job.id} actor is unavailable`);
+    }
+    if (
+      !job.executionContext
+      || job.executionContext.createdByAgentId !== actorAgentId
+      || (
+        executor.executionContext
+        && automationExecutionScopeKey(executor.executionContext)
+          !== automationExecutionScopeKey(job.executionContext)
+      )
+    ) {
+      throw new Error(`cron job ${job.id} execution context does not match its actor`);
     }
     await this._executeCronJobForAgent(actorAgentId, job, executor);
     return { executorKind: "agent_session" };
@@ -274,14 +264,15 @@ export class Scheduler {
    */
   async _executeCronJobForAgent(agentId, job, executor = getAutomationExecutor(job)) {
     // per-job 锁：同一 job 不并发，但同一 agent 的不同 job 可以并行
-    if (this._executingJobs.has(job.id)) {
-      log.log(`cron 跳过 ${job.id}：上一次仍在执行`);
-      const err = new Error(`cron job ${job.id} 仍在执行，跳过`);
+    const executionKey = scopedCronJobKey(job);
+    if (this._executingJobs.has(executionKey)) {
+      log.log(`cron 跳过 ${job.studioId}/${job.id}：上一次仍在执行`);
+      const err = new Error(`cron job ${job.studioId}/${job.id} 仍在执行，跳过`);
       (err as any).skipped = true;
       throw err;
     }
     const ac = new AbortController();
-    this._executingJobs.set(job.id, ac);
+    this._executingJobs.set(executionKey, ac);
     try {
       const isZh = getLocale().startsWith("zh");
       const promptBody = executor.prompt || job.prompt || "";
@@ -309,20 +300,129 @@ export class Scheduler {
         ...this._cronExecutionOptions(job, executor),
       });
     } finally {
-      this._executingJobs.delete(job.id);
+      this._executingJobs.delete(executionKey);
     }
   }
 
+  _resolveCronExecutionScope(job, ctx, actorAgentId) {
+    const sourceSessionId = typeof ctx.sourceSessionId === "string" && ctx.sourceSessionId.trim()
+      ? ctx.sourceSessionId.trim()
+      : null;
+    if (!sourceSessionId) {
+      const actorHome = this._engine.getHomeCwd?.(actorAgentId) || null;
+      return {
+        sessionId: null,
+        sessionPath: null,
+        cwd: actorHome,
+        workspaceFolders: actorHome ? [actorHome] : [],
+        authorizedFolders: [],
+      };
+    }
+    const manifest = this._engine.getSessionManifest?.(sourceSessionId) || null;
+    const currentPath = manifest?.currentLocator?.path || null;
+    let locatorIsValid = false;
+    try {
+      locatorIsValid = manifest?.currentLocator?.type === "jsonl"
+        && fs.statSync(currentPath).isFile()
+        && sessionLocatorKey(currentPath) === manifest.currentLocator.key;
+    } catch {
+      locatorIsValid = false;
+    }
+    if (
+      !manifest
+      || manifest.lifecycle === "deleted"
+      || manifest.health !== "ok"
+      || !currentPath
+      || !locatorIsValid
+      || manifest.ownerAgentId !== actorAgentId
+      || this._engine.getSessionIdForPath?.(currentPath) !== sourceSessionId
+    ) {
+      throw new Error(`cron job ${job.id} source session is unavailable or no longer belongs to its actor`);
+    }
+    const folderScope = this._engine.getSessionFolderScope?.(currentPath) || null;
+    return {
+      sessionId: sourceSessionId,
+      sessionPath: currentPath,
+      cwd: folderScope?.cwd ?? null,
+      workspaceFolders: Array.isArray(folderScope?.workspaceFolders)
+        ? folderScope.workspaceFolders
+        : [],
+      authorizedFolders: Array.isArray(folderScope?.authorizedFolders)
+        ? folderScope.authorizedFolders
+        : [],
+    };
+  }
+
   _cronExecutionOptions(job, executor = getAutomationExecutor(job)) {
-    const ctx = normalizeCronExecutionContext(executor.executionContext || job.executionContext);
+    const actorAgentId = job.actorAgentId;
+    const ctx = normalizeAutomationExecutionContext(
+      job.executionContext,
+      { actorAgentId },
+    );
+    const executionScope = this._resolveCronExecutionScope(job, ctx, actorAgentId);
+    const effectiveContext = {
+      ...ctx,
+      cwd: executionScope.cwd,
+      workspaceFolders: executionScope.workspaceFolders,
+      authorizedFolders: executionScope.authorizedFolders,
+      sourceSessionId: executionScope.sessionId,
+      sourceSessionPath: executionScope.sessionPath,
+    };
     const opts: any = {};
-    if (ctx.cwd) opts.cwd = ctx.cwd;
-    opts.workspaceFolders = ctx.workspaceFolders;
-    if (ctx.sourceSessionPath) opts.parentSessionPath = ctx.sourceSessionPath;
+    if (executionScope.cwd) opts.cwd = executionScope.cwd;
+    opts.workspaceFolders = executionScope.workspaceFolders;
+    opts.authorizedFolders = executionScope.authorizedFolders;
+    if (executionScope.sessionId) opts.parentSessionId = executionScope.sessionId;
+    if (executionScope.sessionPath) opts.parentSessionPath = executionScope.sessionPath;
     if (ctx.notificationContext) opts.notificationContext = ctx.notificationContext;
-    opts.permissionMode = executor.permissionMode || job.permissionMode || this._engine.getAutomationPermissionMode?.() || "auto";
+    opts.permissionMode = this._engine.getAutomationPermissionMode?.() || "auto";
+    opts.approvalPolicy = "deny_on_prompt";
     opts.allowHumanApproval = false;
+    opts.permissionContext = {
+      surface: "automation",
+      automationJob: {
+        studioId: job.studioId,
+        id: job.id,
+        actorAgentId,
+        configRevision: job.configRevision,
+        executionScopeKey: automationExecutionScopeKey(effectiveContext),
+      },
+    };
     return opts;
+  }
+
+  async _deliverActivityCompletionNotification({ entry, sessionPath }) {
+    if (entry.type !== "cron" && entry.type !== "heartbeat") return;
+    const engine = this._engine;
+    const preferenceKey = entry.type === "cron" ? "scheduledTaskCompletion" : "patrolCompletion";
+    const mode = engine.getNotificationPreferences?.()?.[preferenceKey];
+    if (mode !== "when_unfocused" && mode !== "always") return;
+    if (typeof engine.deliverNotification !== "function") return;
+
+    const bodyKey = entry.type === "cron"
+      ? (entry.status === "error"
+          ? "notification.scheduledTaskCompletionFailedBody"
+          : "notification.scheduledTaskCompletionBody")
+      : (entry.status === "error"
+          ? "notification.patrolCompletionFailedBody"
+          : "notification.patrolCompletionBody");
+    const completionIdentity = typeof sessionPath === "string" && sessionPath
+      ? sessionPath
+      : entry.id;
+    try {
+      await engine.deliverNotification({
+        title: entry.agentName || "HanaAgent",
+        body: t(bodyKey, { label: entry.label || entry.summary }),
+        channels: ["desktop"],
+        desktopFocusPolicy: mode,
+        ...(typeof sessionPath === "string" && sessionPath ? { sessionPath } : {}),
+        idempotencyKey: `activity-completion:${entry.type}:${entry.agentId}:${completionIdentity}`,
+      }, {
+        agentId: entry.agentId,
+      });
+    } catch (error) {
+      log.warn(`${entry.type} completion notification failed: ${error?.message || error}`);
+    }
   }
 
   /**
@@ -341,13 +441,31 @@ export class Scheduler {
 
     // 所有 agent 统一走 executeIsolated（支持 agentId + signal 参数）
     const { signal, ...restOpts } = opts;
-    const result = await engine.executeIsolated(prompt, {
-      agentId,
-      persist: activityDir,
-      signal,
-      activityType: type,
-      ...restOpts,
-    });
+    let result;
+    try {
+      result = await engine.executeIsolated(prompt, {
+        agentId,
+        persist: activityDir,
+        signal,
+        activityType: type,
+        ...restOpts,
+      });
+    } catch (error) {
+      const ag = engine.getAgent(agentId);
+      await this._deliverActivityCompletionNotification({
+        entry: {
+          id,
+          type,
+          label: label || null,
+          agentId,
+          agentName: ag?.agentName || agentId,
+          summary: label || (type === "heartbeat" ? "patrol" : "scheduled task"),
+          status: "error",
+        },
+        sessionPath: null,
+      });
+      throw error;
+    }
     const { sessionPath, error } = result;
 
     const finishedAt = Date.now();
@@ -391,6 +509,8 @@ export class Scheduler {
 
     // WS 广播
     this._hub.eventBus.emit({ type: "activity_update", activity: entry }, null);
+
+    await this._deliverActivityCompletionNotification({ entry, sessionPath });
 
     if (failed) {
       const isZhR = getLocale().startsWith("zh");

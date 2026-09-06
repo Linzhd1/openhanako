@@ -95,7 +95,7 @@ export function ChannelCreateOverlay() {
       setVisible(false);
     } catch (err: any) {
       const msg = String(err?.message || err || '');
-      if (msg.includes('已存在') || msg.includes('409')) {
+      if (msg.includes('409') || msg.toLowerCase().includes('already exists') || msg.includes('已存在')) {
         setNameError(true);
         setSubmitError(t('channel.nameExists'));
         nameRef.current?.focus();
@@ -112,6 +112,7 @@ export function ChannelCreateOverlay() {
 
   return (
     <Overlay
+      scope="window"
       open={visible}
       onClose={handleCancel}
       backdrop="blur"
@@ -131,6 +132,7 @@ export function ChannelCreateOverlay() {
           value={name}
           onChange={(e) => { setName(e.target.value); setNameError(false); setSubmitError(''); }}
           style={nameError ? { outline: '1.5px solid var(--danger, #c44)' } : undefined}
+          spellCheck={false}
         />
       </div>
       <div className={styles.createField}>
@@ -170,6 +172,7 @@ export function ChannelCreateOverlay() {
           style={{ resize: 'vertical', minHeight: '2.4rem' }}
           value={intro}
           onChange={(e) => setIntro(e.target.value)}
+          spellCheck={false}
         />
       </div>
       {submitError && submitError !== memberHelper ? (

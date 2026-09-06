@@ -4,24 +4,38 @@
  * 官方协议边界：
  * - Stream 注册：POST https://api.dingtalk.com/v1.0/gateway/connections/open
  * - Bot 回调 topic：/v1.0/im/bot/messages/get
- * - 内部应用 accessToken：POST https://api.dingtalk.io/v1.0/oauth2/accessToken
- * - 单聊发送：POST https://api.dingtalk.io/v1.0/robot/oToMessages/batchSend
- * - 群聊发送：POST https://api.dingtalk.io/v1.0/robot/groupMessages/send
+ * - 当前应用 accessToken：POST https://api.dingtalk.com/v1.0/oauth2/{corpId}/token
+ * - 旧应用 accessToken：POST https://api.dingtalk.io/v1.0/oauth2/accessToken
+ * - 单聊发送：POST https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend
+ * - 群聊发送：POST https://api.dingtalk.com/v1.0/robot/groupMessages/send
  */
 
 import WebSocket from "ws";
 import { createModuleLogger, debugLog } from "../debug-log.ts";
 import { webSocketOptionsForUrl } from "../net/outbound-proxy.ts";
+import { formatSecretFingerprintComparison, redactSecretsFromText } from "../secret-fingerprint.ts";
 import { createBridgeOutboundHttp } from "./outbound-http.ts";
 import { createStreamingCapabilities } from "./streaming-capabilities.ts";
+import {
+  DINGTALK_BOT_CALLBACK_TOPIC,
+  DINGTALK_DM_SEND_PATH,
+  DINGTALK_DM_SEND_URL,
+  DINGTALK_GROUP_SEND_PATH,
+  DINGTALK_GROUP_SEND_URL,
+  DINGTALK_STREAM_OPEN_URL,
+  buildDingTalkUrl,
+  normalizeDingTalkBridgeCredentials,
+} from "./dingtalk-contract.ts";
+import { requestDingTalkAccessToken } from "./dingtalk-api.ts";
 
 const log = createModuleLogger("dingtalk");
 
-export const DINGTALK_BOT_CALLBACK_TOPIC = "/v1.0/im/bot/messages/get";
-export const DINGTALK_STREAM_OPEN_URL = "https://api.dingtalk.com/v1.0/gateway/connections/open";
-export const DINGTALK_ACCESS_TOKEN_URL = "https://api.dingtalk.io/v1.0/oauth2/accessToken";
-export const DINGTALK_DM_SEND_URL = "https://api.dingtalk.io/v1.0/robot/oToMessages/batchSend";
-export const DINGTALK_GROUP_SEND_URL = "https://api.dingtalk.io/v1.0/robot/groupMessages/send";
+export {
+  DINGTALK_BOT_CALLBACK_TOPIC,
+  DINGTALK_DM_SEND_URL,
+  DINGTALK_GROUP_SEND_URL,
+  DINGTALK_STREAM_OPEN_URL,
+};
 
 const MAX_MSG_SIZE = 100_000;
 const MAX_OUTBOUND_TEXT_BYTES = 12_000;
@@ -76,16 +90,20 @@ async function responseJsonOrText(res: any) {
   }
 }
 
-function dingTalkApiError(stage: string, data: any, status?: number) {
-  const code = data?.code ?? data?.errcode ?? data?.errorCode ?? status ?? "unknown";
-  const message = data?.message || data?.errmsg || data?.msg || data?.errorMessage || data?.error || JSON.stringify(data);
+function dingTalkApiError(stage: string, data: any, status?: number, secrets: unknown[] = []) {
+  const rawCode = data?.code ?? data?.errcode ?? data?.errorCode ?? status ?? "unknown";
+  const code = typeof rawCode === "number" ? rawCode : redactSecretsFromText(rawCode, secrets);
+  const message = redactSecretsFromText(
+    data?.message || data?.errmsg || data?.msg || data?.errorMessage || data?.error || "request failed",
+    secrets,
+  );
   return new Error(`[dingtalk:${stage}] ${message || "request failed"} (code=${code})`);
 }
 
-function validateDingTalkApiResponse(stage: string, res: any, data: any) {
+function validateDingTalkApiResponse(stage: string, res: any, data: any, secrets: unknown[] = []) {
   const code = data?.code ?? data?.errcode ?? data?.errorCode;
-  if (!res?.ok) throw dingTalkApiError(stage, data, res?.status);
-  if (code !== undefined && code !== 0 && code !== "0") throw dingTalkApiError(stage, data, res?.status);
+  if (!res?.ok) throw dingTalkApiError(stage, data, res?.status, secrets);
+  if (code !== undefined && code !== 0 && code !== "0") throw dingTalkApiError(stage, data, res?.status, secrets);
 }
 
 function appendTicket(endpoint: string, ticket: string) {
@@ -148,7 +166,22 @@ function unsupportedMessageNotice(payload: Record<string, any>) {
   return `钉钉消息类型 ${msgtype} 暂未接入文本内容，请在钉钉中改发文字。`;
 }
 
-function normalizeDingTalkInboundMessage(payload: Record<string, any>, agentId: string) {
+function resolveDingTalkProfile(payload: Record<string, any>, previous: Record<string, any> = {}) {
+  const displayName = cleanString(payload.senderNick)
+    || cleanString(payload.senderName)
+    || cleanString(payload.senderStaffName)
+    || cleanString(payload.sender?.nick)
+    || cleanString(payload.sender?.name)
+    || cleanString(previous.displayName);
+  const avatarUrl = cleanString(payload.senderAvatar)
+    || cleanString(payload.senderAvatarUrl)
+    || cleanString(payload.sender?.avatar)
+    || cleanString(payload.sender?.avatarUrl)
+    || cleanString(previous.avatarUrl);
+  return { displayName, avatarUrl };
+}
+
+function normalizeDingTalkInboundMessage(payload: Record<string, any>, agentId: string, profileCache: Map<string, any>) {
   const conversationId = cleanString(payload.conversationId);
   const userId = cleanString(payload.senderStaffId)
     || cleanString(payload.senderId)
@@ -168,6 +201,9 @@ function normalizeDingTalkInboundMessage(payload: Record<string, any>, agentId: 
   const sessionKey = isGroup
     ? `dt_group_${chatId}@${agentId}`
     : `dt_dm_${userId}@${agentId}`;
+  const previousProfile = profileCache.get(userId) || {};
+  const profile = resolveDingTalkProfile(payload, previousProfile);
+  profileCache.set(userId, profile);
 
   return {
     platform: "dingtalk",
@@ -176,7 +212,10 @@ function normalizeDingTalkInboundMessage(payload: Record<string, any>, agentId: 
     userId,
     sessionKey,
     text,
-    senderName: cleanString(payload.senderNick) || "DingTalk User",
+    senderName: profile.displayName || "DingTalk User",
+    displayName: profile.displayName || undefined,
+    avatarUrl: profile.avatarUrl || undefined,
+    principalId: userId,
     isGroup,
     _msgId: cleanString(payload.msgId) || cleanString(payload.messageId) || null,
   };
@@ -184,9 +223,13 @@ function normalizeDingTalkInboundMessage(payload: Record<string, any>, agentId: 
 
 /**
  * @param {object} opts
- * @param {string} opts.clientId - 钉钉企业内部应用 AppKey / clientId
- * @param {string} opts.clientSecret - 钉钉企业内部应用 AppSecret / clientSecret
+ * @param {"legacy_app"} [opts.authMode] - stable 升级配置的显式旧鉴权标记
+ * @param {string} opts.corpId - 钉钉组织 ID
+ * @param {string} opts.clientId - 钉钉应用 Client ID
+ * @param {string} opts.clientSecret - 钉钉应用 Client Secret
  * @param {string} opts.robotCode - 机器人编码
+ * @param {string} [opts.apiBaseUrl] - 钉钉 OpenAPI base URL
+ * @param {string} [opts.streamOpenUrl] - 钉钉 Stream 连接注册 endpoint
  * @param {string} opts.agentId
  * @param {(msg: object) => void} opts.onMessage
  * @param {(status: string, error?: string) => void} [opts.onStatus]
@@ -194,62 +237,104 @@ function normalizeDingTalkInboundMessage(payload: Record<string, any>, agentId: 
  * @param {typeof WebSocket} [opts.WebSocketImpl]
  */
 export function createDingTalkAdapter({
+  authMode,
+  corpId,
+  appKey,
+  appSecret,
   clientId,
   clientSecret,
   robotCode,
+  apiBaseUrl,
+  restBaseUrl,
+  streamOpenUrl,
   agentId,
   onMessage,
   onStatus,
   fetchImpl,
   WebSocketImpl = WebSocket,
   reconnectDelayMs = DEFAULT_RECONNECT_DELAY_MS,
+  ...extraConfig
 }: {
-  clientId: string;
-  clientSecret: string;
+  authMode?: "legacy_app";
+  corpId?: string;
+  appKey?: string;
+  appSecret?: string;
+  clientId?: string;
+  clientSecret?: string;
   robotCode: string;
+  apiBaseUrl?: string;
+  restBaseUrl?: string;
+  streamOpenUrl?: string;
   agentId: string;
   onMessage: (msg: Record<string, any>) => void;
   onStatus?: (status: string, error?: string) => void;
   fetchImpl?: any;
   WebSocketImpl?: any;
   reconnectDelayMs?: number;
+  [key: string]: any;
 }) {
+  const contract = normalizeDingTalkBridgeCredentials({
+    ...extraConfig,
+    authMode,
+    corpId,
+    appKey,
+    appSecret,
+    clientId,
+    clientSecret,
+    robotCode,
+    apiBaseUrl,
+    restBaseUrl,
+    streamOpenUrl,
+  });
   const http = createBridgeOutboundHttp({ platform: "dingtalk", fetchImpl });
   let accessToken: string | null = null;
   let tokenExpiresAt = 0;
   let ws: any = null;
+  let streamConnected = false;
+  let outboundError: string | null = null;
   let stopped = false;
   let reconnectTimer: any = null;
+  const profileCache = new Map<string, any>();
 
   async function getAccessToken() {
     if (accessToken && Date.now() < tokenExpiresAt - TOKEN_EXPIRY_SKEW_MS) return accessToken;
-    const res = await http.request({
-      stage: "token",
-      url: DINGTALK_ACCESS_TOKEN_URL,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ appKey: clientId, appSecret: clientSecret }),
-      idempotent: true,
-    });
-    const data = await responseJsonOrText(res);
-    validateDingTalkApiResponse("token", res, data);
-    const token = data?.accessToken || data?.access_token;
-    if (!token) throw dingTalkApiError("token", data, res?.status);
-    const expiresIn = Number(data?.expireIn || data?.expiresIn || data?.expires_in || 7200);
-    accessToken = String(token);
-    tokenExpiresAt = Date.now() + Math.max(60, expiresIn) * 1000;
+    const result = await requestDingTalkAccessToken(
+      contract,
+      (request) => http.request({
+        stage: "token",
+        url: request.url,
+        ...request.init,
+        idempotent: true,
+      }),
+      (request) => {
+        debugLog()?.log(
+          "bridge",
+          `[dingtalk] ${formatSecretFingerprintComparison({
+            stage: "runtime_token",
+            beforeLabel: "normalized",
+            before: contract.clientSecret,
+            afterLabel: "outbound",
+            after: "client_secret" in request.payload
+              ? request.payload.client_secret
+              : request.payload.appSecret,
+          })}`,
+        );
+      },
+    );
+    accessToken = result.token;
+    tokenExpiresAt = Date.now() + result.expiresIn * 1000;
     return accessToken;
   }
 
   async function openStreamRegistration() {
     const res = await http.request({
       stage: "stream_open",
-      url: DINGTALK_STREAM_OPEN_URL,
+      url: contract.streamOpenUrl,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        clientId,
-        clientSecret,
+        clientId: contract.clientId,
+        clientSecret: contract.clientSecret,
         subscriptions: [
           { topic: DINGTALK_BOT_CALLBACK_TOPIC, type: "CALLBACK" },
         ],
@@ -258,10 +343,10 @@ export function createDingTalkAdapter({
       idempotent: true,
     });
     const data = await responseJsonOrText(res);
-    validateDingTalkApiResponse("stream_open", res, data);
+    validateDingTalkApiResponse("stream_open", res, data, [contract.clientSecret]);
     const endpoint = cleanString(data?.endpoint);
     const ticket = cleanString(data?.ticket);
-    if (!endpoint || !ticket) throw dingTalkApiError("stream_open", data, res?.status);
+    if (!endpoint || !ticket) throw dingTalkApiError("stream_open", data, res?.status, [contract.clientSecret]);
     return { endpoint, ticket };
   }
 
@@ -295,9 +380,9 @@ export function createDingTalkAdapter({
     acknowledge(envelope);
     const payload = safeJsonParse(envelope.data);
     if (!payload || typeof payload !== "object") return;
-    if (payload.robotCode && robotCode && payload.robotCode !== robotCode) return;
+    if (payload.robotCode && contract.robotCode && payload.robotCode !== contract.robotCode) return;
 
-    const normalized = normalizeDingTalkInboundMessage(payload, agentId);
+    const normalized = normalizeDingTalkInboundMessage(payload, agentId, profileCache);
     if (!normalized) return;
     try {
       onMessage(normalized);
@@ -325,28 +410,43 @@ export function createDingTalkAdapter({
   async function connect() {
     if (stopped) return;
     clearReconnectTimer();
+    let streamTicket = "";
+    let streamUrl = "";
     try {
       const { endpoint, ticket } = await openStreamRegistration();
+      streamTicket = ticket;
       if (stopped) return;
       const url = appendTicket(endpoint, ticket);
+      streamUrl = url;
       ws = new WebSocketImpl(url, webSocketOptionsForUrl(url));
       ws.on("open", () => {
+        streamConnected = true;
         log.log("stream connected");
-        onStatus?.("connected");
+        if (outboundError) onStatus?.("error", outboundError);
+        else onStatus?.("connected");
       });
       ws.on("message", handleStreamMessage);
       ws.on("error", (err: any) => {
-        const message = err?.message || String(err);
+        streamConnected = false;
+        const message = redactSecretsFromText(
+          err?.message || String(err),
+          [contract.clientSecret, streamTicket, streamUrl],
+        );
         log.error(`stream error: ${message}`);
         onStatus?.("error", message);
       });
       ws.on("close", () => {
+        streamConnected = false;
         if (stopped) return;
         log.warn("stream closed, reconnecting");
         scheduleReconnect("stream closed");
       });
     } catch (err: any) {
-      const message = err?.message || String(err);
+      streamConnected = false;
+      const message = redactSecretsFromText(
+        err?.message || String(err),
+        [contract.clientSecret, streamTicket, streamUrl],
+      );
       log.error(`connect failed: ${message}`);
       onStatus?.("error", message);
       scheduleReconnect(message);
@@ -354,21 +454,36 @@ export function createDingTalkAdapter({
   }
 
   async function requestRobotApi(stage: string, url: string, body: Record<string, any>) {
-    const token = await getAccessToken();
-    const res = await http.request({
-      stage,
-      url,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-acs-dingtalk-access-token": token,
-      },
-      body: JSON.stringify(body),
-      idempotent: false,
-    });
-    const data = await responseJsonOrText(res);
-    validateDingTalkApiResponse(stage, res, data);
-    return data;
+    let token: string | null = null;
+    try {
+      token = await getAccessToken();
+      const res = await http.request({
+        stage,
+        url,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-acs-dingtalk-access-token": token,
+        },
+        body: JSON.stringify(body),
+        idempotent: false,
+      });
+      const data = await responseJsonOrText(res);
+      validateDingTalkApiResponse(stage, res, data, [contract.clientSecret, token]);
+      const shouldRestoreConnected = outboundError !== null && streamConnected;
+      outboundError = null;
+      if (shouldRestoreConnected) onStatus?.("connected");
+      return data;
+    } catch (err: any) {
+      const message = redactSecretsFromText(
+        err?.message || String(err),
+        [contract.clientSecret, token, accessToken],
+      );
+      outboundError = message;
+      onStatus?.("error", message);
+      if (err instanceof Error && err.message === message) throw err;
+      throw new Error(message);
+    }
   }
 
   void connect();
@@ -384,15 +499,15 @@ export function createDingTalkAdapter({
       for (let i = 0; i < chunks.length; i += 1) {
         const msgParam = markdownPayload(chunks[i], i, chunks.length);
         if (scope === "group") {
-          results.push(await requestRobotApi("send_group", DINGTALK_GROUP_SEND_URL, {
-            robotCode,
+          results.push(await requestRobotApi("send_group", buildDingTalkUrl(contract.apiBaseUrl, DINGTALK_GROUP_SEND_PATH), {
+            robotCode: contract.robotCode,
             openConversationId: String(chatId),
             msgKey: "sampleMarkdown",
             msgParam,
           }));
         } else {
-          results.push(await requestRobotApi("send_dm", DINGTALK_DM_SEND_URL, {
-            robotCode,
+          results.push(await requestRobotApi("send_dm", buildDingTalkUrl(contract.apiBaseUrl, DINGTALK_DM_SEND_PATH), {
+            robotCode: contract.robotCode,
             userIds: [String(chatId)],
             msgKey: "sampleMarkdown",
             msgParam,
@@ -404,6 +519,7 @@ export function createDingTalkAdapter({
 
     stop() {
       stopped = true;
+      streamConnected = false;
       clearReconnectTimer();
       const current = ws;
       ws = null;

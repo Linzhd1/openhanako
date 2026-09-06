@@ -7,6 +7,7 @@ import {
   CACHE_SNAPSHOT_EXPERIMENT_ID,
   COMPACTION_MODE_EXPERIMENT_ID,
   DEEPSEEK_ROLEPLAY_REASONING_PATCH_EXPERIMENT_ID,
+  INSTANT_SIMPLE_COMPACTION_EXPERIMENT_ID,
 } from "../lib/experiments/registry.ts";
 import {
   readCacheSnapshotObservation,
@@ -19,6 +20,7 @@ function makeEngine() {
   const prefsState: any = {};
   return {
     root,
+    prefsState,
     engine: {
       agentsDir,
       preferences: {
@@ -45,18 +47,25 @@ describe("experiments route", () => {
 
     expect(status).toBe(200);
     const entry = body.experiments.find((item) => item.id === CACHE_SNAPSHOT_EXPERIMENT_ID);
-    expect(entry.value).toBe("off");
-    expect(entry.valueSchema.presentation.type).toBe("paired_toggles");
+    expect(entry).toBeUndefined();
     const compactionEntry = body.experiments.find((item) => item.id === COMPACTION_MODE_EXPERIMENT_ID);
     expect(compactionEntry.value).toBe("auto");
     expect(compactionEntry.valueSchema.presentation.type).toBe("select");
+    expect(compactionEntry.valueSchema.options.map((option) => option.value)).toEqual([
+      "auto",
+      "cache_preserving",
+      "pi_compatible",
+    ]);
+    const instantEntry = body.experiments.find((item) => item.id === INSTANT_SIMPLE_COMPACTION_EXPERIMENT_ID);
+    expect(instantEntry.value).toBe(false);
+    expect(instantEntry.valueSchema.presentation.type).toBe("toggle");
     const deepseekEntry = body.experiments.find((item) => item.id === DEEPSEEK_ROLEPLAY_REASONING_PATCH_EXPERIMENT_ID);
     expect(deepseekEntry.value).toBe(false);
     expect(deepseekEntry.valueSchema.presentation.type).toBe("toggle");
   });
 
-  it("updates known experiment ids and rejects unknown ids", async () => {
-    const { engine } = makeEngine();
+  it("updates known active experiment ids, hard-disables retired ids, and rejects unknown ids", async () => {
+    const { engine, prefsState } = makeEngine();
     const route = createExperimentsRoute(engine);
 
     const ok = await routeFetch(route, `/experiments/${encodeURIComponent(CACHE_SNAPSHOT_EXPERIMENT_ID)}`, {
@@ -65,7 +74,8 @@ describe("experiments route", () => {
       body: JSON.stringify({ value: "shadow" }),
     });
     expect(ok.status).toBe(200);
-    expect(ok.body.value).toBe("shadow");
+    expect(ok.body.value).toBe("off");
+    expect(prefsState[CACHE_SNAPSHOT_EXPERIMENT_ID]).toBe("off");
 
     const mode = await routeFetch(route, `/experiments/${encodeURIComponent(COMPACTION_MODE_EXPERIMENT_ID)}`, {
       method: "PATCH",
@@ -74,6 +84,14 @@ describe("experiments route", () => {
     });
     expect(mode.status).toBe(200);
     expect(mode.body.value).toBe("cache_preserving");
+
+    const instant = await routeFetch(route, `/experiments/${encodeURIComponent(INSTANT_SIMPLE_COMPACTION_EXPERIMENT_ID)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: true }),
+    });
+    expect(instant.status).toBe(200);
+    expect(instant.body.value).toBe(true);
 
     const deepseek = await routeFetch(route, `/experiments/${encodeURIComponent(DEEPSEEK_ROLEPLAY_REASONING_PATCH_EXPERIMENT_ID)}`, {
       method: "PATCH",

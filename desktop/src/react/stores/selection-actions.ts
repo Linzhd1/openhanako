@@ -18,6 +18,16 @@ let quotedSelectionLifecycle:
   | { target: Document; cleanup: () => void }
   | null = null;
 
+/**
+ * 右键（contextmenu 主按钮，button === 2）的 mouseup 不是选区提交手势，
+ * 不能触发"引用到对话"候选。所有选区提交入口共用这一个判断，避免散落多份。
+ * 跨窗口安全：用属性探测而非 `instanceof MouseEvent`——子窗口的 MouseEvent
+ * 构造函数与主窗口不同源，跨 realm 的 instanceof 恒为 false 会让过滤失效。
+ */
+export function isContextMenuButton(event: Event): boolean {
+  return 'button' in event && (event as MouseEvent).button === 2;
+}
+
 export function initQuotedSelectionLifecycle(target: Document = document): () => void {
   if (quotedSelectionLifecycle?.target === target) {
     return quotedSelectionLifecycle.cleanup;
@@ -42,6 +52,7 @@ export function initQuotedSelectionLifecycle(target: Document = document): () =>
   const handledSelectionCommitEvents = new WeakSet<Event>();
   const handleSelectionCommit = (event: Event) => {
     if (handledSelectionCommitEvents.has(event)) return;
+    if (isContextMenuButton(event)) return;
     handledSelectionCommitEvents.add(event);
     if (suppressNextSelectionCommit) {
       suppressNextSelectionCommit = false;
@@ -99,25 +110,41 @@ export function scheduleCaptureSelection(previewItem: PreviewItem, cmView?: Edit
 
 function captureCMSelection(previewItem: PreviewItem, view: EditorView): void {
   const selection = view.state.selection.main;
-  const { from, to } = selection;
-  if (from === to) {
+  const quotedSelection = previewQuotedSelectionFromCMRange(
+    previewItem,
+    view,
+    selection.from,
+    selection.to,
+    selection.head <= selection.anchor,
+  );
+  if (!quotedSelection) {
     clearSelection(previewClearScope(previewItem));
     return;
   }
-  const rawText = view.state.sliceDoc(from, to);
+  useStore.getState().setQuoteCandidate(quotedSelection);
+}
+
+function previewQuotedSelectionFromCMRange(
+  previewItem: PreviewItem,
+  view: EditorView,
+  from: number,
+  to: number,
+  focusAtStart: boolean,
+): QuotedSelection | null {
+  const rangeFrom = Math.max(0, Math.min(from, to, view.state.doc.length));
+  const rangeTo = Math.max(rangeFrom, Math.min(Math.max(from, to), view.state.doc.length));
+  if (rangeFrom === rangeTo) return null;
+  const rawText = view.state.sliceDoc(rangeFrom, rangeTo);
   const text = rawText.trim();
-  if (!text) {
-    clearSelection(previewClearScope(previewItem));
-    return;
-  }
+  if (!text) return null;
   const leadingTrimmed = rawText.length - rawText.trimStart().length;
   const trailingTrimmed = rawText.length - rawText.trimEnd().length;
-  const textStart = from + leadingTrimmed;
-  const textEnd = to - trailingTrimmed;
+  const textStart = rangeFrom + leadingTrimmed;
+  const textEnd = rangeTo - trailingTrimmed;
   const lineStart = view.state.doc.lineAt(textStart).number;
   const lineEnd = view.state.doc.lineAt(Math.max(textStart, textEnd - 1)).number;
 
-  useStore.getState().setQuoteCandidate({
+  return {
     text,
     sourceTitle: previewItem.title,
     sourceKind: 'preview',
@@ -126,9 +153,34 @@ function captureCMSelection(previewItem: PreviewItem, view: EditorView): void {
     lineEnd,
     selectionAnchorKind: 'codemirror',
     charCount: text.length,
-    anchorRect: getCMSelectionAnchorRect(view, textStart, textEnd, selection.head <= selection.anchor) ?? getElementAnchorRect((view as EditorView & { dom?: Element }).dom ?? null),
+    anchorRect: getCMSelectionAnchorRect(view, textStart, textEnd, focusAtStart) ?? getElementAnchorRect((view as EditorView & { dom?: Element }).dom ?? null),
     updatedAt: Date.now(),
-  });
+  };
+}
+
+/**
+ * Commit an explicit CodeMirror source range to the existing composer quote
+ * collection. Context menus use this path because they already own an exact
+ * text or block range and must not depend on the transient floating candidate.
+ */
+export function quotePreviewRangeToChat(
+  previewItem: PreviewItem,
+  view: EditorView,
+  range: { from: number; to: number },
+): boolean {
+  const quotedSelection = previewQuotedSelectionFromCMRange(
+    previewItem,
+    view,
+    range.from,
+    range.to,
+    false,
+  );
+  if (!quotedSelection) return false;
+  const state = useStore.getState();
+  state.addQuotedSelection(quotedSelection);
+  state.clearQuoteCandidate();
+  state.requestInputFocus();
+  return true;
 }
 
 function captureDOMSelection(previewItem: PreviewItem, fallbackAnchorRect?: FloatingAnchorRect): void {
@@ -190,10 +242,6 @@ export function captureChatSelection(sessionPath: string, fallbackAnchorRect?: F
     updatedAt: Date.now(),
   };
   useStore.getState().setQuoteCandidate(quotedSelection);
-}
-
-export function scheduleCaptureChatSelection(sessionPath: string, fallbackAnchorRect?: FloatingAnchorRect): void {
-  captureChatSelection(sessionPath, fallbackAnchorRect);
 }
 
 function captureDocumentChatSelection(target: Document, fallbackAnchorRect?: FloatingAnchorRect): void {

@@ -31,10 +31,21 @@ describe("Windows NSIS installer contract", () => {
     expect(bypass).toContain('DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"');
   });
 
-  it("cleans the replaceable bundled server tree before overlaying new files", () => {
+  it("cleans the retired scattered server tree left behind by pre-seed installs before overlaying new files", () => {
     const source = fs.readFileSync(path.join(root, "build", "installer.nsh"), "utf-8");
 
     expect(source).toContain('RMDir /r "$INSTDIR\\resources\\server"');
+  });
+
+  it("removes all versioned seed payloads before replacing the install surface", () => {
+    const source = fs.readFileSync(path.join(root, "build", "installer.nsh"), "utf-8");
+    const macro = extractMacro(source, "hanakoRemoveOwnedInstallTrees");
+    const seedRemoval = 'RMDir /r "$INSTDIR\\resources\\seed"';
+    const resourcesRemoval = 'RMDir "$INSTDIR\\resources"';
+
+    expect(macro).toContain(seedRemoval);
+    expect(macro).toContain(resourcesRemoval);
+    expect(macro.indexOf(seedRemoval)).toBeLessThan(macro.indexOf(resourcesRemoval));
   });
 
   it("removes legacy unpacked Electron app directories before overlaying new files", () => {
@@ -155,13 +166,32 @@ describe("Windows NSIS installer contract", () => {
     expect(verify).toContain('$INSTDIR\\${APP_EXECUTABLE_FILENAME}');
     expect(verify).toContain('$INSTDIR\\resources\\app.asar');
     expect(verify).toContain('$INSTDIR\\resources\\app-update.yml');
-    expect(verify).toContain('$INSTDIR\\resources\\server\\hana-server.exe');
-    expect(verify).toContain('$INSTDIR\\resources\\server\\bootstrap.js');
-    expect(verify).toContain('$INSTDIR\\resources\\server\\bundle\\index.js');
-    expect(verify).toContain('$INSTDIR\\resources\\server\\node_modules\\better-sqlite3\\build\\Release\\better_sqlite3.node');
+    expect(verify).toContain('hanakoRequireInstallSurfaceGlob "$INSTDIR\\resources\\seed" "seed-train-*.json"');
+    expect(verify).toContain('hanakoRequireInstallSurfaceGlob "$INSTDIR\\resources\\seed" "seed-train-*.json.sig"');
+    expect(verify).toContain('hanakoRequireInstallSurfaceGlob "$INSTDIR\\resources\\seed" "server-*.tar.gz"');
+    expect(verify).toContain('hanakoRequireInstallSurfaceGlob "$INSTDIR\\resources\\seed" "renderer-*.tar.gz"');
     expect(verify).toContain('$INSTDIR\\resources\\git\\cmd\\git.exe');
+    expect(verify).toContain('$INSTDIR\\resources\\git\\usr\\bin\\sh.exe');
     expect(verify).toContain('MessageBox MB_OK|MB_ICONSTOP');
     expect(verify).toContain('Quit');
+  });
+
+  it("resolves seed archive wildcards through FindFirst/FindClose without hardcoding a version", () => {
+    const source = fs.readFileSync(path.join(root, "build", "installer.nsh"), "utf-8");
+    const glob = extractMacro(source, "hanakoRequireInstallSurfaceGlob");
+
+    expect(glob).toContain("FindFirst $R3 $R4");
+    expect(glob).toContain("FindClose $R3");
+    expect(glob).not.toMatch(/\d+\.\d+\.\d+/);
+  });
+
+  it("verifies the MinGit install surface without requiring the retired bundled bash", () => {
+    const source = fs.readFileSync(path.join(root, "build", "installer.nsh"), "utf-8");
+    const verify = extractMacro(source, "hanakoVerifyInstallSurface");
+
+    // MinGit 不再打包 bash.exe；安装器与资源是同一个包的原子产物，自检要求 sh.exe 即可
+    expect(verify).not.toContain("bash.exe");
+    expect(verify).not.toContain("PortableGit");
   });
 
   it("records installer phase timing without changing install success conditions", () => {
@@ -191,5 +221,15 @@ describe("Windows NSIS installer contract", () => {
     expect(removeTrees).toContain('hanakoInstallTimingMark "removeOwnedInstallTrees" "start"');
     expect(removeTrees).toContain('hanakoInstallTimingMark "removeOwnedInstallTrees" "end"');
     expect(verify).toContain("hanakoPersistInstallTiming");
+  });
+
+  it("grants the restricted-app-packages sandbox ACE on the install directory during install", () => {
+    const source = fs.readFileSync(path.join(root, "build", "installer.nsh"), "utf-8");
+    const macro = extractMacro(source, "hanakoGrantSandboxAce");
+    const install = extractMacro(source, "customInstall");
+
+    expect(macro).toContain('"$SYSDIR\\icacls.exe" "$INSTDIR" /grant *S-1-15-2-2:(OI)(CI)(RX)');
+    expect(macro).not.toContain("Quit");
+    expect(install).toContain("hanakoGrantSandboxAce");
   });
 });

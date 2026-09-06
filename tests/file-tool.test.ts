@@ -98,6 +98,37 @@ describe("file tool", () => {
     });
   });
 
+  it("stats a local path with ISO mtime text and versioned details", async () => {
+    const { workspace } = makeTree();
+    const notePath = path.join(workspace, "note.txt");
+    fs.writeFileSync(notePath, "hello", "utf-8");
+    const tool = createFileTool({
+      getCwd: () => workspace,
+    });
+
+    const result = await tool.execute("file-1", {
+      action: "stat",
+      path: "note.txt",
+    });
+
+    const details = result.details as any;
+    const mtimeIso = new Date(details.file.mtimeMs).toISOString();
+    expect(result.content[0].text).toContain("note.txt");
+    expect(result.content[0].text).toContain(`modified ${mtimeIso}`);
+    expect(details.file).toMatchObject({
+      type: "path",
+      path: notePath,
+      filePath: notePath,
+      filename: "note.txt",
+      size: 5,
+      mtimeMs: expect.any(Number),
+      version: {
+        mtimeMs: details.file.mtimeMs,
+        size: 5,
+      },
+    });
+  });
+
   it("copies a SessionFile into the current workspace by fileId", async () => {
     const { workspace, source, sessionPath } = makeTree();
     const registerSessionFile = vi.fn(({ filePath, label, origin, operation, storageKind }) => ({
@@ -220,5 +251,29 @@ describe("file tool", () => {
 
     expect(result.content[0].text).toMatch(/copy source is outside allowed roots/i);
     expect(fs.existsSync(path.join(workspace, "assets", "cover.png"))).toBe(false);
+  });
+
+  it("allows file.copy to use live authorized session folders outside cwd", async () => {
+    const { workspace, sessionPath } = makeTree();
+    const authorized = path.join(tmpDir!, "authorized-assets");
+    const source = path.join(authorized, "cover.png");
+    const targetDir = path.join(authorized, "exports");
+    fs.mkdirSync(authorized, { recursive: true });
+    fs.writeFileSync(source, "png");
+    const tool = createFileTool({
+      getCwd: () => workspace,
+      getSessionPath: () => sessionPath,
+      getAuthorizedFolders: vi.fn(() => [authorized]),
+    });
+
+    const result = await tool.execute("file-1", {
+      action: "copy",
+      path: source,
+      targetDir,
+      filename: "copied.png",
+    });
+
+    expect(result.content[0].text).toContain("copied.png");
+    expect(fs.readFileSync(path.join(targetDir, "copied.png"), "utf8")).toBe("png");
   });
 });

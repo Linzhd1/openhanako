@@ -16,6 +16,7 @@
  * PUT  /api/preferences/browser  — 更新内置浏览器偏好
  * POST /api/preferences/browser/clear-cookies — 清除内置浏览器 Cookies
  * POST /api/preferences/setup-complete — 提交首次配置完成意图
+ * POST /api/preferences/legacy-gpu-safe-mode/hardware-acceleration — 消费旧版 GPU 自动安全模式偏好
  * GET  /api/preferences/computer-use  — 读取 Computer Use provider/approval 状态
  * PUT  /api/preferences/computer-use  — 更新 Computer Use 全局设置
  * POST /api/preferences/computer-use/request-permissions — 请求系统权限
@@ -32,7 +33,7 @@ import {
   normalizeWorkspaceUiEntry,
   normalizeWorkspaceUiSurface,
 } from "../../shared/workspace-ui-state.ts";
-import { normalizeSidebarUiPrefs } from "../../shared/sidebar-ui-state.ts";
+import { normalizeSidebarUiPrefs, normalizeSidebarUiPrefsPatch } from "../../shared/sidebar-ui-state.ts";
 import { normalizeNotificationPreferences } from "../../shared/notification-preferences.ts";
 import { normalizeQuickChatPreferences } from "../../shared/quick-chat-preferences.ts";
 import { normalizeBrowserPreferences } from "../../shared/browser-preferences.ts";
@@ -147,6 +148,19 @@ export function createPreferencesRoute(engine: any, options: Record<string, any>
   const { platform = process.platform } = options;
   const route = new Hono();
 
+  // 仅供本机桌面启动流程在 server 数据闸门通过后调用。接口刻意保持窄语义：
+  // 只比较并删除旧值 false，不接受任意偏好 patch，也不覆盖已经变化的值。
+  route.post("/preferences/legacy-gpu-safe-mode/hardware-acceleration", (c) => {
+    try {
+      const settingsDenied = denyWithoutScope(c, "settings.write");
+      if (settingsDenied) return settingsDenied;
+      const result = engine.compareAndDeleteLegacyHardwareAccelerationPreference();
+      return c.json({ ok: true, ...result });
+    } catch (err) {
+      return c.json({ error: err.message }, 500);
+    }
+  });
+
   // 读取全局模型 + 搜索配置
   route.get("/preferences/models", async (c) => {
     try {
@@ -234,7 +248,9 @@ export function createPreferencesRoute(engine: any, options: Record<string, any>
 
       debugLog()?.log("api", `PUT /api/preferences/models sections=[${sections.join(",")}]`);
       if (sections.length > 0) {
-        emitAppEvent(engine, "models-changed", { agentId: engine.currentAgentId || null });
+        // Shared model preferences are global, so the event names no agent
+        // rather than whichever one the server happens to be focused on.
+        emitAppEvent(engine, "models-changed", { agentId: null });
       }
       recordSecurityAuditEvent(c, engine, {
         action: "settings.preferences.models.update",
@@ -460,7 +476,7 @@ export function createPreferencesRoute(engine: any, options: Record<string, any>
       if (typeof engine.setSidebarUiPrefs !== "function") {
         return c.json({ error: "sidebar UI preferences unavailable" }, 500);
       }
-      const sidebarUi = engine.setSidebarUiPrefs(normalizeSidebarUiPrefs(body.sidebarUi || body));
+      const sidebarUi = engine.setSidebarUiPrefs(normalizeSidebarUiPrefsPatch(body.sidebarUi || body));
       return c.json({ ok: true, sidebarUi });
     } catch (err) {
       return c.json({ error: err.message }, 400);

@@ -49,6 +49,51 @@ describe("desktop main GPU startup contract", () => {
     }
   });
 
+  it("settles legacy GPU preference cleanup only after the local server is ready", () => {
+    const source = fs.readFileSync(MAIN_PATH, "utf-8");
+    const startupBlockIndex = source.indexOf('console.log("[desktop] 启动 HanaAgent Server...")');
+    const serverStartIndex = source.indexOf("await startServer();", startupBlockIndex);
+    const settleIndex = source.indexOf("await settleLegacyGpuPreferenceAfterServerStart();", serverStartIndex);
+    const serverReadyIndex = source.indexOf('phase: "server-ready"', settleIndex);
+
+    expect(startupBlockIndex).toBeGreaterThan(-1);
+    expect(serverStartIndex).toBeGreaterThan(startupBlockIndex);
+    expect(settleIndex).toBeGreaterThan(serverStartIndex);
+    expect(serverReadyIndex).toBeGreaterThan(settleIndex);
+  });
+
+  it("records Windows window-starting phases before BrowserWindow creation can fail", () => {
+    const source = fs.readFileSync(MAIN_PATH, "utf-8");
+    const mainStartingIndex = source.indexOf('phase: "main-window-starting"');
+    const mainCreateIndex = source.indexOf("createMainWindow();");
+    const mainCreatedIndex = source.indexOf('phase: "main-window-created"');
+    const onboardingStartingIndex = source.indexOf('phase: "onboarding-window-starting"');
+    const onboardingCreateIndex = source.indexOf('createOnboardingWindow({ skipToTutorial: "1" });');
+    const onboardingCreatedIndex = source.indexOf('phase: "onboarding-window-created"');
+
+    expect(mainStartingIndex).toBeGreaterThan(-1);
+    expect(mainCreateIndex).toBeGreaterThan(-1);
+    expect(mainCreatedIndex).toBeGreaterThan(-1);
+    expect(mainStartingIndex).toBeLessThan(mainCreateIndex);
+    expect(mainCreateIndex).toBeLessThan(mainCreatedIndex);
+    expect(onboardingStartingIndex).toBeGreaterThan(-1);
+    expect(onboardingCreateIndex).toBeGreaterThan(-1);
+    expect(onboardingCreatedIndex).toBeGreaterThan(-1);
+    expect(onboardingStartingIndex).toBeLessThan(onboardingCreateIndex);
+    expect(onboardingCreateIndex).toBeLessThan(onboardingCreatedIndex);
+  });
+
+  it("creates the main BrowserWindow through the Windows diagnostic wrapper", () => {
+    const source = fs.readFileSync(MAIN_PATH, "utf-8");
+    const helperIndex = source.indexOf("function createBrowserWindowWithDiagnostics");
+    const mainCreateIndex = source.indexOf('createBrowserWindowWithDiagnostics("main", opts, { windowsMinimalRetry: true })');
+    const directCreateIndex = source.indexOf("mainWindow = new BrowserWindow(opts)");
+
+    expect(helperIndex).toBeGreaterThan(-1);
+    expect(mainCreateIndex).toBeGreaterThan(helperIndex);
+    expect(directCreateIndex).toBe(-1);
+  });
+
   it("listens for GPU child process exits instead of deprecated GPU crash hooks", () => {
     const source = fs.readFileSync(MAIN_PATH, "utf-8");
 
@@ -62,5 +107,30 @@ describe("desktop main GPU startup contract", () => {
     expect(source).not.toContain("disable-software-rasterizer");
     expect(source).not.toContain("disable-gpu-sandbox");
     expect(source).not.toContain("no-sandbox");
+  });
+
+  it("runs the install ACL heal before resolving the GPU startup policy", () => {
+    const source = fs.readFileSync(MAIN_PATH, "utf-8");
+    const requireIndex = source.indexOf('require("./src/shared/win32-install-acl-heal.cjs")');
+    const healIndex = source.indexOf("maybeHealWin32InstallAcl({");
+    const resolveIndex = source.indexOf("const gpuStartupPolicy = resolveGpuStartupPolicy({");
+
+    expect(requireIndex).toBeGreaterThan(-1);
+    expect(healIndex).toBeGreaterThan(-1);
+    expect(resolveIndex).toBeGreaterThan(-1);
+    expect(healIndex).toBeLessThan(resolveIndex);
+
+    const healCall = source.slice(healIndex, source.indexOf("});", healIndex) + 3);
+    expect(healCall).toContain("installDir: path.dirname(process.execPath)");
+    expect(healCall).toContain("isPackaged: app.isPackaged");
+  });
+
+  it("appends install ACL heal diagnostics next to the GPU startup diagnostics", () => {
+    const source = fs.readFileSync(MAIN_PATH, "utf-8");
+    const gpuDiagIndex = source.indexOf("items.push(buildGpuStartupDiagnostics({ hanakoHome, policy: gpuStartupPolicy, app }));");
+    const healDiagIndex = source.indexOf("items.push(buildInstallAclHealDiagnostics({ hanakoHome }));");
+
+    expect(gpuDiagIndex).toBeGreaterThan(-1);
+    expect(healDiagIndex).toBeGreaterThan(gpuDiagIndex);
   });
 });

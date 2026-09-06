@@ -7,9 +7,10 @@
 
 import fs from "fs";
 import { getPiModel } from "../lib/pi-sdk/index.ts";
-import { lookupKnown } from "../shared/known-models.ts";
-import { atomicWriteSync } from "../shared/safe-fs.ts";
+import { lookupKnown, lookupKnownProvider } from "../shared/known-models.ts";
+import { writeSecretFileSync } from "../shared/secret-fs.ts";
 import {
+  getEndpointDefaultReasoningCapability,
   normalizeModelProtocolCompat,
   normalizeToolUseContract,
   normalizeVisionCapabilities,
@@ -20,13 +21,16 @@ import {
 import { normalizeProviderHeaders, providerCredentialAllowsMissingApiKey } from "../shared/provider-auth.ts";
 import { validateProviderModels } from "../shared/provider-model-validation.ts";
 import { buildRuntimeApiKeyRef } from "../shared/runtime-api-key-ref.ts";
+import { inferOllamaModelMetadata } from "../shared/ollama-model-metadata.ts";
 import { normalizeProviderBaseUrlForApi } from "../lib/llm/provider-client.ts";
 import { normalizeThinkingLevelForModel } from "./session-thinking-level.ts";
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
-const PI_BUILTIN_PROVIDER_REUSE = new Set(["kimi-coding"]);
+const PI_BUILTIN_METADATA_PROVIDERS = new Set(["kimi-coding", "opencode", "opencode-go"]);
+const PI_BUILTIN_PROVIDER_REUSE = new Set(["kimi-coding", "opencode-go"]);
 const KIMI_CODING_PROVIDER = "kimi-coding";
-const KIMI_CODING_MODEL_ID = "kimi-for-coding";
+const KIMI_CODING_HEADER_MODEL_ID = "kimi-for-coding";
+const CHAT_CREDENTIAL_SOURCES = new Set(["provider-catalog", "auth-storage", "none"]);
 
 /**
  * 模型 ID → 人类可读名
@@ -37,16 +41,6 @@ function humanizeName(id) {
   name = name.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
   name = name.replace(/(\d) (\d)/g, "$1.$2");
   return name;
-}
-
-/** 从 auth.json entry 提取 API key（兼容多种格式） */
-function extractApiKey(entry) {
-  if (!entry) return "";
-  if (typeof entry === "string") return entry;
-  if (typeof entry?.apiKey === "string") return entry.apiKey;
-  if (typeof entry?.access === "string") return entry.access;
-  if (typeof entry?.token === "string") return entry.token;
-  return "";
 }
 
 function getModelId(modelEntry) {
@@ -60,6 +54,25 @@ function getProviderModelDefaultThinkingLevel(modelDefaults, modelId) {
   return typeof level === "string" ? level : undefined;
 }
 
+function resolveModelApi(modelEntry, provider, providerApi) {
+  const explicitApi = typeof modelEntry === "object" && modelEntry !== null
+    ? modelEntry.api
+    : null;
+  return explicitApi || lookupKnownProvider(provider, getModelId(modelEntry))?.api || providerApi;
+}
+
+const THINKING_LEVEL_MAP_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+function normalizeThinkingLevelMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result: Record<string, string | null> = {};
+  for (const key of THINKING_LEVEL_MAP_KEYS) {
+    const mapped = value[key];
+    if (typeof mapped === "string" || mapped === null) result[key] = mapped;
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
 function buildPiInputModalities({ image = false } = {}) {
   return [
     "text",
@@ -67,8 +80,16 @@ function buildPiInputModalities({ image = false } = {}) {
   ];
 }
 
+function normalizePiBuiltinCompat(piBuiltin) {
+  if (!piBuiltin?.compat || typeof piBuiltin.compat !== "object") return null;
+  return normalizeModelProtocolCompat({
+    ...piBuiltin.compat,
+    outputCapField: piBuiltin.compat.outputCapField || piBuiltin.compat.maxTokensField,
+  });
+}
+
 function getPiBuiltinModel(provider, modelId) {
-  if (!PI_BUILTIN_PROVIDER_REUSE.has(provider) || !modelId) return null;
+  if (!PI_BUILTIN_METADATA_PROVIDERS.has(provider) || !modelId) return null;
   try {
     return getPiModel(provider, modelId) || null;
   } catch {
@@ -76,8 +97,16 @@ function getPiBuiltinModel(provider, modelId) {
   }
 }
 
+function getPiProtocolBaseline(provider, modelId) {
+  return provider === "opencode" || provider === "opencode-go"
+    ? getPiBuiltinModel(provider, modelId)
+    : null;
+}
+
 function shouldReusePiBuiltinModel(provider, modelId, api) {
-  return api === "anthropic-messages" && !!getPiBuiltinModel(provider, modelId);
+  return PI_BUILTIN_PROVIDER_REUSE.has(provider)
+    && api === "anthropic-messages"
+    && !!getPiBuiltinModel(provider, modelId);
 }
 
 function isKimiCodingProvider(provider) {
@@ -103,33 +132,21 @@ function getKimiCodingEffectiveApi(provider, baseUrl, api) {
   return "openai-completions";
 }
 
-function normalizeKimiCodingModelEntry(modelEntry) {
-  if (typeof modelEntry === "object" && modelEntry !== null) {
-    return { ...modelEntry, id: KIMI_CODING_MODEL_ID };
-  }
-  return KIMI_CODING_MODEL_ID;
+function pickHeader(headers, headerName) {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return {};
+  const entry = Object.entries(headers).find(([name]) => name.toLowerCase() === headerName.toLowerCase());
+  return entry ? { [entry[0]]: entry[1] } : {};
 }
 
-function isObjectModelEntry(modelEntry) {
-  return typeof modelEntry === "object" && modelEntry !== null;
-}
+function getPiRequestHeaders(provider, modelId) {
+  const exactHeaders = getPiBuiltinModel(provider, modelId)?.headers;
+  if (exactHeaders && typeof exactHeaders === "object") return exactHeaders;
+  if (!isKimiCodingProvider(provider)) return {};
 
-function normalizeKimiCodingModelEntries(provider, baseUrl, modelEntries) {
-  if (!isKimiCodingProvider(provider) || !isOfficialKimiCodingBaseUrl(baseUrl)) return modelEntries;
-
-  const byId = new Map();
-  for (const rawEntry of modelEntries) {
-    const entry = normalizeKimiCodingModelEntry(rawEntry);
-    const id = getModelId(entry);
-    const current = byId.get(id);
-    if (!current) {
-      byId.set(id, entry);
-      continue;
-    }
-    if (isObjectModelEntry(current) || !isObjectModelEntry(entry)) continue;
-    byId.set(id, entry);
-  }
-  return Array.from(byId.values());
+  // New Kimi Coding model ids still need the provider's client identity, but
+  // request headers are the only field shared with the Pi default model.
+  const providerHeaders = getPiBuiltinModel(provider, KIMI_CODING_HEADER_MODEL_ID)?.headers;
+  return pickHeader(providerHeaders, "user-agent");
 }
 
 function isZhipuOpenAICompat(provider, baseUrl, api) {
@@ -147,20 +164,24 @@ function isZhipuOpenAICompat(provider, baseUrl, api) {
   );
 }
 
-function buildModelOverride(modelEntry, modelDefaults = {}) {
+function buildModelOverride(modelEntry, modelDefaults = {}, executionHeaders = {}) {
   const modelDefaultThinkingLevel = getProviderModelDefaultThinkingLevel(modelDefaults, getModelId(modelEntry));
   if (typeof modelEntry !== "object" || modelEntry === null) {
-    return modelDefaultThinkingLevel !== undefined
-      ? { defaultThinkingLevel: modelDefaultThinkingLevel }
-      : null;
+    const override: Record<string, any> = {};
+    if (modelDefaultThinkingLevel !== undefined) override.defaultThinkingLevel = modelDefaultThinkingLevel;
+    const headers = normalizeProviderHeaders(executionHeaders);
+    if (Object.keys(headers).length > 0) override.headers = headers;
+    return Object.keys(override).length > 0 ? override : null;
   }
 
   const override: Record<string, any> = {};
   if (modelEntry.name !== undefined) override.name = modelEntry.name;
   if (modelEntry.context !== undefined) override.contextWindow = modelEntry.context;
   if (modelEntry.contextWindow !== undefined) override.contextWindow = modelEntry.contextWindow;
-  if (modelEntry.maxOutput !== undefined) override.maxTokens = modelEntry.maxOutput;
-  if (modelEntry.maxTokens !== undefined) override.maxTokens = modelEntry.maxTokens;
+  const configuredMaxOutput = modelEntry.maxOutput
+    ?? modelEntry.maxTokens
+    ?? modelEntry.maxOutputTokens;
+  if (configuredMaxOutput !== undefined) override.maxTokens = configuredMaxOutput;
   const defaultThinkingLevel = modelEntry.defaultThinkingLevel ?? modelDefaultThinkingLevel;
   if (defaultThinkingLevel !== undefined) {
     override.defaultThinkingLevel = defaultThinkingLevel;
@@ -175,8 +196,12 @@ function buildModelOverride(modelEntry, modelDefaults = {}) {
   }
   if (modelEntry.reasoning !== undefined) override.reasoning = modelEntry.reasoning;
   if (modelEntry.xhigh !== undefined) override.xhigh = modelEntry.xhigh;
+  const thinkingLevelMap = normalizeThinkingLevelMap(modelEntry.thinkingLevelMap);
+  if (thinkingLevelMap) override.thinkingLevelMap = thinkingLevelMap;
   const compat = normalizeModelProtocolCompat(modelEntry.compat);
   if (compat) override.compat = compat;
+  const headers = normalizeProviderHeaders(executionHeaders);
+  if (Object.keys(headers).length > 0) override.headers = headers;
   const toolUse = normalizeToolUseContract(modelEntry.toolUse);
   if (modelEntry.toolUse !== undefined && !toolUse) {
     throw new Error(`invalid toolUse contract for model "${getModelId(modelEntry) || "unknown"}"`);
@@ -197,17 +222,38 @@ function buildModelOverride(modelEntry, modelDefaults = {}) {
  * @param {string|{id:string, name?:string, context?:number, maxOutput?:number}} modelEntry
  * @param {string} provider - provider 名称（查词典用）
  */
-function buildModelEntry(modelEntry, provider, baseUrl = "", api = "openai-completions", modelDefaults = {}) {
+function buildModelEntry(
+  modelEntry,
+  provider,
+  baseUrl = "",
+  api = "openai-completions",
+  modelDefaults = {},
+  executionHeaders = {},
+  providerBaseUrl = baseUrl,
+) {
   const isObj = typeof modelEntry === "object" && modelEntry !== null;
   const id = getModelId(modelEntry);
   const known = lookupKnown(provider, id);
-  const piBuiltin = getPiBuiltinModel(provider, id);
+  const providerKnown = lookupKnownProvider(provider, id);
+  const piRequestHeaders = getPiRequestHeaders(provider, id);
+  const piProtocolBaseline = getPiProtocolBaseline(provider, id);
+  const modelApi = (isObj && modelEntry.api)
+    || providerKnown?.api
+    || piProtocolBaseline?.api
+    || api;
+  const endpointReasoning = getEndpointDefaultReasoningCapability({
+    id,
+    provider,
+    api: modelApi,
+    baseUrl,
+  });
 
   // 输入模态能力：用户设置 > known-models 词典 > 默认 false
   // 兼容读：migration #7 之前的旧数据用 vision 字段；两个版本后移除 vision fallback
   const userImage = isObj ? (modelEntry.image ?? modelEntry.vision) : undefined;
-  const knownImage = known?.image ?? known?.vision;
-  const image = userImage !== undefined ? userImage : (knownImage === true);
+  const knownImage = known?.image ?? known?.vision ?? piProtocolBaseline?.input?.includes?.("image");
+  const inferredImage = inferOllamaModelMetadata(provider, id)?.image;
+  const image = userImage !== undefined ? userImage : (knownImage === true || inferredImage === true);
   const userVideo = isObj ? modelEntry.video : undefined;
   const knownVideo = known?.video;
   const video = userVideo !== undefined ? userVideo : (knownVideo === true);
@@ -218,27 +264,58 @@ function buildModelEntry(modelEntry, provider, baseUrl = "", api = "openai-compl
   const xhigh = userXhigh !== undefined ? userXhigh : (known?.xhigh === true);
   const entry: Record<string, any> = {
     id,
-    name: (isObj && modelEntry.name) || known?.name || humanizeName(id),
+    name: (isObj && modelEntry.name) || piProtocolBaseline?.name || known?.name || humanizeName(id),
     input: buildPiInputModalities({ image: image === true }),
-    contextWindow: (isObj && modelEntry.context) || known?.context || DEFAULT_CONTEXT_WINDOW,
-    reasoning: (isObj && modelEntry.reasoning !== undefined) ? modelEntry.reasoning : (known?.reasoning === true),
+    contextWindow: (isObj ? (modelEntry.context ?? modelEntry.contextWindow) : undefined)
+      ?? piProtocolBaseline?.contextWindow
+      ?? known?.context
+      ?? DEFAULT_CONTEXT_WINDOW,
+    reasoning: (isObj && modelEntry.reasoning !== undefined)
+      ? modelEntry.reasoning
+      : (
+        piProtocolBaseline?.reasoning === true
+        || known?.reasoning === true
+        || endpointReasoning === true
+      ),
   };
+  if (baseUrl !== providerBaseUrl) entry.baseUrl = baseUrl;
   if (xhigh === true) entry.xhigh = true;
 
-  const maxOutput = (isObj && modelEntry.maxOutput) || known?.maxOutput;
+  const rawThinkingLevelMap = isObj && modelEntry.thinkingLevelMap !== undefined
+    ? modelEntry.thinkingLevelMap
+    : (piProtocolBaseline?.thinkingLevelMap ?? providerKnown?.thinkingLevelMap);
+  const thinkingLevelMap = normalizeThinkingLevelMap(rawThinkingLevelMap);
+  if (thinkingLevelMap) entry.thinkingLevelMap = thinkingLevelMap;
+  if ((isObj && modelEntry.api) || providerKnown?.api || modelApi !== api) entry.api = modelApi;
+
+  const maxOutput = (isObj
+    ? (modelEntry.maxOutput ?? modelEntry.maxTokens ?? modelEntry.maxOutputTokens)
+    : undefined) ?? piProtocolBaseline?.maxTokens ?? known?.maxOutput;
   if (maxOutput) entry.maxTokens = maxOutput;
+  const configuredDefaultThinkingLevel = getProviderModelDefaultThinkingLevel(modelDefaults, id);
   const defaultThinkingLevel = isObj
-    ? (modelEntry.defaultThinkingLevel ?? getProviderModelDefaultThinkingLevel(modelDefaults, id))
-    : getProviderModelDefaultThinkingLevel(modelDefaults, id);
+    ? (modelEntry.defaultThinkingLevel ?? configuredDefaultThinkingLevel ?? providerKnown?.defaultThinkingLevel)
+    : (configuredDefaultThinkingLevel ?? providerKnown?.defaultThinkingLevel);
   if (defaultThinkingLevel !== undefined) {
     entry.defaultThinkingLevel = normalizeThinkingLevelForModel(
       defaultThinkingLevel,
-      { ...entry, provider, api, baseUrl },
+      {
+        ...entry,
+        provider,
+        api: modelApi,
+        baseUrl,
+        thinkingLevels: (isObj && modelEntry.thinkingLevels) || providerKnown?.thinkingLevels,
+      },
     );
   }
 
   if (known?.quirks?.length) entry.quirks = known.quirks;
-  if (piBuiltin?.headers) entry.headers = { ...piBuiltin.headers };
+  const modelHeaders = normalizeProviderHeaders({
+    ...piRequestHeaders,
+    ...(isObj ? (modelEntry.headers || {}) : {}),
+    ...executionHeaders,
+  });
+  if (Object.keys(modelHeaders).length > 0) entry.headers = modelHeaders;
 
   const rawToolUse = isObj && modelEntry.toolUse !== undefined ? modelEntry.toolUse : known?.toolUse;
   const toolUse = normalizeToolUseContract(rawToolUse);
@@ -255,22 +332,28 @@ function buildModelEntry(modelEntry, provider, baseUrl = "", api = "openai-compl
 
   // Pi SDK compat 覆盖：
   // 1. 非 OpenAI provider 不发 developer role（dashscope 等不支持）— 与 reasoning 无关
-  // 2. thinkingFormat 由 shared/model-capabilities.js 统一派生，避免请求层按 provider 猜
+  // 2. thinkingFormat 由 shared/model-capabilities.ts 统一派生，避免请求层按 provider 猜
   // 3. Gemini OpenAI 兼容层（/v1beta/openai）严格校验，不识别 store 字段会 400。
   //    Native google-generative-ai 不走 Chat Completions，不需要这组 OpenAI 字段兼容。
   if (provider !== "openai") {
+    const piBuiltinCompat = normalizePiBuiltinCompat(piProtocolBaseline) || {};
     const knownCompat = normalizeModelProtocolCompat(known?.compat) || {};
     const explicitCompat = isObj
       ? (normalizeModelProtocolCompat(modelEntry.compat) || {})
       : {};
-    const compat: Record<string, unknown> = { ...knownCompat, ...explicitCompat, supportsDeveloperRole: false };
-    if (api === "openai-completions" && (
+    const compat: Record<string, unknown> = {
+      ...piBuiltinCompat,
+      ...knownCompat,
+      ...explicitCompat,
+      supportsDeveloperRole: false,
+    };
+    if (modelApi === "openai-completions" && (
       provider === "gemini"
       || baseUrl.includes("generativelanguage.googleapis.com")
     )) {
       compat.supportsStore = false;
     }
-    if (compat.thinkingFormat === "zhipu" || isZhipuOpenAICompat(provider, baseUrl, api)) {
+    if (compat.thinkingFormat === "zhipu" || isZhipuOpenAICompat(provider, baseUrl, modelApi)) {
       compat.supportsStore = false;
       compat.supportsReasoningEffort = false;
     }
@@ -279,7 +362,7 @@ function buildModelEntry(modelEntry, provider, baseUrl = "", api = "openai-compl
 
   let mediaAwareEntry = video === true ? withHanaVideoInputCompat(entry, true) : entry;
   mediaAwareEntry = audio === true ? withHanaAudioInputCompat(mediaAwareEntry, true) : mediaAwareEntry;
-  return withThinkingFormatCompat(mediaAwareEntry, { provider, api, baseUrl });
+  return withThinkingFormatCompat(mediaAwareEntry, { provider, api: modelApi, baseUrl });
 }
 
 function filterChatModelEntries(provider, models) {
@@ -298,94 +381,100 @@ function filterChatModelEntries(provider, models) {
  * @param {Record<string, object>} providers - Provider Catalog 中的 providers 块（snake_case）
  * @param {object} [opts]
  * @param {string} opts.modelsJsonPath - models.json 输出路径
- * @param {string} [opts.authJsonPath] - auth.json 路径（OAuth 凭证查找用）
- * @param {Record<string, string>} [opts.oauthKeyMap] - providerId → auth.json key 映射
  * @returns {boolean} 内容是否有变化
  */
 export function syncModels(providers, opts: Record<string, any> = {}) {
   const modelsJsonPath = opts.modelsJsonPath;
-  const authJsonPath = opts.authJsonPath;
-  const oauthKeyMap = opts.oauthKeyMap || {};
   const chatProjectionMap = opts.chatProjectionMap || {};
-
-  // 懒加载 auth.json（只在需要时读一次）
-  let _authJson;
-  function getAuthJson() {
-    if (_authJson !== undefined) return _authJson;
-    if (!authJsonPath) { _authJson = {}; return _authJson; }
-    try {
-      _authJson = JSON.parse(fs.readFileSync(authJsonPath, "utf-8")) || {};
-    } catch {
-      _authJson = {};
-    }
-    return _authJson;
-  }
+  const chatProjectionPlans = opts.chatProjectionPlans || {};
 
   // 构建新的 providers 块
   const newProviders = {};
+  const runtimeOwners = new Map();
 
   for (const [name, p] of Object.entries(providers || {}) as [string, Record<string, any>][]) {
-    const projection = chatProjectionMap[name] || "models-json";
+    const plan = chatProjectionPlans[name] || {};
+    const projection = plan.projection || chatProjectionMap[name] || "models-json";
+    const credentialSource = plan.credentialSource || "provider-catalog";
+    if (!CHAT_CREDENTIAL_SOURCES.has(credentialSource)) {
+      throw new Error(`Invalid chat credentialSource "${credentialSource}" for provider "${name}"`);
+    }
     if (projection === "sdk-auth-alias" || projection === "none") continue;
+    const provider = plan.sourceProviderId || name;
+    const runtimeProviderId = plan.runtimeProviderId || name;
     if (!p.base_url) continue;
     if (!p.models || p.models.length === 0) continue;
-    validateProviderModels(name, p.models, { baseUrl: p.base_url });
+    validateProviderModels(provider, p.models, { baseUrl: p.base_url });
 
-    let apiKey = p.api_key || "";
-    const hasLiteralApiKey = typeof p.api_key === "string" && p.api_key.length > 0;
+    let apiKey = credentialSource === "provider-catalog" ? (p.api_key || "") : "";
+    const hasLiteralApiKey = credentialSource === "provider-catalog"
+      && typeof p.api_key === "string"
+      && p.api_key.length > 0;
 
-    // 无 api_key 时尝试 OAuth 查找
-    if (!apiKey) {
-      const authKey = oauthKeyMap[name] || name;
-      apiKey = extractApiKey(getAuthJson()[authKey]);
-    }
-
-    const headers = normalizeProviderHeaders(p.headers);
+    const headers = credentialSource === "auth-storage" ? {} : normalizeProviderHeaders(p.headers);
     const hasHeaders = Object.keys(headers).length > 0;
 
     // 无凭证时只允许 provider 契约声明无需 key、旧本地 loopback 配置，或显式 provider headers。
-    if (!apiKey && !hasHeaders && !providerCredentialAllowsMissingApiKey({
+    if (credentialSource === "provider-catalog" && !apiKey && !hasHeaders && !providerCredentialAllowsMissingApiKey({
       authType: p.auth_type,
       baseUrl: p.base_url,
     })) continue;
 
     const effectiveApiKey = apiKey || (hasHeaders ? "headers" : "local");
     const configuredApi = p.api || "openai-completions";
-    const effectiveApi = getKimiCodingEffectiveApi(name, p.base_url, configuredApi);
+    const effectiveApi = getKimiCodingEffectiveApi(provider, p.base_url, configuredApi);
     const effectiveBaseUrl = normalizeProviderBaseUrlForApi({
-      provider: name,
+      provider,
       baseUrl: p.base_url,
       api: effectiveApi,
     });
     const modelDefaults = p.model_defaults || {};
-    const chatModels = normalizeKimiCodingModelEntries(
-      name,
-      p.base_url,
-      filterChatModelEntries(name, p.models),
-    );
+    const chatModels = filterChatModelEntries(provider, p.models);
     const customModels = [];
     const modelOverrides = {};
+    const modelExecutionHeaders = plan.modelExecutionHeaders || {};
 
     for (const modelEntry of chatModels) {
       const id = getModelId(modelEntry);
-      if (shouldReusePiBuiltinModel(name, id, effectiveApi)) {
-        const override = buildModelOverride(modelEntry, modelDefaults);
+      const modelApi = resolveModelApi(modelEntry, provider, effectiveApi);
+      if (shouldReusePiBuiltinModel(provider, id, modelApi)) {
+        const override = buildModelOverride(modelEntry, modelDefaults, modelExecutionHeaders[id]);
         if (override) modelOverrides[id] = override;
         continue;
       }
-      customModels.push(buildModelEntry(modelEntry, name, effectiveBaseUrl, effectiveApi, modelDefaults));
+      const modelBaseUrl = normalizeProviderBaseUrlForApi({
+        provider,
+        baseUrl: p.base_url,
+        api: modelApi,
+      });
+      customModels.push(buildModelEntry(
+        modelEntry,
+        provider,
+        modelBaseUrl,
+        effectiveApi,
+        modelDefaults,
+        modelExecutionHeaders[id],
+        effectiveBaseUrl,
+      ));
     }
 
     const providerConfig: Record<string, any> = {
       baseUrl: effectiveBaseUrl,
       api: effectiveApi,
-      apiKey: hasLiteralApiKey ? buildRuntimeApiKeyRef(name) : effectiveApiKey,
     };
+    if (credentialSource !== "auth-storage") {
+      providerConfig.apiKey = hasLiteralApiKey ? buildRuntimeApiKeyRef(runtimeProviderId) : effectiveApiKey;
+    }
     if (Object.keys(headers).length > 0) providerConfig.headers = headers;
     if (customModels.length > 0) providerConfig.models = customModels;
     if (Object.keys(modelOverrides).length > 0) providerConfig.modelOverrides = modelOverrides;
 
-    newProviders[name] = providerConfig;
+    const previousOwner = runtimeOwners.get(runtimeProviderId);
+    if (previousOwner && previousOwner !== provider) {
+      throw new Error(`Chat runtime provider collision: "${previousOwner}" and "${provider}" both project to "${runtimeProviderId}"`);
+    }
+    runtimeOwners.set(runtimeProviderId, provider);
+    newProviders[runtimeProviderId] = providerConfig;
   }
 
   const newJson = { providers: newProviders };
@@ -401,7 +490,7 @@ export function syncModels(providers, opts: Record<string, any> = {}) {
   if (oldStr === newStr) return false;
 
   // 原子写入：先写 tmp 文件，再 rename
-  atomicWriteSync(modelsJsonPath, newStr);
+  writeSecretFileSync(modelsJsonPath, newStr);
 
   return true;
 }

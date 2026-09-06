@@ -3,11 +3,11 @@ import { hanaFetch } from '../hooks/use-hana-fetch';
 import { sessionIdForPathFromLocatorState, sessionScopedValue } from '../stores/session-slice';
 import { applyAgentIdentity, loadAvatars } from '../stores/agent-actions';
 import { activateWorkspaceDesk } from '../stores/desk-actions';
-import { loadMessages } from '../stores/session-actions';
+import { loadMessages, pendingNewSessionIdentityPatch } from '../stores/session-actions';
 import { connectWebSocket, getWebSocket } from '../services/websocket';
 import { configureAppEventActions } from '../services/app-event-actions';
 import { configureWsMessageHandler } from '../services/ws-message-handler';
-import { createBrowserServerConnection, upsertServerConnection, type ServerIdentity } from '../services/server-connection';
+import { createBrowserServerConnection, upsertServerConnection, warnIfServerProtocolMismatch, type ServerIdentity } from '../services/server-connection';
 import { loadModels } from '../utils/ui-helpers';
 import { applySyncedAppearancePreferences, type SyncedAppearancePreferences } from '../services/appearance-sync';
 import { applyChatLayout } from '../chat/layout';
@@ -67,6 +67,7 @@ export async function initializeMobileRuntime(principal: MobilePrincipal): Promi
   configureMobileMessageHandlers();
 
   const identity = await rawJson<ServerIdentity>('/api/server/identity');
+  warnIfServerProtocolMismatch(identity);
   const connection = createBrowserServerConnection({
     identity,
     principal,
@@ -85,7 +86,7 @@ export async function initializeMobileRuntime(principal: MobilePrincipal): Promi
     previewOpen: false,
     currentSessionPath: null,
     pendingSessionSwitchPath: null,
-    pendingNewSession: true,
+    ...pendingNewSessionIdentityPatch(),
     welcomeVisible: true,
   });
 
@@ -130,7 +131,7 @@ export async function initializeMobileRuntime(principal: MobilePrincipal): Promi
       ...(bootstrap.thinkingLevel ? { thinkingLevel: bootstrap.thinkingLevel } : {}),
     });
   }
-  loadAvatars(bootstrap.avatars);
+  loadAvatars(bootstrap.avatars, currentAgent?.id || bootstrap.currentAgentId || null);
   if (isSessionPermissionMode(permissionDefault.permissionMode)) {
     useStore.getState().setPendingNewSessionPermissionMode(permissionDefault.permissionMode);
   }
@@ -178,7 +179,7 @@ export async function loadMobileSessions({
     useStore.setState({
       currentSessionPath: null,
       pendingSessionSwitchPath: null,
-      pendingNewSession: true,
+      ...pendingNewSessionIdentityPatch(),
       welcomeVisible: true,
     });
   }
@@ -186,11 +187,17 @@ export async function loadMobileSessions({
   return next;
 }
 
-export async function switchMobileSession(path: string, session?: Pick<Session, 'cwd' | 'permissionMode' | 'sessionId'> | null): Promise<void> {
+export async function switchMobileSession(
+  path: string,
+  session?: Pick<Session, 'cwd' | 'permissionMode' | 'sessionId' | 'agentId' | 'agentName'> | null,
+): Promise<void> {
   useStore.setState((state) => {
     const sessionId = typeof session?.sessionId === 'string' && session.sessionId.trim()
       ? session.sessionId.trim()
       : sessionIdForPathFromLocatorState(state, path);
+    const sessionAgent = session?.agentId
+      ? state.agents.find(agent => agent.id === session.agentId) || null
+      : null;
     return {
     currentSessionPath: path,
     currentSessionId: sessionId,
@@ -202,7 +209,14 @@ export async function switchMobileSession(path: string, session?: Pick<Session, 
     } : {}),
     pendingSessionSwitchPath: path,
     pendingNewSession: false,
+    selectedAgentId: null,
     welcomeVisible: false,
+    ...(session?.agentId ? {
+      currentAgentId: session.agentId,
+      agentName: session.agentName || sessionAgent?.name || session.agentId,
+      agentYuan: sessionAgent?.yuan || 'hanako',
+      homeFolder: sessionAgent?.homeFolder || null,
+    } : {}),
     };
   });
   syncMobilePermissionMode(session || null);

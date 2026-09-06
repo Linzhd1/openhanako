@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import React from 'react';
+import { installWindowTestT } from '../helpers/i18n-test-strings';
 import { InputArea } from '../../components/InputArea';
 import { AssistantMessage } from '../../components/chat/AssistantMessage';
 import { SessionConfirmationPrompt } from '../../components/input/SessionConfirmationPrompt';
@@ -59,8 +60,12 @@ vi.mock('../../components/input/extensions/skill-badge', () => ({
   SkillBadge: {},
 }));
 
+import { createTestTranslator } from '../helpers/i18n-test-strings';
+
+const testT = createTestTranslator();
+
 vi.mock('../../hooks/use-i18n', () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({ t: testT }),
 }));
 
 vi.mock('../../hooks/use-config', () => ({
@@ -107,6 +112,7 @@ vi.mock('../../components/input/InputControlBar', () => ({
 
 vi.mock('../../hooks/use-slash-items', () => ({
   useSkillSlashItems: () => [],
+  useServerSlashCommandItems: () => [],
 }));
 
 vi.mock('../../utils/paste-upload-feedback', () => ({
@@ -169,6 +175,7 @@ describe('computer app approval prompt', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    installWindowTestT();
     seedSession();
   });
 
@@ -292,17 +299,21 @@ describe('computer app approval prompt', () => {
       fireEvent.click(screen.getByRole('button', { name: '更多确认选项' }));
       fireEvent.click(screen.getByRole('menuitem', { name: '本对话不再询问' }));
 
+      // A tool approval also reads the MCP connector registry, to find out
+      // whether it is about an MCP tool. Match the calls that matter by path
+      // rather than by position, so that lookup does not shift the assertions.
+      const callFor = (path: string) => hanaFetchMock.mock.calls.find(call => call[0] === path);
       await waitFor(() => {
-        expect(hanaFetchMock).toHaveBeenCalledTimes(2);
+        expect(callFor('/api/confirm/confirm-tool-1')).toBeTruthy();
       });
-      expect(hanaFetchMock.mock.calls[0]).toEqual([
+      expect(callFor('/api/session-permission-mode')).toEqual([
         '/api/session-permission-mode',
         expect.objectContaining({
           method: 'POST',
           body: JSON.stringify({ mode: 'operate', currentSessionOnly: true }),
         }),
       ]);
-      expect(hanaFetchMock.mock.calls[1]).toEqual([
+      expect(callFor('/api/confirm/confirm-tool-1')).toEqual([
         '/api/confirm/confirm-tool-1',
         expect.objectContaining({
           method: 'POST',
@@ -482,6 +493,9 @@ describe('computer app approval prompt', () => {
       },
       showAvatar: false,
       sessionPath: '/session/a.jsonl',
+      agentDisplay: { id: 'hana', displayName: 'Hana', avatarUrl: null, fallbackAvatar: null, yuan: 'hana', isUser: false },
+      isStreaming: false,
+      isSelected: false,
     }));
 
     expect(screen.queryByText('允许 Hana 使用电脑')).toBeNull();

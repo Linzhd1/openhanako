@@ -34,6 +34,28 @@ vi.mock('../../settings/actions', () => ({
 }));
 
 vi.mock('@/ui', () => ({
+  Toggle: ({
+    on,
+    onChange,
+    label,
+    ariaLabel,
+  }: {
+    on: boolean | undefined;
+    onChange: (next: boolean) => void;
+    label?: string;
+    ariaLabel?: string;
+  }) => (
+    <button
+      type="button"
+      role="switch"
+      aria-label={ariaLabel || label}
+      aria-checked={on === undefined ? 'mixed' : on}
+      disabled={on === undefined}
+      onClick={() => {
+        if (on !== undefined) onChange(!on);
+      }}
+    />
+  ),
   SelectWidget: ({
     value,
     options = [],
@@ -192,7 +214,7 @@ describe('AgentTab settings agent selection', () => {
               agentId: 'hana',
               packageName: 'hana-charactercard.zip',
               agent: { name: 'Hana', yuan: 'hanako', description: '花名册描述' },
-              prompts: { identity: 'identity', ishiki: 'ishiki', publicIshiki: 'public' },
+              prompts: { identity: 'identity', agents: 'agents-md', publicAgents: 'public' },
               memory: {
                 available: true,
                 count: 1,

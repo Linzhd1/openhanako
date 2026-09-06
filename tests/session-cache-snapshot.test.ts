@@ -38,7 +38,7 @@ describe("session cache snapshot", () => {
       model: runtimeModel,
       cacheKeyParams: { thinkingLevel: "high", toolChoice: "auto" },
       systemPrompt: "stable system",
-      tools: [tool("read"), tool("bash")],
+      tools: [tool("read"), tool("exec_command")],
       messages: [
         {
           role: "user",
@@ -59,7 +59,7 @@ describe("session cache snapshot", () => {
       reason: "compaction",
       model,
       cacheKeyParams: { thinkingLevel: "high", toolChoice: "auto" },
-      toolNames: ["read", "bash"],
+      toolNames: ["read", "exec_command"],
       strict: true,
     });
     expect(snapshot.requestModel).toEqual(runtimeModel);
@@ -103,6 +103,33 @@ describe("session cache snapshot", () => {
       strict: true,
       diffs: [],
     });
+  });
+
+  it("keeps Session identity separate while reusing an identical provider-visible prefix", () => {
+    const common = {
+      model,
+      cacheKeyParams: { thinkingLevel: "high" },
+      systemPrompt: "stable system",
+      tools: [tool("read")],
+      messages: [
+        { role: "user", content: "shared question" },
+        { role: "assistant", content: "shared answer" },
+      ],
+      reason: "session_fork",
+      createdAt: "2026-07-19T00:00:00.000Z",
+    };
+    const source = buildSessionCacheSnapshot({
+      ...common,
+      sessionPath: "/sessions/source.jsonl",
+    });
+    const child = buildSessionCacheSnapshot({
+      ...common,
+      sessionPath: "/sessions/child.jsonl",
+    });
+
+    expect(child.sessionPath).not.toBe(source.sessionPath);
+    expect(child.cachePrefixHash).toBe(source.cachePrefixHash);
+    expect(child.messagePrefixHash).toBe(source.messagePrefixHash);
   });
 
   it("tracks reasoning replay mode as part of the cache contract", () => {

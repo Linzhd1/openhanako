@@ -6,8 +6,7 @@ import { updateSettingsSnapshot } from '../actions';
 import { MediaProviderDetail } from './media/MediaProviderDetail';
 import { SettingsSection } from '../components/SettingsSection';
 import { SettingsRow } from '../components/SettingsRow';
-import { SelectWidget } from '@/ui';
-import { Toggle } from '../widgets/Toggle';
+import { SelectWidget, Toggle } from '@/ui';
 import styles from '../Settings.module.css';
 
 interface MediaProvider {
@@ -15,6 +14,11 @@ interface MediaProvider {
   displayName?: string;
   hasCredentials: boolean;
   unavailableReason?: string | null;
+  unavailableMessage?: string | null;
+  runtimeCapability?: {
+    status?: string;
+    error?: { code?: string; message?: string } | null;
+  } | null;
   models: { id: string; name: string; protocolId?: string; adapterAvailable?: boolean }[];
   availableModels: { id: string; name: string }[];
 }
@@ -138,12 +142,8 @@ function SpeechProviderDetail({
         <h2 className={styles['pv-detail-title']}>{provider.displayName || providerId}</h2>
       </div>
 
-      <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginBottom: 'var(--space-md)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-        <span style={{
-          width: 6, height: 6, borderRadius: '50%',
-          background: provider.hasCredentials ? 'var(--success)' : 'var(--text-muted)',
-          display: 'inline-block',
-        }} />
+      <div className={styles['settings-credential-status']}>
+        <span className={`${styles['settings-credential-dot']}${provider.hasCredentials ? ' ' + styles.on : ''}`} />
         {provider.hasCredentials ? t('settings.media.credentialOk') : t('settings.media.credentialMissing')}
       </div>
 
@@ -160,11 +160,7 @@ function SpeechProviderDetail({
                   <span className={styles['pv-fav-item-name']} title={model.id}>{model.name || model.id}</span>
                   <span className={styles['pv-fav-item-id']}>{model.id}</span>
                   {isDefault(model.id) && (
-                    <span style={{
-                      fontSize: '0.6rem', color: 'var(--accent)',
-                      background: 'var(--accent-light)', padding: '1px 6px',
-                      borderRadius: '4px', fontWeight: 500, flexShrink: 0,
-                    }}>
+                    <span className={styles['settings-default-badge']}>
                       {t('settings.media.default')}
                     </span>
                   )}
@@ -271,6 +267,12 @@ export function MediaTab() {
     loadImageProviders();
     loadVideoProviders();
     loadSpeechProviders();
+    const refreshRuntimeMediaProviders = () => {
+      loadImageProviders();
+      loadVideoProviders();
+    };
+    window.addEventListener('focus', refreshRuntimeMediaProviders);
+    return () => window.removeEventListener('focus', refreshRuntimeMediaProviders);
   }, [loadImageProviders, loadVideoProviders, loadSpeechProviders]);
 
   const providerIds = Object.keys(providers);
@@ -378,6 +380,7 @@ export function MediaTab() {
                   key={pid}
                   className={`${styles['pv-list-item']}${selectedImageProviderId === pid ? ' ' + styles['selected'] : ''}${!p.hasCredentials ? ' ' + styles['dim'] : ''}`}
                   onClick={() => setSelected({ kind: 'imageGeneration', providerId: pid })}
+                  title={p.unavailableMessage || p.unavailableReason || undefined}
                 >
                   <span className={`${styles['pv-status-dot']}${p.hasCredentials ? ' ' + styles['on'] : ''}`} />
                   <span className={styles['pv-list-item-name']}>{p.displayName || pid}</span>
@@ -395,6 +398,7 @@ export function MediaTab() {
                   key={pid}
                   className={`${styles['pv-list-item']}${selectedVideoProviderId === pid ? ' ' + styles['selected'] : ''}${!p.hasCredentials ? ' ' + styles['dim'] : ''}`}
                   onClick={() => setSelected({ kind: 'videoGeneration', providerId: pid })}
+                  title={p.unavailableMessage || p.unavailableReason || undefined}
                 >
                   <span className={`${styles['pv-status-dot']}${p.hasCredentials ? ' ' + styles['on'] : ''}`} />
                   <span className={styles['pv-list-item-name']}>{p.displayName || pid}</span>
@@ -426,12 +430,12 @@ export function MediaTab() {
             })}
 
             <div className={styles['pv-list-divider']} />
-            <div className={styles['pv-list-group-label']} style={{ color: 'var(--text-muted)' }}>
+            <div className={`${styles['pv-list-group-label']} ${styles['pv-list-group-label-muted']}`}>
               {t('settings.media.speechSynthesis')}
             </div>
-            <div className={styles['pv-list-item']} style={{ opacity: 0.3, pointerEvents: 'none' }}>
+            <div className={`${styles['pv-list-item']} ${styles['pv-list-item-disabled']}`}>
               <span className={styles['pv-status-dot']} />
-              <span className={styles['pv-list-item-name']} style={{ fontStyle: 'italic', fontSize: '0.7rem' }}>
+              <span className={`${styles['pv-list-item-name']} ${styles['pv-list-item-coming-soon']}`}>
                 {t('settings.media.comingSoon')}
               </span>
             </div>
@@ -503,7 +507,9 @@ export function MediaTab() {
                   const adapterAvailable = m.adapterAvailable !== false;
                   const label = `${m.provider} / ${m.name || m.id}`;
                   const unavailableReason = !providerHasCredentials
-                    ? t('settings.media.credentialMissing')
+                    ? providers[m.provider]?.unavailableMessage
+                      || providers[m.provider]?.unavailableReason
+                      || t('settings.media.credentialMissing')
                     : !adapterAvailable
                       ? t('settings.media.adapterMissing')
                       : '';
@@ -546,7 +552,9 @@ export function MediaTab() {
                   const adapterAvailable = m.adapterAvailable !== false;
                   const label = `${m.provider} / ${m.name || m.id}`;
                   const unavailableReason = !providerHasCredentials
-                    ? t('settings.media.credentialMissing')
+                    ? videoProviders[m.provider]?.unavailableMessage
+                      || videoProviders[m.provider]?.unavailableReason
+                      || t('settings.media.credentialMissing')
                     : !adapterAvailable
                       ? t('settings.media.videoAdapterMissing')
                       : '';

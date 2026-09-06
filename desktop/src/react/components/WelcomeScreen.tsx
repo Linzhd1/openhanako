@@ -25,6 +25,7 @@ import {
 import { openSettingsModal } from '../stores/settings-modal-actions';
 import type { Agent, StudioWorkspace } from '../types';
 import { AgentAvatar, refreshAgentAvatarVersion, resolveAgentDisplayInfo, type AgentDisplayInfo } from '../utils/agent-display';
+import { isSameWorkspacePath, resolveAgentWorkspace } from '../utils/agent-workspace';
 import styles from './Welcome.module.css';
 import { buildWorkspacePickerItems, normalizeWorkspacePath } from '../../../../shared/workspace-history.ts';
 
@@ -163,24 +164,21 @@ function AgentChips({ agents, selectedId }: {
   const handleClick = useCallback((agentId: string) => {
     const agent = agents.find(a => a.id === agentId) as Agent | undefined;
     useStore.setState({ selectedAgentId: agentId });
-    const homeFolder = normalizeWorkspacePath(agent?.homeFolder);
-    if (homeFolder) {
+    const targetWorkspace = resolveAgentWorkspace(agent);
+    const state = useStore.getState();
+    const workspaceUnchanged = !state.selectedWorkspaceMountId
+      && isSameWorkspacePath(state.selectedFolder || state.deskBasePath, targetWorkspace);
+    if (targetWorkspace && !workspaceUnchanged) {
       useStore.setState({
-        selectedFolder: homeFolder,
+        selectedFolder: targetWorkspace,
         selectedWorkspaceMountId: null,
         selectedWorkspaceLabel: null,
         workspaceFolders: [],
       });
-      void activateWorkspaceDesk(homeFolder, { mountId: null });
+      void activateWorkspaceDesk(targetWorkspace, { mountId: null });
     }
     // 切换到该 agent 的 chat model
-    if (agent?.chatModel?.id && agent.chatModel.provider) {
-      hanaFetch('/api/models/set', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ modelId: agent.chatModel.id, provider: agent.chatModel.provider }),
-      }).then(() => loadModels()).catch(() => {});
-    }
+    refreshModelsAfterAgentModelSwitch(agent);
   }, [agents]);
 
   return (
@@ -224,6 +222,19 @@ function AgentChip({ agent, isSelected, onClick }: {
       <span>{agent.name}</span>
     </button>
   );
+}
+
+function refreshModelsAfterAgentModelSwitch(agent: Agent | undefined): void {
+  if (agent?.chatModel?.id && agent.chatModel.provider) {
+    hanaFetch('/api/models/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ modelId: agent.chatModel.id, provider: agent.chatModel.provider }),
+    }).then(() => {
+      loadModels();
+    }).catch(() => {});
+    return;
+  }
 }
 
 // ── Folder Picker ──
@@ -278,7 +289,9 @@ function FolderPicker({
     const folder = await window.platform?.selectFolder?.();
     if (!folder) return;
     const workspace = await createLocalStudioWorkspaceFromFolder(folder);
-    if (workspace) await applyStudioWorkspace(workspace);
+    if (workspace) {
+      await applyStudioWorkspace(workspace);
+    }
   }, []);
 
   const handleAddWorkspaceFolder = useCallback(async () => {
@@ -317,16 +330,10 @@ function FolderPicker({
         workspaceFolders: [],
       });
       void activateWorkspaceDesk(homeFolder, { mountId: null });
-      if (agent.chatModel?.id && agent.chatModel.provider) {
-        hanaFetch('/api/models/set', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ modelId: agent.chatModel.id, provider: agent.chatModel.provider }),
-        }).then(() => loadModels()).catch(() => {});
-      }
+      refreshModelsAfterAgentModelSwitch(agent);
       return;
     }
-    applyFolder(folder);
+    void applyFolder(folder);
   }, [agents, currentAgentId]);
 
   const selectedWorkspace = selectedWorkspaceMountId
@@ -374,7 +381,9 @@ function FolderPicker({
           onAddWorkspaceFolder={handleAddWorkspaceFolder}
           onRemoveRecentWorkspace={removeRecentWorkspace}
           onRemoveStudioWorkspace={handleRemoveWorkspace}
-          onRemoveWorkspaceFolder={removeWorkspaceFolder}
+          onRemoveWorkspaceFolder={(folder) => {
+            removeWorkspaceFolder(folder);
+          }}
         />
       )}
     </div>

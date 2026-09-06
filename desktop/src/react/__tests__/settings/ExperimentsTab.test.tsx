@@ -3,7 +3,7 @@
  */
 
 import React from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -14,29 +14,11 @@ function response(body: unknown): Response {
   return { json: async () => body } as Response;
 }
 
+// memory.editable_facts 已毕业转正（不再是实验，也不再出现在 registry 里）；
+// memory.cache_snapshot_reflection 也已退休。当前没有存活的 owner: "memory" 实验，
+// 所以 /api/experiments 对 memory 部分只会返回空数组。
 const experimentsPayload = {
-  experiments: [{
-    id: 'memory.cache_snapshot_reflection',
-    titleKey: 'settings.experiments.cacheSnapshot.title',
-    descriptionKey: 'settings.experiments.cacheSnapshot.description',
-    owner: 'memory',
-    scope: 'global',
-    value: 'off',
-    defaultValue: 'off',
-    valueSchema: {
-      type: 'enum',
-      presentation: { type: 'paired_toggles' },
-      options: [
-        { value: 'off', labelKey: 'settings.experiments.cacheSnapshot.off' },
-        { value: 'shadow', labelKey: 'settings.experiments.cacheSnapshot.shadow' },
-        { value: 'write', labelKey: 'settings.experiments.cacheSnapshot.write' },
-      ],
-    },
-    status: 'beta',
-    risk: 'medium',
-    restartPolicy: 'new_session',
-    targetHome: { tab: 'agent', section: 'memory' },
-  }],
+  experiments: [],
 };
 
 const observationPayload = {
@@ -60,6 +42,9 @@ vi.mock('../../settings/helpers', () => ({
     'settings.experiments.title': '实验',
     'settings.experiments.description': '前沿功能会先放在这里观察。',
     'settings.experiments.owner.memory': '记忆',
+    'settings.experiments.memoryTitle': '记忆实验',
+    'settings.experiments.memorySectionDescription': '记忆相关实验。',
+    'settings.experiments.empty': '暂无实验',
     'settings.experiments.cacheSnapshot.title': '缓存记忆系统',
     'settings.experiments.cacheSnapshot.description': '使用缓存快照生成 rolling summary。',
     'settings.experiments.cacheSnapshot.observeOnly': '只观察，不写入记忆',
@@ -69,8 +54,10 @@ vi.mock('../../settings/helpers', () => ({
     'settings.experiments.cacheSnapshot.summaryTitle': 'Rolling Summary Preview',
     'settings.experiments.cacheSnapshot.emptyPreview': '暂无观察结果',
     'settings.experiments.cacheSnapshot.clearObservation': '清除观察结果',
+    'settings.experiments.status.alpha': 'Alpha',
     'settings.experiments.status.beta': 'Beta',
     'settings.experiments.risk.medium': '中风险',
+    'settings.experiments.restart.immediate': '立即生效',
     'settings.experiments.restart.new_session': '新会话生效',
     'settings.autoSaved': '已保存',
   }[key] || key),
@@ -120,46 +107,17 @@ describe('ExperimentsTab', () => {
     cleanup();
   });
 
-  it('maps the dual toggles to shadow by default and write when observe-only is off', async () => {
+  it('shows the memory section empty state when the API omits both retired experiments', async () => {
     const { ExperimentsTab } = await import('../../settings/tabs/ExperimentsTab');
     render(<ExperimentsTab />);
 
-    const main = await screen.findByRole('switch', { name: '缓存记忆系统' });
-    expect(main).toHaveAttribute('aria-checked', 'false');
-
-    fireEvent.click(main);
-
-    await waitFor(() => {
-      expect(hanaFetchMock).toHaveBeenCalledWith(
-        '/api/experiments/memory.cache_snapshot_reflection',
-        expect.objectContaining({
-          method: 'PATCH',
-          body: JSON.stringify({ value: 'shadow' }),
-        }),
-      );
-    });
-    await waitFor(() => {
-      expect(screen.getAllByText(/观察模式不会对正式记忆产生任何影响/)).toHaveLength(1);
-      expect(hanaFetchMock).toHaveBeenCalledWith(
-        '/api/experiments/memory/cache-snapshot-reflection/observation?agentId=primary',
-        undefined,
-      );
-    });
-
-    const observeOnly = await screen.findByRole('switch', { name: '只观察，不写入记忆' });
-    expect(observeOnly).toHaveAttribute('aria-checked', 'true');
-
-    fireEvent.click(observeOnly);
-
-    await waitFor(() => {
-      expect(hanaFetchMock).toHaveBeenCalledWith(
-        '/api/experiments/memory.cache_snapshot_reflection',
-        expect.objectContaining({
-          method: 'PATCH',
-          body: JSON.stringify({ value: 'write' }),
-        }),
-      );
-    });
-    expect(screen.getByText(/当前会写入正式记忆/)).toBeInTheDocument();
+    expect(await screen.findByText('暂无实验')).toBeInTheDocument();
+    expect(screen.queryByText('可编辑记忆')).not.toBeInTheDocument();
+    expect(screen.queryByText('缓存记忆系统')).not.toBeInTheDocument();
+    expect(screen.queryByText('只观察，不写入记忆')).not.toBeInTheDocument();
+    expect(hanaFetchMock).not.toHaveBeenCalledWith(
+      '/api/experiments/memory/cache-snapshot-reflection/observation?agentId=primary',
+      undefined,
+    );
   });
 });

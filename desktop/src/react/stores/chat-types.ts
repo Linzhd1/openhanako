@@ -17,6 +17,8 @@ export interface ToolCall {
   args?: Record<string, unknown>;
   done: boolean;
   success: boolean;
+  status?: 'running' | 'succeeded' | 'failed' | 'unknown';
+  error?: string;
   details?: { card?: import('../types').PluginCardDetails; [key: string]: unknown };
 }
 
@@ -58,6 +60,25 @@ export interface VoiceTranscription {
   updatedAt?: number;
 }
 
+export interface AgentReviewContext {
+  requestId?: string | null;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  reviewedSessionId?: string | null;
+  reviewerSessionId?: string | null;
+  reviewerAgentId: string;
+  reviewerAgentName: string;
+  text?: string | null;
+  error?: string | null;
+  completedAt?: string | null;
+}
+
+export interface AgentReviewRequestContext {
+  requestId?: string | null;
+  reviewedSessionId: string;
+  reviewerAgentId: string;
+  reviewerAgentName: string;
+}
+
 export interface DeskContext {
   dir: string;
   fileCount: number;
@@ -69,6 +90,8 @@ export interface SessionRegistryFile {
   sessionPath?: string;
   filePath?: string;
   realPath?: string;
+  legacyFileIds?: string[];
+  legacyFilePaths?: string[];
   label?: string;
   displayName?: string;
   filename?: string;
@@ -263,7 +286,8 @@ export type RichBlock =
     startedAt?: number | null;
     finishedAt?: number | null;
   }
-  | { type: 'plugin_card'; card: import('../types').PluginCardDetails };
+  | { type: 'plugin_card'; card: import('../types').PluginCardDetails }
+  | { type: 'interactive_card'; cardId: string; title: string; code: string };
 
 export type ContentBlock = TextDecorator | RichBlock;
 
@@ -272,6 +296,10 @@ export type ContentBlock = TextDecorator | RichBlock;
 export interface ChatMessage {
   id: string;              // UI message id；本地发送的 user message 可先使用 clientMessageId
   sourceEntryId?: string;  // Pi SDK session entry id，用于 branch-aware 的重新生成/编辑
+  /** 本次 Agent turn 的真实输入 entry；隐藏后台输入也必须保留，不能猜到最近可见 user。 */
+  turnInputEntryId?: string;
+  /** false 表示真实 turn input 只用于模型上下文，不对应可见用户节点。 */
+  turnInputVisible?: boolean;
   role: 'user' | 'assistant';
   // User
   text?: string;
@@ -280,8 +308,14 @@ export interface ChatMessage {
   attachments?: UserAttachment[];
   deskContext?: DeskContext | null;
   skills?: string[];
+  sessionRefs?: Array<{ sessionId: string; label: string }>;
+  agentMentions?: Array<{ agentId: string; label: string }>;
+  agentReview?: AgentReviewContext;
+  agentReviewRequest?: AgentReviewRequestContext;
   sendStatus?: 'pending' | 'failed';
   sendError?: string;
+  /** 非用户本人发出的消息来源（如别的 Agent 经跨 session 协作投递）。老数据无此字段，按普通用户消息渲染。 */
+  origin?: { kind: 'agent'; agentId: string | null; agentName: string | null };
   // Assistant
   blocks?: ContentBlock[];
   // 通用
@@ -317,6 +351,9 @@ export interface SessionModel {
   thinkingLevels?: ThinkingLevel[];
   defaultThinkingLevel?: ThinkingLevel;
   contextWindow?: number;
+  /** Historical sessions can remain readable while their exact model is no longer executable. */
+  available?: boolean;
+  unavailableReason?: 'model_removed' | 'provider_not_configured' | 'temporarily_unavailable' | null;
 }
 
 // ── Per-session 消息状态 ──

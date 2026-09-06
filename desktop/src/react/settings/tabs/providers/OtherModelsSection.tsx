@@ -5,10 +5,9 @@ import {
   t, lookupModelMeta, formatContext, autoSaveGlobalModels,
 } from '../../helpers';
 import { loadSettingsConfig } from '../../actions';
-import { SelectWidget } from '@/ui';
+import { SelectWidget, Toggle } from '@/ui';
 import { ModelWidget } from '../../widgets/ModelWidget';
 import { KeyInput } from '../../widgets/KeyInput';
-import { Toggle } from '../../widgets/Toggle';
 import styles from '../../Settings.module.css';
 import {
   AUTO_SEARCH_PROVIDER,
@@ -184,7 +183,7 @@ export function OtherModelsSection({ providers }: { providers: Record<string, { 
   );
 
   return (
-    <div style={{ padding: 'var(--space-md)' }}>
+    <div style={{ padding: 'var(--space-16)' }}>
       <div className={styles['settings-form-grid']}>
         <div className={`${styles['settings-form-field']} ${styles['settings-form-field-half']}`}>
           <label className={styles['settings-form-label']}>{t('settings.api.utilityModel')}</label>

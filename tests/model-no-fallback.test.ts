@@ -11,13 +11,16 @@ import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 
 // ── Mock Pi SDK ──
 
-const { createAgentSessionMock, sessionManagerCreateMock } = vi.hoisted(() => ({
+const { createAgentSessionMock, emitSessionShutdownMock, sessionManagerCreateMock } = vi.hoisted(() => ({
   createAgentSessionMock: vi.fn(),
+  emitSessionShutdownMock: vi.fn(async () => true),
   sessionManagerCreateMock: vi.fn(),
 }));
 
 vi.mock("../lib/pi-sdk/index.js", () => ({
   createAgentSession: createAgentSessionMock,
+  emitSessionShutdown: emitSessionShutdownMock,
+  getPiModels: vi.fn(() => []),
   SessionManager: {
     create: sessionManagerCreateMock,
     open: vi.fn(),
@@ -52,10 +55,44 @@ function makeModels(list = []) {
 }
 
 function makeCoordinator(tempDir, { agentConfig = {}, models = makeModels() } = {}) {
-  sessionManagerCreateMock.mockReturnValue({ getCwd: () => tempDir });
+  const sessionPath = path.join(tempDir, "s.jsonl");
+  let manifest = null;
+  const branchHeads = new Map();
+  const sessionManifestStore = {
+    resolveByLocatorPath: vi.fn((candidate) => manifest?.currentLocator?.path === candidate ? manifest : null),
+    getBySessionId: vi.fn((sessionId) => manifest?.sessionId === sessionId ? manifest : null),
+    createForPath: vi.fn((input) => {
+      manifest = {
+        ...input,
+        sessionId: "sess_model_test",
+        lifecycle: "active",
+        currentLocator: { path: input.sessionPath },
+      };
+      return manifest;
+    }),
+    updateLocatorLifecycle: vi.fn((sessionId, nextPath, lifecycle) => {
+      manifest = { ...manifest, sessionId, lifecycle, currentLocator: { path: nextPath } };
+      return manifest;
+    }),
+    getBranchHead: vi.fn((sessionId) => branchHeads.get(sessionId) || null),
+    setBranchHead: vi.fn((sessionId, head) => {
+      const stored = { ...head, sessionId };
+      branchHeads.set(sessionId, stored);
+      return stored;
+    }),
+    setMemoryPolicy: vi.fn(),
+    setPermissionModeSnapshot: vi.fn(),
+    setThinkingLevel: vi.fn(),
+    setWorkspaceScope: vi.fn(),
+    setPlugin: vi.fn(),
+  };
+  sessionManagerCreateMock.mockReturnValue({
+    getCwd: () => tempDir,
+    getSessionFile: () => sessionPath,
+  });
   createAgentSessionMock.mockResolvedValue({
     session: {
-      sessionManager: { getSessionFile: () => path.join(tempDir, "s.jsonl") },
+      sessionManager: { getSessionFile: () => sessionPath },
       subscribe: vi.fn(() => vi.fn()),
       abort: vi.fn(),
     },
@@ -69,6 +106,7 @@ function makeCoordinator(tempDir, { agentConfig = {}, models = makeModels() } = 
       agentName: "test-agent",
       config: agentConfig,
       tools: [],
+      buildSystemPrompt: () => "prompt",
     }),
     getActiveAgentId: () => "test",
     getModels: () => models,
@@ -89,8 +127,10 @@ function makeCoordinator(tempDir, { agentConfig = {}, models = makeModels() } = 
       agentName: id,
       config: agentConfig,
       tools: [],
+      buildSystemPrompt: () => "prompt",
     }),
     listAgents: () => [],
+    sessionManifestStore,
   });
 }
 
@@ -169,6 +209,89 @@ describe("模型选择无 fallback", () => {
       const ctx = coord.createSessionContext();
       expect(() => ctx.resolveModel({ models: { chat: { id: "qwen3.5-plus", provider: "dashscope" } } }))
         .toThrow(/resolveModelNotAvailable|不在可用列表|not available/);
+    });
+
+    it("restores a disabled historical model as unavailable before the SDK can fallback", async () => {
+      const allowedModel = { id: "allowed-model", provider: "openai" };
+      const coord = makeCoordinator(tempDir, { models: makeModels([allowedModel]) });
+      const sessionMgr = {
+        getCwd: () => tempDir,
+        getSessionFile: () => path.join(tempDir, "disabled-restore.jsonl"),
+        getEntries: () => [],
+        resetLeaf: vi.fn(),
+        buildSessionContext: () => ({
+          model: { provider: "openai-codex", modelId: "disabled-model" },
+        }),
+      };
+      createAgentSessionMock.mockImplementationOnce(async (options) => ({
+        session: {
+          sessionManager: sessionMgr,
+          model: options.model,
+          messages: [],
+          agent: {
+            state: {
+              model: options.model,
+              messages: [],
+              systemPrompt: "prompt",
+              tools: [],
+            },
+            streamFn: vi.fn(),
+          },
+          isStreaming: false,
+          isCompacting: false,
+          subscribe: vi.fn(() => vi.fn()),
+          setActiveToolsByName: vi.fn(),
+          setThinkingLevel: vi.fn(),
+          getContextUsage: vi.fn(() => null),
+        },
+      }));
+
+      await expect(coord.createSession(
+        sessionMgr,
+        tempDir,
+        true,
+        null,
+        { restore: true },
+      )).resolves.toBeDefined();
+      expect(createAgentSessionMock).toHaveBeenCalledOnce();
+      expect(createAgentSessionMock.mock.calls[0][0].model).toMatchObject({
+        id: "disabled-model",
+        provider: "openai-codex",
+        api: "hana-unavailable-model",
+      });
+      expect(coord.getSessionModelAvailability(sessionMgr.getSessionFile())).toMatchObject({
+        available: false,
+        modelRef: "openai-codex/disabled-model",
+      });
+    });
+
+    it("tears down a restored session when the SDK reports a model fallback", async () => {
+      const allowedModel = { id: "allowed-model", provider: "openai" };
+      const coord = makeCoordinator(tempDir, { models: makeModels([allowedModel]) });
+      const dispose = vi.fn();
+      createAgentSessionMock.mockResolvedValue({
+        session: { model: allowedModel, dispose },
+        modelFallbackMessage: "disabled-model -> allowed-model",
+      });
+      const sessionMgr = {
+        getCwd: () => tempDir,
+        getSessionFile: () => path.join(tempDir, "fallback-restore.jsonl"),
+        getEntries: () => [],
+        resetLeaf: vi.fn(),
+        buildSessionContext: () => ({
+          model: { provider: "openai", modelId: "allowed-model" },
+        }),
+      };
+
+      await expect(coord.createSession(
+        sessionMgr,
+        tempDir,
+        true,
+        null,
+        { restore: true },
+      )).rejects.toThrow(/fallback rejected/);
+      expect(emitSessionShutdownMock).toHaveBeenCalled();
+      expect(dispose).toHaveBeenCalled();
     });
   });
 
@@ -311,6 +434,25 @@ describe("模型选择无 fallback", () => {
         "http://192.168.1.20:11434/v1",
       );
     });
+
+    it("uses the model API even when the provider-wide API is empty", () => {
+      const mm = new ModelManager({ hanakoHome: tempDir });
+      const fullModel = {
+        id: "gpt-5.6-sol",
+        provider: "openai",
+        api: "openai-responses",
+      };
+      mm._availableModels = [fullModel];
+      mm.providerRegistry = {
+        getCredentials: vi.fn(() => ({
+          api: "",
+          apiKey: "sk-test",
+          baseUrl: "https://api.openai.com/v1",
+        })),
+      };
+
+      expect(mm.resolveModelWithCredentials(fullModel).api).toBe("openai-responses");
+    });
   });
 
   describe("resolveUtilityConfig", () => {
@@ -364,6 +506,24 @@ describe("模型选择无 fallback", () => {
         .toThrow(/noUtilityLargeModel|utility_large 模型|utility_large model/);
     });
 
+    it("明确 small-only 调用时不要求 utility_large", () => {
+      const mm = new ModelManager({ hanakoHome: tempDir });
+      setupRouter(mm);
+      mm._availableModels = [
+        { id: "some-model", provider: "x", _cred: { api: "openai-completions", apiKey: "sk-test", baseUrl: "https://test.example.com/v1" } },
+      ];
+
+      const result = mm.resolveUtilityConfig(
+        {},
+        { utility: { id: "some-model", provider: "x" } },
+        {},
+        { requireUtilityLarge: false },
+      );
+
+      expect(result.utility).toMatchObject({ id: "some-model", provider: "x" });
+      expect(result.utility_large).toBeNull();
+    });
+
     it("utility 和 utility_large 都配置时正常返回", () => {
       const mm = new ModelManager({ hanakoHome: tempDir });
       mm._availableModels = [
@@ -383,6 +543,28 @@ describe("模型选择无 fallback", () => {
       expect(result.utility_large).toMatchObject({ id: "large-model", provider: "test-provider" });
       expect(result.api_key).toBe("sk-test");
       expect(result.api).toBe("openai-completions");
+    });
+
+    it("keeps per-model APIs distinct for utility models on the same provider", () => {
+      const mm = new ModelManager({ hanakoHome: tempDir });
+      const credential = { api: "", apiKey: "sk-test", baseUrl: "https://test.example.com/v1" };
+      mm._availableModels = [
+        { id: "util-model", provider: "test-provider", api: "openai-responses", _cred: credential },
+        { id: "large-model", provider: "test-provider", api: "openai-completions", _cred: credential },
+      ];
+      setupRouter(mm);
+
+      const result = mm.resolveUtilityConfig(
+        {},
+        {
+          utility: { id: "util-model", provider: "test-provider" },
+          utility_large: { id: "large-model", provider: "test-provider" },
+        },
+        {},
+      );
+
+      expect(result.api).toBe("openai-responses");
+      expect(result.large_api).toBe("openai-completions");
     });
 
     it("utility 模型携带 OAuth accountId，供 Codex Responses utility 请求使用", () => {

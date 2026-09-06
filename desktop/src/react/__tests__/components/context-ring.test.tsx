@@ -8,29 +8,41 @@ import { ContextRing } from '../../components/input/ContextRing';
 import { useStore } from '../../stores';
 import { refreshSessionCapabilities } from '../../stores/session-actions';
 
-const { sendMock } = vi.hoisted(() => ({
+const { sendMock, getWebSocketMock, hanaFetchMock } = vi.hoisted(() => ({
   sendMock: vi.fn(),
+  getWebSocketMock: vi.fn(),
+  hanaFetchMock: vi.fn(),
 }));
 
 vi.mock('../../services/websocket', () => ({
-  getWebSocket: vi.fn(() => ({ readyState: 1, send: sendMock })),
+  getWebSocket: getWebSocketMock,
 }));
 
 vi.mock('../../stores/session-actions', () => ({
   refreshSessionCapabilities: vi.fn(() => Promise.resolve(true)),
 }));
 
+vi.mock('../../hooks/use-hana-fetch', () => ({
+  hanaFetch: hanaFetchMock,
+}));
+
 describe('ContextRing', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    hanaFetchMock.mockResolvedValue(new Response(JSON.stringify({
+      experiments: [{ id: 'session.instant_simple_compaction', value: false }],
+    })));
+    getWebSocketMock.mockReturnValue({ readyState: WebSocket.OPEN, send: sendMock });
     useStore.setState({
       agentYuan: 'hanako',
+      currentSessionId: 'sess_a',
       currentSessionPath: '/session/a.jsonl',
       contextTokens: null,
       contextWindow: null,
       contextPercent: null,
       contextBySession: {},
       compactingSessions: ['/session/a.jsonl'],
+      compactionModeBySession: {},
     } as never);
   });
 
@@ -38,11 +50,13 @@ describe('ContextRing', () => {
     cleanup();
     useStore.setState({
       currentSessionPath: null,
+      currentSessionId: null,
       contextTokens: null,
       contextWindow: null,
       contextPercent: null,
       contextBySession: {},
       compactingSessions: [],
+      compactionModeBySession: {},
     } as never);
   });
 
@@ -56,7 +70,20 @@ describe('ContextRing', () => {
     });
   });
 
-  it('is visible for an active session but hides the token label below 100k', async () => {
+  it('identifies instant simple compaction in the ring tooltip', async () => {
+    useStore.setState({
+      compactionModeBySession: { sess_a: 'lossy_local' },
+    } as never);
+    const { container } = render(<ContextRing />);
+
+    fireEvent.mouseEnter(container.querySelector('button') as HTMLButtonElement);
+
+    await waitFor(() => {
+      expect(screen.getByText('chat.instantSimpleCompaction')).toBeInTheDocument();
+    });
+  });
+
+  it('is visible for an active session but never shows the token label', async () => {
     useStore.setState({
       contextBySession: {
         '/session/a.jsonl': { tokens: 12_345, window: 200_000, percent: 6 },
@@ -72,7 +99,7 @@ describe('ContextRing', () => {
     expect(queryByText('12k')).toBeNull();
   });
 
-  it('shows the token label from 100k', async () => {
+  it('keeps the token label hidden at high usage', async () => {
     useStore.setState({
       contextBySession: {
         '/session/a.jsonl': { tokens: 100_000, window: 200_000, percent: 50 },
@@ -80,11 +107,12 @@ describe('ContextRing', () => {
       compactingSessions: [],
     } as never);
 
-    const { getByText } = render(<ContextRing />);
+    const { container, queryByText } = render(<ContextRing />);
 
     await waitFor(() => {
-      expect(getByText('100k')).toBeTruthy();
+      expect(container.querySelector('button')).toBeTruthy();
     });
+    expect(queryByText('100k')).toBeNull();
   });
 
   it('opens a two-action menu instead of compacting immediately', async () => {
@@ -97,9 +125,54 @@ describe('ContextRing', () => {
     fireEvent.click(button);
 
     expect(screen.getByRole('menu')).toBeInTheDocument();
-    expect(screen.getByText('input.refreshAndCompact')).toBeInTheDocument();
-    expect(screen.getByText('input.compact')).toBeInTheDocument();
+    expect(screen.getAllByRole('menuitem').map(item => item.textContent)).toEqual([
+      'input.compact',
+      'input.refreshAndCompact',
+    ]);
+    expect(screen.queryByText('chat.instantSimpleCompaction')).not.toBeInTheDocument();
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('shows and runs instant simple compaction only when its experiment is enabled', async () => {
+    hanaFetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      experiments: [{ id: 'session.instant_simple_compaction', value: true }],
+    })));
+    useStore.setState({ compactingSessions: [] } as never);
+
+    const { container } = render(<ContextRing />);
+    await waitFor(() => expect(hanaFetchMock).toHaveBeenCalledWith('/api/experiments'));
+    fireEvent.click(container.querySelector('button') as HTMLButtonElement);
+    const actions = await screen.findAllByRole('menuitem');
+    expect(actions.map(item => item.textContent)).toEqual([
+      'input.compact',
+      'input.refreshAndCompact',
+      'chat.instantSimpleCompaction',
+    ]);
+    fireEvent.click(actions[2]);
+
+    expect(sendMock).toHaveBeenCalledWith(JSON.stringify({
+      type: 'compact',
+      sessionId: 'sess_a',
+      method: 'instant_simple',
+    }));
+    expect(refreshSessionCapabilities).not.toHaveBeenCalled();
+  });
+
+  it('updates the one-shot menu entry when the settings window broadcasts the toggle', async () => {
+    useStore.setState({ compactingSessions: [] } as never);
+    const { container } = render(<ContextRing />);
+    await waitFor(() => expect(hanaFetchMock).toHaveBeenCalledWith('/api/experiments'));
+
+    window.dispatchEvent(new CustomEvent('hana-settings', {
+      detail: {
+        type: 'experiment-changed',
+        id: 'session.instant_simple_compaction',
+        value: true,
+      },
+    }));
+    fireEvent.click(container.querySelector('button') as HTMLButtonElement);
+
+    expect(await screen.findByText('chat.instantSimpleCompaction')).toBeInTheDocument();
   });
 
   it('runs fresh compact from the update action', async () => {
@@ -138,7 +211,30 @@ describe('ContextRing', () => {
     fireEvent.click(container.querySelector('button') as HTMLButtonElement);
     fireEvent.click(screen.getByText('input.compact'));
 
-    expect(sendMock).toHaveBeenCalledWith(JSON.stringify({ type: 'compact', sessionPath: '/session/a.jsonl' }));
+    expect(sendMock).toHaveBeenCalledWith(JSON.stringify({ type: 'compact', sessionId: 'sess_a' }));
     expect(refreshSessionCapabilities).not.toHaveBeenCalled();
+  });
+
+  it('shows an error instead of sending when session identity is unavailable', () => {
+    useStore.setState({ currentSessionId: null, compactingSessions: [] } as never);
+
+    const { container } = render(<ContextRing />);
+    fireEvent.click(container.querySelector('button') as HTMLButtonElement);
+    fireEvent.click(screen.getByText('input.compact'));
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(useStore.getState().toasts.at(-1)).toMatchObject({ type: 'error' });
+  });
+
+  it('shows an error instead of silently dropping while WebSocket is disconnected', () => {
+    getWebSocketMock.mockReturnValue({ readyState: WebSocket.CLOSED, send: sendMock });
+    useStore.setState({ compactingSessions: [] } as never);
+
+    const { container } = render(<ContextRing />);
+    fireEvent.click(container.querySelector('button') as HTMLButtonElement);
+    fireEvent.click(screen.getByText('input.compact'));
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(useStore.getState().toasts.at(-1)).toMatchObject({ type: 'error' });
   });
 });

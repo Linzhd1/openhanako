@@ -50,4 +50,111 @@ describe("BridgeManager platform status", () => {
 
     expect(bm.getStatus("hana").wechat).toMatchObject({ status: "connecting", error: null });
   });
+
+  it("reports DingTalk config errors when enabled credentials are incomplete", () => {
+    createTelegramAdapter.mockReset();
+    createFeishuAdapter.mockReset();
+    createDingTalkAdapter.mockReset();
+    createQQAdapter.mockReset();
+    createWechatAdapter.mockReset();
+
+    const engine = {
+      hanakoHome: os.tmpdir(),
+      agent: null,
+      getAgent: vi.fn(() => null),
+    };
+    const hub = { eventBus: { emit: vi.fn() } };
+    const bm = new BridgeManager({ engine, hub });
+
+    bm.startPlatformFromConfig("dingtalk", {
+      enabled: true,
+      corpId: "corp-1",
+      clientId: "dt-client",
+      clientSecret: "dt-secret",
+    }, "hana");
+
+    expect(createDingTalkAdapter).not.toHaveBeenCalled();
+    expect(bm.getStatus("hana").dingtalk).toMatchObject({
+      status: "error",
+      error: expect.stringMatching(/enterprise robotCode/i),
+    });
+  });
+
+  it("does not start DingTalk when the new token contract is missing corpId", () => {
+    createDingTalkAdapter.mockReset();
+    const engine = {
+      hanakoHome: os.tmpdir(),
+      agent: null,
+      getAgent: vi.fn(() => null),
+    };
+    const hub = { eventBus: { emit: vi.fn() } };
+    const bm = new BridgeManager({ engine, hub });
+
+    bm.startPlatformFromConfig("dingtalk", {
+      enabled: true,
+      clientId: "dt-client",
+      clientSecret: "dt-secret",
+      robotCode: "ding-robot",
+    }, "hana");
+
+    expect(createDingTalkAdapter).not.toHaveBeenCalled();
+    expect(bm.getStatus("hana").dingtalk).toMatchObject({
+      status: "error",
+      error: expect.stringMatching(/corpId/i),
+    });
+  });
+
+  it("starts a migrated stable DingTalk config only when legacy mode is explicit", () => {
+    createDingTalkAdapter.mockReset();
+    createDingTalkAdapter.mockReturnValue({ stop: vi.fn() });
+    const engine = {
+      hanakoHome: os.tmpdir(),
+      agent: null,
+      getAgent: vi.fn(() => null),
+    };
+    const hub = { eventBus: { emit: vi.fn() } };
+    const bm = new BridgeManager({ engine, hub });
+
+    bm.startPlatformFromConfig("dingtalk", {
+      enabled: true,
+      authMode: "legacy_app",
+      clientId: "dt-client",
+      clientSecret: "dt-secret",
+      robotCode: "ding-robot",
+      apiBaseUrl: "https://api.dingtalk.io/v1.0",
+    }, "hana");
+
+    expect(createDingTalkAdapter).toHaveBeenCalledWith(expect.objectContaining({
+      authMode: "legacy_app",
+      corpId: "",
+      clientId: "dt-client",
+      clientSecret: "dt-secret",
+      apiBaseUrl: "https://api.dingtalk.io/v1.0",
+    }));
+    expect(bm.getStatus("hana").dingtalk).toMatchObject({
+      status: "connecting",
+      error: null,
+    });
+  });
+
+  it("does not revive a legacy QQ token after canonical appSecret was cleared", () => {
+    createQQAdapter.mockReset();
+    const engine = {
+      hanakoHome: os.tmpdir(),
+      agent: null,
+      getAgent: vi.fn(() => null),
+    };
+    const hub = { eventBus: { emit: vi.fn() } };
+    const bm = new BridgeManager({ engine, hub });
+
+    bm.startPlatformFromConfig("qq", {
+      enabled: true,
+      appID: "qq-app",
+      appSecret: "",
+      token: "legacy-must-stay-cleared",
+    }, "hana");
+
+    expect(createQQAdapter).not.toHaveBeenCalled();
+    expect(bm.getStatus("hana").qq).toBeUndefined();
+  });
 });

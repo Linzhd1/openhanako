@@ -1,4 +1,4 @@
-// shared/tool-categories.js
+// shared/tool-categories.ts
 //
 // Single source of truth for built-in tool categorization.
 //
@@ -13,6 +13,8 @@
 //   OPTIONAL — User-toggleable in AgentTab → Tools section. Some may default off.
 //   GLOBAL   — Built-in, but governed by a global high-permission setting page
 //              rather than per-agent tool toggles.
+//   LEGACY_INTERNAL — Known retired/internal transports kept for replay or direct
+//                     unit coverage. Never registered into the Agent tool surface.
 //
 // Plugin-contributed tools (flagged with _pluginId) are NOT part of this
 // categorization. Plugin lifecycle is managed by PluginsTab. A plugin-backed
@@ -20,7 +22,7 @@
 // per-agent switch; concrete plugin tools then implement runtime availability.
 
 export const CORE_TOOL_NAMES = [
-  "read", "bash", "edit", "write", "grep", "find", "ls",
+  "read", "write", "edit", "exec_command", "write_stdin", "grep", "find", "ls",
   "search_memory", "pin_memory", "unpin_memory",
   "web_search",
 ];
@@ -31,6 +33,7 @@ export const STANDARD_TOOL_NAMES = [
   "notify",
   "stage_files",
   "file",
+  "materialize",
   "subagent",
   "subagent_reply",
   "subagent_close",
@@ -41,20 +44,27 @@ export const STANDARD_TOOL_NAMES = [
   "current_status",
   "session_folders",
   "stop_task",
-  "terminal",
+  "hana_card_guide",
+  "show_card",
+  "loop_control",
 ];
 
 export const GLOBAL_TOOL_NAMES = [
   "computer",
 ];
 
+export const LEGACY_INTERNAL_TOOL_NAMES = [
+  "terminal",
+  "dm",
+];
+
 export const OPTIONAL_TOOL_NAMES = [
   "automation",
   "beautify",
   "browser",
-  "dm",
   "install_skill",
   "office",
+  "session",
   "update_settings",
   "workflow",
 ];
@@ -64,6 +74,24 @@ export const PLUGIN_BACKED_OPTIONAL_TOOL_IDS = {
   office: "office",
 };
 
+/**
+ * Built-ins whose invocation boundary is enforced by an older host-owned
+ * gateway instead of a tool-owned `sessionPermission.resolveInvocation`.
+ *
+ * Keep this list small and explicit. Adding a name here is a security decision:
+ * the named implementation must already derive its authority from the host
+ * sandbox, ResourceIO, or an internal capability gate.
+ */
+export const BUILT_IN_PERMISSION_GATEWAY_TOOL_NAMES = [
+  // PI filesystem primitives are constrained by the session ResourceIO/sandbox.
+  "read", "write", "edit", "grep", "find", "ls",
+  // Existing read/network surfaces still use the host permission classifier.
+  "search_memory", "web_search", "web_fetch",
+  // These tools own a deeper action/path/session gate at execution time.
+  "file", "current_status", "session_folders", "computer",
+  "session", "workflow",
+];
+
 const OPTIONAL_TOOL_NAMES_SET = new Set(OPTIONAL_TOOL_NAMES);
 
 /**
@@ -72,18 +100,15 @@ const OPTIONAL_TOOL_NAMES_SET = new Set(OPTIONAL_TOOL_NAMES);
  * fresh agents and agents upgrading from a pre-feature version hit this path.
  *
  * Must be a subset of OPTIONAL_TOOL_NAMES. The frontend AgentTab keeps a local
- * copy for display defaults; tests/optional-tool-names-drift.test.js guards the
+ * copy for display defaults; tests/optional-tool-names-drift.test.ts guards the
  * two from drifting.
  *
  * Rationale:
- *   beautify        — aesthetic generation is new and model/provider-costly;
- *                     off by default until the feature has baked for a few versions.
- *   dm              — direct-messages between agents; off by default because
- *                     single-agent setups have no peers and it adds context.
  *   workflow        — deterministic multi-agent orchestration; a heavy fan-out
  *                     capability, opt-in per agent until it has baked.
+ *   (beautify 已于 0.375.x 毕业为默认开启。)
  */
-export const DEFAULT_DISABLED_TOOL_NAMES = ["dm", "beautify", "workflow"];
+export const DEFAULT_DISABLED_TOOL_NAMES = ["workflow"];
 
 export function uniqueToolNames(names) {
   const seen = new Set();
@@ -133,6 +158,7 @@ export function assertAllToolsCategorized(actualToolNames) {
     ...CORE_TOOL_NAMES,
     ...STANDARD_TOOL_NAMES,
     ...GLOBAL_TOOL_NAMES,
+    ...LEGACY_INTERNAL_TOOL_NAMES,
     ...OPTIONAL_TOOL_NAMES,
   ]);
   const missing = actualToolNames.filter((n) => !categorized.has(n));
@@ -141,6 +167,70 @@ export function assertAllToolsCategorized(actualToolNames) {
       `Tools not categorized in shared/tool-categories.js: ${missing.join(", ")}.\n` +
       `Every built-in tool must be explicitly labeled as core / standard / optional. ` +
       `See the header of shared/tool-categories.js for the decision rules.`
+    );
+  }
+}
+
+function hasOwnDataPluginId(tool) {
+  if (!tool || (typeof tool !== "object" && typeof tool !== "function")) return false;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(tool, "_pluginId");
+    return !!descriptor
+      && Object.prototype.hasOwnProperty.call(descriptor, "value")
+      && typeof descriptor.value === "string"
+      && descriptor.value.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function hasOwnInvocationPermissionResolver(tool) {
+  if (!tool || (typeof tool !== "object" && typeof tool !== "function")) return false;
+  try {
+    const permissionDescriptor = Object.getOwnPropertyDescriptor(tool, "sessionPermission");
+    if (
+      !permissionDescriptor
+      || !Object.prototype.hasOwnProperty.call(permissionDescriptor, "value")
+      || !permissionDescriptor.value
+      || typeof permissionDescriptor.value !== "object"
+    ) {
+      return false;
+    }
+    const resolverDescriptor = Object.getOwnPropertyDescriptor(
+      permissionDescriptor.value,
+      "resolveInvocation",
+    );
+    return !!resolverDescriptor
+      && Object.prototype.hasOwnProperty.call(resolverDescriptor, "value")
+      && typeof resolverDescriptor.value === "function";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Startup invariant for the permission catalog. Every non-plugin built-in must
+ * either declare a synchronous tool-owned invocation resolver or be named in
+ * the explicit host-gateway list above. Plugin tools are intentionally skipped:
+ * a plugin without a declaration remains review-required at runtime.
+ *
+ * @param {Array<object>} actualTools
+ * @throws {Error} if a built-in has no permission boundary
+ */
+export function assertAllBuiltInToolsPermissionCovered(actualTools) {
+  const gatewayNames = new Set(BUILT_IN_PERMISSION_GATEWAY_TOOL_NAMES);
+  const missing = uniqueToolNames((actualTools || [])
+    .filter((tool) => !hasOwnDataPluginId(tool))
+    .filter((tool) => {
+      const name = typeof tool?.name === "string" ? tool.name : "";
+      return name && !gatewayNames.has(name) && !hasOwnInvocationPermissionResolver(tool);
+    })
+    .map((tool) => tool.name));
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Built-in tools missing invocation permission coverage: ${missing.join(", ")}.\n`
+      + "Add a tool-owned sessionPermission.resolveInvocation descriptor, or explicitly document its host gateway in shared/tool-categories.js.",
     );
   }
 }

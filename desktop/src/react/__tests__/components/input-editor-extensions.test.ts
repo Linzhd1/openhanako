@@ -111,6 +111,15 @@ describe('input editor extensions', () => {
     editor.destroy();
   });
 
+  it('registers Session and Agent mention badges as inline atoms', () => {
+    const editor = new Editor({ extensions: createInputEditorExtensions('') });
+
+    expect(editor.schema.nodes.sessionBadge?.spec.atom).toBe(true);
+    expect(editor.schema.nodes.agentBadge?.spec.atom).toBe(true);
+
+    editor.destroy();
+  });
+
   it('keeps text after markdown bold outside the bold mark even if stored marks are cleared', () => {
     const editor = new Editor({
       extensions: createInputEditorExtensions(''),
@@ -160,5 +169,44 @@ describe('input editor extensions', () => {
     });
 
     editor.destroy();
+  });
+
+  it('keeps markdown list input as rich list structure and serializes it as markdown text', () => {
+    const ordered = new Editor({
+      extensions: createInputEditorExtensions(''),
+    });
+    typeText(ordered, '1. first');
+
+    expect(ordered.getJSON().content?.[0]).toMatchObject({
+      type: 'orderedList',
+      attrs: { start: 1 },
+      content: [{
+        type: 'listItem',
+        content: [{
+          type: 'paragraph',
+          content: [{ type: 'text', text: 'first' }],
+        }],
+      }],
+    });
+    expect(serializeEditor(ordered.getJSON()).text).toBe('1. first');
+    ordered.destroy();
+
+    const bullet = new Editor({
+      extensions: createInputEditorExtensions(''),
+    });
+    typeText(bullet, '- first');
+
+    expect(bullet.getJSON().content?.[0]).toMatchObject({
+      type: 'bulletList',
+      content: [{
+        type: 'listItem',
+        content: [{
+          type: 'paragraph',
+          content: [{ type: 'text', text: 'first' }],
+        }],
+      }],
+    });
+    expect(serializeEditor(bullet.getJSON()).text).toBe('- first');
+    bullet.destroy();
   });
 });

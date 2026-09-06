@@ -4,7 +4,7 @@
 
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
 const getAutoLaunchStatus = vi.fn();
 const setAutoLaunchEnabled = vi.fn();
@@ -30,7 +30,7 @@ vi.mock('../../actions', () => ({
   updateSettingsSnapshot: (...args: unknown[]) => updateSettingsSnapshot(...args),
 }));
 
-vi.mock('../../widgets/Toggle', () => ({
+vi.mock('@/ui', () => ({
   Toggle: ({
     on,
     onChange,
@@ -58,9 +58,6 @@ vi.mock('../../widgets/Toggle', () => ({
       toggle
     </button>
   ),
-}));
-
-vi.mock('../../widgets/SelectWidget', () => ({
   SelectWidget: ({
     options,
     value,
@@ -115,7 +112,7 @@ beforeEach(() => {
     status: null,
   });
   hanaFetch.mockResolvedValue(jsonResponse({
-    notifications: { turnCompletion: 'never' },
+    notifications: { chatCompletion: 'never' },
   }));
   quickChatReloadShortcut.mockResolvedValue({ ok: true, shortcut: 'Alt+Space' });
   useSettingsStore.setState({
@@ -229,24 +226,35 @@ describe('GeneralTab', () => {
     expect(autoSaveConfig.mock.invocationCallOrder[0]).toBeLessThan(setKeepAwakeEnabled.mock.invocationCallOrder[0]);
   });
 
-  it('saves turn completion notification preference through the notification route', async () => {
+  it('renders three completion categories and saves the chat preference through the notification route', async () => {
     installHana();
     hanaFetch
       .mockResolvedValueOnce(jsonResponse({ quickChat: { shortcut: 'Alt+Space' } }))
-      .mockResolvedValueOnce(jsonResponse({ notifications: { turnCompletion: 'never' } }))
-      .mockResolvedValueOnce(jsonResponse({ ok: true, notifications: { turnCompletion: 'when_session_unfocused' } }));
+      .mockResolvedValueOnce(jsonResponse({ notifications: { chatCompletion: 'never' } }))
+      .mockResolvedValueOnce(jsonResponse({
+        ok: true,
+        notifications: {
+          chatCompletion: 'when_session_unfocused',
+          scheduledTaskCompletion: 'never',
+          patrolCompletion: 'never',
+        },
+      }));
 
     render(<GeneralTab />);
 
-    const select = await screen.findByLabelText('turn-completion-notification');
+    expect(await screen.findByText('settings.general.notifications.chatCompletion')).toBeTruthy();
+    expect(screen.getByText('settings.general.notifications.scheduledTaskCompletion')).toBeTruthy();
+    expect(screen.getByText('settings.general.notifications.patrolCompletion')).toBeTruthy();
+    const row = screen.getByTestId('chat-completion-notification-row');
+    const select = within(row).getByRole('combobox');
     await waitFor(() => expect((select as HTMLSelectElement).disabled).toBe(false));
-    expect(screen.getByText('settings.general.notifications.turnCompletionWhenSessionUnfocused')).toBeTruthy();
+    expect(within(row).getByText('settings.general.notifications.whenSessionUnfocused')).toBeTruthy();
     fireEvent.change(select, { target: { value: 'when_session_unfocused' } });
 
     await waitFor(() => expect(hanaFetch).toHaveBeenLastCalledWith('/api/preferences/notifications', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notifications: { turnCompletion: 'when_session_unfocused' } }),
+      body: JSON.stringify({ notifications: { chatCompletion: 'when_session_unfocused' } }),
     }));
     await waitFor(() => expect((select as HTMLSelectElement).value).toBe('when_session_unfocused'));
   });
@@ -255,7 +263,7 @@ describe('GeneralTab', () => {
     installHana();
     hanaFetch
       .mockResolvedValueOnce(jsonResponse({ quickChat: { shortcut: 'Alt+Space', reuseTimeoutMinutes: 5 } }))
-      .mockResolvedValueOnce(jsonResponse({ notifications: { turnCompletion: 'never' } }))
+      .mockResolvedValueOnce(jsonResponse({ notifications: { chatCompletion: 'never' } }))
       .mockResolvedValueOnce(jsonResponse({ ok: true, quickChat: { shortcut: 'CommandOrControl+Shift+K', reuseTimeoutMinutes: 5 } }));
     quickChatReloadShortcut.mockResolvedValue({ ok: true, shortcut: 'CommandOrControl+Shift+K' });
 
@@ -281,7 +289,7 @@ describe('GeneralTab', () => {
     installHana();
     hanaFetch
       .mockResolvedValueOnce(jsonResponse({ quickChat: { shortcut: 'Alt+Space', reuseTimeoutMinutes: 10 } }))
-      .mockResolvedValueOnce(jsonResponse({ notifications: { turnCompletion: 'never' } }))
+      .mockResolvedValueOnce(jsonResponse({ notifications: { chatCompletion: 'never' } }))
       .mockResolvedValueOnce(jsonResponse({ ok: true, quickChat: { shortcut: 'Alt+Space', reuseTimeoutMinutes: 5 } }));
 
     render(<GeneralTab />);
@@ -301,7 +309,7 @@ describe('GeneralTab', () => {
     installHana();
     hanaFetch
       .mockResolvedValueOnce(jsonResponse({ quickChat: { shortcut: 'CommandOrControl+Shift+K', reuseTimeoutMinutes: 10 } }))
-      .mockResolvedValueOnce(jsonResponse({ notifications: { turnCompletion: 'never' } }))
+      .mockResolvedValueOnce(jsonResponse({ notifications: { chatCompletion: 'never' } }))
       .mockResolvedValueOnce(jsonResponse({ ok: true, quickChat: { shortcut: 'Alt+Space', reuseTimeoutMinutes: 10 } }));
     quickChatReloadShortcut.mockResolvedValue({ ok: true, shortcut: 'Alt+Space' });
 

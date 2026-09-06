@@ -11,12 +11,12 @@ import { ComputerUseSection } from './ComputerUseSection';
 import {
   COMPACTION_MODE_EXPERIMENT_ID,
   COMPACTION_MODES,
+  INSTANT_SIMPLE_COMPACTION_EXPERIMENT_ID,
   normalizeCompactionMode,
 } from '../../../../../shared/compaction-mode.ts';
 import styles from '../Settings.module.css';
 
 const CACHE_SNAPSHOT_EXPERIMENT_ID = 'memory.cache_snapshot_reflection';
-const EDITABLE_MEMORY_EXPERIMENT_ID = 'memory.editable_facts';
 const DEEPSEEK_ROLEPLAY_REASONING_PATCH_EXPERIMENT_ID = 'provider.deepseek_roleplay_reasoning_patch';
 const PROACTIVE_SUBAGENT_EXPERIMENT_ID = 'subagent.proactive_delegation';
 
@@ -408,6 +408,11 @@ export function ExperimentsTab() {
         experiments: applyNextValue(snapshot.preferences.experiments as ExperimentDefinition[]),
       },
     }));
+    const change = { id, value: nextValue };
+    window.dispatchEvent(new CustomEvent('hana-settings', {
+      detail: { type: 'experiment-changed', ...change },
+    }));
+    window.platform?.settingsChanged?.('experiment-changed', change);
     showToast(t('settings.autoSaved'), 'success');
   };
 
@@ -422,6 +427,12 @@ export function ExperimentsTab() {
           {sessionExperiments.map((experiment) => (
             experiment.id === COMPACTION_MODE_EXPERIMENT_ID ? (
               <CompactionModeExperiment
+                key={experiment.id}
+                experiment={experiment}
+                onValueChange={updateExperimentValue}
+              />
+            ) : experiment.id === INSTANT_SIMPLE_COMPACTION_EXPERIMENT_ID ? (
+              <BooleanExperiment
                 key={experiment.id}
                 experiment={experiment}
                 onValueChange={updateExperimentValue}
@@ -474,12 +485,6 @@ export function ExperimentsTab() {
           memoryExperiments.map((experiment) => (
             experiment.id === CACHE_SNAPSHOT_EXPERIMENT_ID ? (
               <CacheSnapshotExperiment
-                key={experiment.id}
-                experiment={experiment}
-                onValueChange={updateExperimentValue}
-              />
-            ) : experiment.id === EDITABLE_MEMORY_EXPERIMENT_ID ? (
-              <BooleanExperiment
                 key={experiment.id}
                 experiment={experiment}
                 onValueChange={updateExperimentValue}

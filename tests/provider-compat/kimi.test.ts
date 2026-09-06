@@ -11,6 +11,15 @@ const kimiModel = {
   api: "openai-completions",
   baseUrl: "https://api.kimi.com/coding/v1",
   reasoning: true,
+  thinkingLevels: ["off", "low", "high", "max"],
+  defaultThinkingLevel: "high",
+  thinkingLevelMap: {
+    off: null,
+    low: "low",
+    medium: "high",
+    high: "high",
+    xhigh: "max",
+  },
   compat: {
     supportsDeveloperRole: false,
     thinkingFormat: "kimi",
@@ -24,7 +33,7 @@ describe("provider-compat/kimi", () => {
     expect(getReasoningProfile(kimiModel)).toBe("kimi-openai");
   });
 
-  it("enables thinking with Kimi official fields in chat mode", () => {
+  it("maps legacy medium to Kimi high in chat mode", () => {
     const payload = {
       model: "kimi-for-coding",
       max_tokens: 12000,
@@ -40,13 +49,13 @@ describe("provider-compat/kimi", () => {
     expect(result).toMatchObject({
       model: "kimi-for-coding",
       max_completion_tokens: 12000,
-      reasoning_effort: "medium",
+      reasoning_effort: "high",
       thinking: { type: "enabled" },
     });
     expect(result).not.toHaveProperty("max_tokens");
   });
 
-  it("maps xhigh to Kimi high effort instead of DeepSeek max", () => {
+  it("maps Hana Max/xhigh to Kimi max effort", () => {
     const result = normalizeProviderPayload({
       model: "kimi-for-coding",
       messages: [{ role: "user", content: "hi" }],
@@ -55,9 +64,69 @@ describe("provider-compat/kimi", () => {
       reasoningLevel: "xhigh",
     });
 
-    expect(result.reasoning_effort).toBe("high");
-    expect(result.thinking).toEqual({ type: "enabled" });
+    expect(result.reasoning_effort).toBe("max");
+    expect(result.thinking).toEqual({ type: "enabled", keep: "all" });
     expect(result).not.toHaveProperty("output_config");
+  });
+
+  it.each([
+    ["low", "low"],
+    ["high", "high"],
+    ["max", "max"],
+  ])("maps the visible %s level to Kimi %s", (reasoningLevel, expectedEffort) => {
+    const result = normalizeProviderPayload({
+      model: "kimi-for-coding",
+      messages: [{ role: "user", content: "hi" }],
+    }, kimiModel, {
+      mode: "chat",
+      reasoningLevel,
+    });
+
+    expect(result.reasoning_effort).toBe(expectedEffort);
+    expect(result).not.toHaveProperty("reasoning_effort", "auto");
+    expect(result).not.toHaveProperty("reasoning_effort", "medium");
+  });
+
+  it("resolves legacy auto from the model default instead of generic medium", () => {
+    const result = normalizeProviderPayload({
+      model: "kimi-for-coding",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "auto",
+    }, kimiModel, {
+      mode: "chat",
+      reasoningLevel: "auto",
+    });
+
+    expect(result.reasoning_effort).toBe("high");
+  });
+
+  it("honors a model-level thinkingLevelMap override", () => {
+    const result = normalizeProviderPayload({
+      model: "kimi-for-coding",
+      messages: [{ role: "user", content: "hi" }],
+    }, {
+      ...kimiModel,
+      thinkingLevelMap: { ...kimiModel.thinkingLevelMap, high: "max" },
+    }, {
+      mode: "chat",
+      reasoningLevel: "high",
+    });
+
+    expect(result.reasoning_effort).toBe("max");
+  });
+
+  it("turns thinking off without leaving a reasoning effort", () => {
+    const result = normalizeProviderPayload({
+      model: "kimi-for-coding",
+      messages: [{ role: "user", content: "hi" }],
+      reasoning_effort: "high",
+    }, kimiModel, {
+      mode: "chat",
+      reasoningLevel: "off",
+    });
+
+    expect(result.reasoning_effort).toBeUndefined();
+    expect(result.thinking).toEqual({ type: "disabled" });
   });
 
   it("disables thinking and strips replayed reasoning_content for utility calls", () => {
@@ -79,13 +148,62 @@ describe("provider-compat/kimi", () => {
     expect(result.messages[0]).not.toHaveProperty("reasoning_content");
   });
 
+  it("fixes kimi-for-coding utility temperature at the provider-compatible value", () => {
+    const result = normalizeProviderPayload({
+      model: "kimi-for-coding",
+      messages: [{ role: "user", content: "summarize" }],
+      temperature: 0.3,
+    }, kimiModel, { mode: "utility" });
+
+    expect(result.temperature).toBe(0.6);
+    expect(result.thinking).toEqual({ type: "disabled" });
+  });
+
+  it.each(["k3", "k3-256k"])(
+    "omits unsupported temperature from %s summary requests",
+    (modelId) => {
+      const result = normalizeProviderPayload({
+        model: modelId,
+        messages: [{ role: "user", content: "summarize" }],
+        temperature: 0.3,
+      }, {
+        ...kimiModel,
+        id: modelId,
+      }, { mode: "utility" });
+
+      expect(result).not.toHaveProperty("temperature");
+      expect(result.thinking).toEqual({ type: "disabled" });
+    },
+  );
+
+  it("omits unsupported K3 temperature from chat requests", () => {
+    const result = normalizeProviderPayload({
+      model: "k3",
+      messages: [{ role: "user", content: "hi" }],
+      temperature: 0.7,
+    }, {
+      ...kimiModel,
+      id: "k3",
+    }, {
+      mode: "chat",
+      reasoningLevel: "high",
+    });
+
+    expect(result).not.toHaveProperty("temperature");
+    expect(result.thinking).toEqual({ type: "enabled", keep: "all" });
+  });
+
   it("recovers reasoning_content for Kimi tool-call replay", () => {
     const payload = {
       model: "kimi-for-coding",
       messages: [
         {
           role: "assistant",
-          content: [{ type: "text", text: "I need to inspect the file." }],
+          content: [{
+            type: "thinking",
+            thinking: "I need to inspect the file.",
+            thinkingSignature: "reasoning_content",
+          }],
           tool_calls: [{
             id: "call_1",
             type: "function",
@@ -200,6 +318,7 @@ describe("provider-compat/kimi", () => {
       provider: "openai",
       api: "openai-completions",
     }, { mode: "chat" });
-    expect(nonKimiResult).toBe(payload);
+    expect(nonKimiResult).toEqual({ ...payload, max_tokens: 65_536 });
+    expect(nonKimiResult.tools).toEqual(payload.tools);
   });
 });

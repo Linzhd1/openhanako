@@ -192,17 +192,31 @@ pre code {
 }
 
 /* Tables */
+.markdown-table-scroll {
+  max-width: 100%;
+  margin: 1.5em 0;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
   margin: 1.5em 0;
   font-size: 0.95em;
+  table-layout: fixed;
+}
+
+.markdown-table-scroll > table {
+  margin: 0;
+  table-layout: fixed;
 }
 
 th, td {
   border: 1px solid var(--sakura-border);
   padding: 0.6em 1em;
   text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 th {

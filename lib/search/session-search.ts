@@ -34,6 +34,7 @@ export function searchSessions(sessions, query, options: { phase?: string; limit
       modelId: session.modelId || null,
       modelProvider: session.modelProvider || null,
       pinnedAt: session.pinnedAt || null,
+      pinOrder: Number.isFinite(session.pinOrder) ? session.pinOrder : null,
       matchKind: phase,
       snippet: buildSnippet(fieldText, normalizedQuery, match.token),
       score: match.score,
@@ -90,7 +91,7 @@ function scoreText(text, normalizedQuery, tokens, phase) {
   return { matched: true, score, token: matchedToken };
 }
 
-function isSearchableToken(token) {
+export function isSearchableToken(token) {
   if (!token) return false;
   if (token.length >= 2 && /[\p{Script=Han}]/u.test(token)) return true;
   if (/^[a-z0-9_][a-z0-9_.-]*$/u.test(token)) return token.length >= 2;
@@ -122,7 +123,7 @@ function timestampOf(value) {
   return Number.isNaN(time) ? 0 : time;
 }
 
-function buildSnippet(text, normalizedQuery, token) {
+export function buildSnippet(text, normalizedQuery, token) {
   const raw = collapseWhitespace(text);
   if (!raw) return "";
 

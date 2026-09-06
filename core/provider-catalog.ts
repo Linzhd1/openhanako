@@ -1,8 +1,15 @@
 import fs from "fs";
 import path from "path";
 import YAML from "js-yaml";
-import { atomicWriteSync, safeReadYAMLSync } from "../shared/safe-fs.ts";
+import { safeReadYAMLSync } from "../shared/safe-fs.ts";
+import {
+  SECRET_DIR_MODE,
+  ensureSecretDirModeSync,
+  ensureSecretFileModeSync,
+  writeSecretFileSync,
+} from "../shared/secret-fs.ts";
 import { SEARCH_CAPABILITY_KIND, SEARCH_CAPABILITY_PROVIDERS } from "../shared/search-providers.ts";
+import { migrationBackupsRoot } from "./migration-backups.ts";
 
 export const PROVIDER_CATALOG_VERSION = 2;
 export const PROVIDER_CATALOG_FILE = "provider-catalog.json";
@@ -19,6 +26,11 @@ function isPlainObject(value: any): value is Record<string, any> {
 
 function cloneData<T>(value: T): T {
   return structuredClone(value);
+}
+
+function readJsonTextWithoutBom(filePath: string) {
+  const raw = fs.readFileSync(filePath, "utf-8");
+  return raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
 }
 
 function normalizeDeletedProviders(value: any): string[] {
@@ -143,7 +155,7 @@ export class ProviderCatalogStore {
 
   save(catalog: any) {
     const normalized = normalizeProviderCatalog(catalog);
-    atomicWriteSync(this.catalogPath, JSON.stringify(normalized, null, 2) + "\n");
+    writeSecretFileSync(this.catalogPath, JSON.stringify(normalized, null, 2) + "\n");
     return normalized;
   }
 
@@ -174,7 +186,7 @@ export class ProviderCatalogStore {
   _readExistingCatalog() {
     let parsed: any = null;
     try {
-      parsed = JSON.parse(fs.readFileSync(this.catalogPath, "utf-8"));
+      parsed = JSON.parse(readJsonTextWithoutBom(this.catalogPath));
     } catch (err: any) {
       if (err?.code === "ENOENT") return null;
       throw err;
@@ -209,16 +221,22 @@ export class ProviderCatalogStore {
     if (existingFiles.length === 0) return;
 
     const backupDir = path.join(
-      this._hanakoHome,
-      "migration-backups",
+      migrationBackupsRoot(this._hanakoHome),
       `provider-catalog-v1-${timestampSlug()}`,
     );
-    fs.mkdirSync(backupDir, { recursive: true });
+    fs.mkdirSync(backupDir, { recursive: true, mode: SECRET_DIR_MODE });
+    // recursive 创建不会重设已存在目录的权限，显式收紧一次
+    ensureSecretDirModeSync(backupDir);
 
     const copiedFiles = [];
     for (const filePath of existingFiles) {
       const filename = path.basename(filePath);
-      fs.copyFileSync(filePath, path.join(backupDir, filename));
+      const backupPath = path.join(backupDir, filename);
+      // 逐字节复制，不做解码再编码：备份必须与源文件完全一致。
+      // 复制后立即收紧权限；这中间的瞬时窗口不构成暴露，因为备份目录本身
+      // 已经只对当前用户开放。
+      fs.copyFileSync(filePath, backupPath);
+      ensureSecretFileModeSync(backupPath);
       copiedFiles.push(filename);
     }
 
@@ -229,6 +247,6 @@ export class ProviderCatalogStore {
       providers: Object.keys(catalog.providers).sort(),
       copiedFiles,
     };
-    atomicWriteSync(path.join(backupDir, "migration-report.json"), JSON.stringify(report, null, 2) + "\n");
+    writeSecretFileSync(path.join(backupDir, "migration-report.json"), JSON.stringify(report, null, 2) + "\n");
   }
 }

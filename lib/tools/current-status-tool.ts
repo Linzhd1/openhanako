@@ -5,6 +5,7 @@
  * list/get 协议；每个状态项由独立 provider 负责，后续扩展只加 provider。
  */
 
+import path from "path";
 import { StringEnum, Type } from "../pi-sdk/index.ts";
 import { getAppearanceStatus } from "./appearance-status.ts";
 import { getToolSessionPath } from "./tool-session.ts";
@@ -105,6 +106,11 @@ function provider(key, description, get) {
   return { key, description, get };
 }
 
+function resolveNow(deps: Record<string, any>): Date {
+  const value = deps.now?.();
+  return value instanceof Date ? value : new Date();
+}
+
 function statusOutput(payload, contentBlocks = [], details = {}) {
   return {
     __currentStatusOutput: true,
@@ -144,10 +150,27 @@ function normalizeOperations(value) {
     : [];
 }
 
+function sessionFileRef(fileId) {
+  return fileId ? { kind: "session-file", fileId } : null;
+}
+
+function writableLocalRefForSessionFile(source, status) {
+  const origin = nullableString(source.origin);
+  const filePath = nullableString(source.filePath);
+  if (origin !== "agent_write" && origin !== "agent_edit") return null;
+  if (status === "expired" || source.isDirectory === true) return null;
+  if (!filePath || !path.isAbsolute(filePath)) return null;
+  return { kind: "local-file", path: filePath };
+}
+
 function normalizeSessionFile(file) {
   const source = file && typeof file === "object" ? file : {};
+  const fileId = nullableString(source.fileId || source.id);
+  const status = nullableString(source.status) || "available";
   return {
-    fileId: nullableString(source.fileId || source.id),
+    fileId,
+    sessionFileRef: sessionFileRef(fileId),
+    writableLocalRef: writableLocalRefForSessionFile(source, status),
     label: nullableString(source.label || source.displayName || source.filename || source.filePath),
     displayName: nullableString(source.displayName),
     filename: nullableString(source.filename),
@@ -158,12 +181,10 @@ function normalizeSessionFile(file) {
     origin: nullableString(source.origin),
     operations: normalizeOperations(source.operations),
     storageKind: nullableString(source.storageKind),
-    status: nullableString(source.status) || "available",
+    status,
     missingAt: nullableNumber(source.missingAt),
     createdAt: nullableNumber(source.createdAt),
     isDirectory: source.isDirectory === true,
-    filePath: nullableString(source.filePath),
-    realPath: nullableString(source.realPath),
   };
 }
 
@@ -278,10 +299,7 @@ function normalizeProvider(item) {
 }
 
 export function createCurrentStatusRegistry(deps: Record<string, any> = {}) {
-  const getNow = () => {
-    const value = deps.now?.();
-    return value instanceof Date ? value : new Date();
-  };
+  const getNow = () => resolveNow(deps);
   const getTimezone = () => resolveTimezone(deps.getTimezone?.());
   const getStatusModel = ({ sessionPath, ctx }: Record<string, any> = {}) => (
     ctx?.model
@@ -407,7 +425,7 @@ export function createCurrentStatusTool(deps: Record<string, any> = {}) {
   return {
     name: "current_status",
     label: "Current Status",
-    description: "Lightweight current-environment status (time, agent identity, UI context, Bridge context, etc.). System prompt time is a snapshot and may be stale; call with key=\"time\" for precise current time. Use action=list to discover available keys.",
+    description: "Lightweight current-environment status (time, agent identity, UI context, Bridge context, etc.). The system prompt's \"Session started at\" line is a frozen snapshot of when the session began; call with key=\"time\" for the precise current time. Use action=list to discover available keys.",
     parameters: Type.Object({
       action: StringEnum(["list", "get"], {
         description: "list returns available status keys; get returns one status key value.",

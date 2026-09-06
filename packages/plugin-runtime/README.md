@@ -93,6 +93,9 @@ import { getPluginRequestContext } from '@hana/plugin-runtime';
 export default function(app) {
   app.post('/create-session', async (c) => {
     const req = getPluginRequestContext(c);
+    // req.agentId is null when the surface belongs to no agent (a preview, for
+    // example). Handle that case rather than treating it as a default agent.
+    if (!req.agentId) return c.json({ error: 'this surface has no agent yet' }, 400);
     const result = await req.bus.request('session:create', { agentId: req.agentId });
     return c.json(result);
   });
@@ -203,12 +206,26 @@ execution boundary and perform any source mutation through ResourceIO.
 ## Tool session permissions
 
 Declare `sessionPermission` on Agent-callable tools so Hana can apply the current
-session permission mode before the tool runs. Use `readOnly: true` for pure reads,
-`kind: 'plugin_output'` for bounded plugin-data writes returned through
-`stageFile()`, and `kind: 'external_side_effect'` for provider, network, platform,
-or account actions that Auto mode should send to the reviewer. Workspace edits
-should stay reviewer-bound unless `describeSideEffect(input)` clearly describes
-the target and write behavior.
+session permission mode before the tool runs. Prefer an invocation resolver and
+classify each concrete action as `read`, `routine`, or `review`:
+
+- `read` only inspects already-authorized data and also runs in Read-only mode.
+- `routine` declares that the action stays within the current workspace/sandbox.
+  Plugin invocations remain automatically reviewed in Auto unless the host has
+  explicitly preauthorized that exact capability; Ask prompts and Read-only
+  blocks it.
+- `review` crosses a trust boundary, such as an external service, account,
+  notification route, or destructive target. Auto sends only this invocation to
+  the automatic reviewer.
+
+Static `readOnly`, `kind`, and `auto` fields remain the compatibility path for
+existing tools without an invocation resolver. For example, use `readOnly: true`
+for pure reads, `kind: 'plugin_output'` for bounded plugin-data writes returned
+through `stageFile()`, and `kind: 'external_side_effect'` for provider, network,
+platform, or account actions. The host accepts that legacy path only from
+resolver-less, plain own-data metadata and copies the supported fields before
+policy evaluation; accessors, inherited resolvers, and class instances fail
+closed.
 
 ```ts
 export const renderImage = defineTool({
@@ -227,6 +244,57 @@ export const renderImage = defineTool({
   },
 });
 ```
+
+Multi-action tools should additionally resolve each concrete call with the
+synchronous, non-mutating `resolveInvocation(input)` contract. The capability is
+the tool's local definition name plus the resolved action. Hana strips the plugin
+prefix before checking this relation, so a plugin tool named `team_message`
+declares `team_message.send`, not `<plugin-id>_team_message.send`.
+
+```ts
+export const teamMessage = defineTool({
+  name: 'team_message',
+  description: 'Read or send a team-channel message.',
+  sessionPermission: {
+    resolveInvocation(input: { action: string; channelId?: string }) {
+      if (input.action === 'read' && input.channelId) {
+        return {
+          action: 'read',
+          kind: 'read',
+          capability: 'team_message.read',
+          target: { type: 'channel', id: input.channelId },
+        };
+      }
+      if (input.action === 'send' && input.channelId) {
+        return {
+          action: 'send',
+          kind: 'review',
+          capability: 'team_message.send',
+          target: { type: 'channel', id: input.channelId, label: input.channelId },
+        };
+      }
+      return null;
+    },
+  },
+  async execute(input, ctx) {
+    // ...
+  },
+});
+```
+
+Resolvers must return a plain descriptor synchronously. Returning `null`,
+throwing, returning a Promise/thenable, using an unknown kind, or declaring a
+capability that does not match `<tool-name>.<action>` fails closed; Hana attaches
+a rejection consumer to asynchronous results and never falls back to the legacy
+static policy once a resolver exists. The resolver owns the mapping from its
+input schema to this stable permission action; the host does not infer aliases.
+
+Targets use a stable, wildcard-free `{ type, id, label? }` identity, with `id`
+limited to 4096 characters. Sort multi-target inputs before deriving `id`;
+`label` is display-only reviewer context and never participates in identity.
+Context-default or otherwise dynamic routes stay per-invocation reviews. Actor,
+server, and session identity are derived by the host and must never appear in a
+resolver descriptor or its `sideEffect` metadata.
 
 ## Session, Agent, model, and media helpers
 
@@ -414,7 +482,7 @@ export const startRun = defineTool({
 });
 ```
 
-The helper requires `sessionId` / `sessionRef`; passing only a legacy `sessionPath` throws. Hana resolves the current path through the session manifest and only renders sessions owned by the same plugin with `plugin_private` or `private` visibility. Main currently provides a thin native transcript surface; richer composer and native card composition are reserved for the Infinity Chalkboard / Card Kernel layer.
+The helper requires `sessionId` / `sessionRef`; passing only a legacy `sessionPath` throws. Hana resolves the current path through the session manifest and only renders sessions owned by the same plugin with `plugin_private` or `private` visibility. Main currently provides a thin native transcript surface; richer composer and native card composition are not part of the public runtime contract yet.
 
 ## Provider contributions
 
@@ -479,6 +547,17 @@ export const { id, displayName, authType, runtime, capabilities } = provider;
 ```
 
 Keep chat and media capabilities explicit. Media-only providers should use `chat.projection = "none"`, and CLI providers must use structured argument bindings rather than shell command strings.
+
+Chat providers may separate their Hana catalog identity from their execution identity. Use
+`runtimeProviderId` for the execution/auth key and `credentialSource` to declare ownership:
+`provider-catalog` reads API-key configuration, `auth-storage` uses the OAuth store without
+copying tokens into `models.json`, and `none` is for providers that require no credential.
+The `models` field has three states: missing uses the provider declaration defaults, `[]`
+explicitly disables chat models, and a non-empty array is the exact user allowlist.
+`sdk-auth-alias` remains a legacy compatibility mode whose model list is owned by the
+runtime SDK catalog. New OAuth providers should use `projection: "models-json"` together
+with `credentialSource: "auth-storage"` so the host owns the model catalog while the
+OAuth store owns request credentials.
 
 Legacy image-generation plugins may still use `media-gen:register-adapter` as a compatibility execution path. New plugins and Agent-generated scaffolds must not call `media-gen:*`; declare a ProviderPlugin with `capabilities.media.*` for discovery, then use the stable media helpers or the formal Adapter Plugin API when that execution surface is available.
 

@@ -69,6 +69,21 @@ describe("VisionBridge", () => {
     }
   });
 
+  it("awaits fresh vision credentials before any analysis request", async () => {
+    const callText = vi.fn();
+    const { bridge } = makeBridge(callText, async () => {
+      throw new Error("oauth refresh failed");
+    });
+
+    await expect(bridge.prepare({
+      sessionPath: "/tmp/session.jsonl",
+      targetModel: { id: "text-only", provider: "test", input: ["text"] },
+      text: "what is this?",
+      images: [image],
+    })).rejects.toThrow("oauth refresh failed");
+    expect(callText).not.toHaveBeenCalled();
+  });
+
   it("analyzes text-only model images and registers notes by attachment path", async () => {
     const { bridge, callText } = makeBridge();
 
@@ -96,6 +111,37 @@ describe("VisionBridge", () => {
     expect(injected.messages[0].content[0].text).toContain("image_overview");
     expect(injected.messages[0].content[0].text).toContain("user_request_answer");
     expect(injected.messages[0].content[0].text).toContain(VISION_CONTEXT_END);
+  });
+
+  it("forwards resolved Grok OAuth provider and model headers to auxiliary vision callText", async () => {
+    const callText = vi.fn(async () => "image_overview: A screenshot.");
+    const { bridge } = makeBridge(callText, () => ({
+      model: { id: "grok-4.1", provider: "xai", input: ["text", "image"] },
+      api: "openai-completions",
+      api_key: "oauth-token",
+      base_url: "https://api.x.ai/v1",
+      headers: {
+        "x-grok-client-version": "0.1.202",
+        "x-grok-model-override": "grok-4.1",
+      },
+    }));
+
+    await bridge.prepare({
+      sessionPath: "/tmp/session.jsonl",
+      targetModel: { id: "text-only", provider: "test", input: ["text"] },
+      text: "what is this?",
+      images: [image],
+    });
+
+    expect(callText).toHaveBeenCalledWith(expect.objectContaining({
+      api: "openai-completions",
+      apiKey: "oauth-token",
+      baseUrl: "https://api.x.ai/v1",
+      headers: {
+        "x-grok-client-version": "0.1.202",
+        "x-grok-model-override": "grok-4.1",
+      },
+    }));
   });
 
   it("records auxiliary vision usage against sessionId while keeping the path locator", async () => {
@@ -260,6 +306,123 @@ describe("VisionBridge", () => {
       sessionPath: movedSessionPath,
       note: "image_overview: moved path screenshot.",
     });
+  });
+
+  it("forks only vision notes reachable from the retained session prefix", () => {
+    const dir = makeTempDir();
+    const sourceSessionPath = path.join(dir, "source.jsonl");
+    const targetSessionPath = path.join(dir, "target.jsonl");
+    const sourceSessionId = "sess_vision_source";
+    const targetSessionId = "sess_vision_target";
+    const retainedKey = "visual-resource:retained-shot";
+    const hiddenKey = "visual-resource:hidden-shot";
+    fs.writeFileSync(path.join(dir, "session-vision-notes.json"), JSON.stringify({
+      version: 1,
+      sessions: {
+        [sourceSessionId]: {
+          sessionId: sourceSessionId,
+          sessionPath: sourceSessionPath,
+          images: {
+            [retainedKey]: {
+              note: "retained note",
+              imagePath: retainedKey,
+              sessionId: sourceSessionId,
+              sessionPath: sourceSessionPath,
+              updatedAt: 10,
+            },
+            [hiddenKey]: {
+              note: "hidden note",
+              imagePath: hiddenKey,
+              sessionId: sourceSessionId,
+              sessionPath: sourceSessionPath,
+              updatedAt: 20,
+            },
+          },
+        },
+      },
+    }), "utf-8");
+
+    const bridge = makeVisionBridge({
+      getSessionIdForPath: (candidate) => {
+        if (candidate === sourceSessionPath) return sourceSessionId;
+        if (candidate === targetSessionPath) return targetSessionId;
+        return null;
+      },
+    });
+    const result = bridge.forkSessionNotes({
+      sourceSessionId,
+      sourceSessionPath,
+      targetSessionId,
+      targetSessionPath,
+      retainedEntries: [{ type: "custom", data: { resourceKey: retainedKey } }],
+    });
+
+    expect(result).toEqual({ notes: 1, keys: [retainedKey] });
+    const sidecar = JSON.parse(fs.readFileSync(path.join(dir, "session-vision-notes.json"), "utf-8"));
+    expect(sidecar.sessions[sourceSessionId].images[hiddenKey].note).toBe("hidden note");
+    expect(sidecar.sessions[targetSessionId].images).toEqual({
+      [retainedKey]: expect.objectContaining({
+        note: "retained note",
+        sessionId: targetSessionId,
+        sessionPath: targetSessionPath,
+      }),
+    });
+    expect(bridge.lookupNote(targetSessionPath, retainedKey)).toMatchObject({
+      note: "retained note",
+      sessionId: targetSessionId,
+      sessionPath: targetSessionPath,
+    });
+    expect(bridge.lookupNote(targetSessionPath, hiddenKey)).toBeNull();
+  });
+
+  it("discards forked vision notes without touching the source session", () => {
+    const dir = makeTempDir();
+    const sourceSessionPath = path.join(dir, "source.jsonl");
+    const targetSessionPath = path.join(dir, "target.jsonl");
+    const sourceSessionId = "sess_vision_source";
+    const targetSessionId = "sess_vision_target";
+    const resourceKey = "visual-resource:retained-shot";
+    fs.writeFileSync(path.join(dir, "session-vision-notes.json"), JSON.stringify({
+      version: 1,
+      sessions: {
+        [sourceSessionId]: {
+          sessionId: sourceSessionId,
+          sessionPath: sourceSessionPath,
+          images: {
+            [resourceKey]: {
+              note: "source note",
+              imagePath: resourceKey,
+              sessionId: sourceSessionId,
+              sessionPath: sourceSessionPath,
+            },
+          },
+        },
+      },
+    }), "utf-8");
+    const bridge = makeVisionBridge({
+      getSessionIdForPath: (candidate) => candidate === targetSessionPath ? targetSessionId : sourceSessionId,
+    });
+
+    bridge.forkSessionNotes({
+      sourceSessionId,
+      sourceSessionPath,
+      targetSessionId,
+      targetSessionPath,
+      retainedEntries: [{ resourceKey }],
+    });
+    expect(bridge.discardForkedSessionNotes({
+      sessionId: targetSessionId,
+      sessionPath: targetSessionPath,
+    })).toBe(true);
+    expect(bridge.discardForkedSessionNotes({
+      sessionId: targetSessionId,
+      sessionPath: targetSessionPath,
+    })).toBe(false);
+
+    const sidecar = JSON.parse(fs.readFileSync(path.join(dir, "session-vision-notes.json"), "utf-8"));
+    expect(sidecar.sessions[sourceSessionId].images[resourceKey].note).toBe("source note");
+    expect(sidecar.sessions[targetSessionId]).toBeUndefined();
+    expect(bridge.lookupNote(targetSessionPath, resourceKey)).toBeNull();
   });
 
   it("summarizes resources on explicit request without requiring a text-only target model", async () => {

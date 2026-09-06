@@ -3,8 +3,7 @@ import { useSettingsStore } from '../store';
 import { autoSaveConfig, t } from '../helpers';
 import { hanaFetch } from '../api';
 import { loadSettingsConfig } from '../actions';
-import { Toggle } from '../widgets/Toggle';
-import { SelectWidget } from '@/ui';
+import { SelectWidget, Toggle } from '@/ui';
 import { readConfigBoolean } from '../resource-state';
 import { SettingsSection } from '../components/SettingsSection';
 import { SettingsRow } from '../components/SettingsRow';
@@ -74,7 +73,7 @@ export function SecurityTab() {
   const platformName = useSettingsStore(s => s.platformName);
   const showToast = useSettingsStore(s => s.showToast);
   // 默认开（!== false）：和后端 preferences-manager.getSandboxNetwork / engine.getSandboxNetwork 保持一致。
-  // 见 core/preferences-manager.js:86 和 commit 51ecc435。
+  // 见 core/preferences-manager.ts:86 和 commit 51ecc435。
   const sandboxEnabled = readConfigBoolean(settingsConfig, cfg => cfg.sandbox, true);
   const isWindows = platformName === 'win32';
   const sandboxNetworkEnabled = settingsConfig

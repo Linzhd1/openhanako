@@ -43,6 +43,7 @@ export interface ContinuousBottomScrollController {
 const DEFAULT_STICKY_THRESHOLD = 48;
 const DEFAULT_LARGE_JUMP_PX = 720;
 const FOLLOW_TIME_CONSTANT_MS = 85;
+const SCROLL_EPSILON_PX = 0.5;
 
 function finiteNumber(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -76,6 +77,8 @@ export function useContinuousBottomScroll({
   const lastFrameTimeRef = useRef<number | null>(null);
   const followingRef = useRef(false);
   const instantLandingArmedRef = useRef(false);
+  const programmaticScrollTopRef = useRef<number | null>(null);
+  const lastObservedScrollHeightRef = useRef<number | null>(null);
 
   activeRef.current = active;
   thresholdRef.current = stickyThreshold;
@@ -88,6 +91,12 @@ export function useContinuousBottomScroll({
     }
     followingRef.current = false;
     lastFrameTimeRef.current = null;
+  }, []);
+
+  const setProgrammaticScrollTop = useCallback((el: HTMLElement, value: number) => {
+    const safeValue = finiteNumber(value);
+    programmaticScrollTopRef.current = safeValue;
+    el.scrollTop = safeValue;
   }, []);
 
   const checkSticky = useCallback(() => {
@@ -124,15 +133,21 @@ export function useContinuousBottomScroll({
     const current = finiteNumber(el.scrollTop);
     const delta = target - current;
 
-    if (Math.abs(delta) <= 0.5 || delta < 0) {
-      el.scrollTop = target;
+    if (Math.abs(delta) <= SCROLL_EPSILON_PX) {
+      setProgrammaticScrollTop(el, target);
       stopFollow();
+      return;
+    }
+
+    if (delta < 0) {
+      stopFollow();
+      checkSticky();
       return;
     }
 
     const largeJump = finiteNumber(largeJumpRef.current, DEFAULT_LARGE_JUMP_PX);
     if (delta > largeJump || prefersReducedMotion()) {
-      el.scrollTop = target;
+      setProgrammaticScrollTop(el, target);
       stopFollow();
       return;
     }
@@ -144,9 +159,9 @@ export function useContinuousBottomScroll({
     lastFrameTimeRef.current = safeTime;
     const rawAlpha = 1 - Math.exp(-dt / FOLLOW_TIME_CONSTANT_MS);
     const alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1;
-    el.scrollTop = current + delta * alpha;
+    setProgrammaticScrollTop(el, current + delta * alpha);
     rafRef.current = window.requestAnimationFrame(runFrame);
-  }, [scrollRef, stopFollow]);
+  }, [checkSticky, scrollRef, setProgrammaticScrollTop, stopFollow]);
 
   const followBottom = useCallback(() => {
     const el = scrollRef.current;
@@ -154,10 +169,16 @@ export function useContinuousBottomScroll({
 
     const target = maxScrollTop(el);
     const delta = target - finiteNumber(el.scrollTop);
-    if (delta <= 0.5) {
+    if (Math.abs(delta) <= SCROLL_EPSILON_PX) {
       // Already at bottom: a no-op follow must NOT consume an armed instant landing — the arm is
       // reserved for the first *meaningful* growth (the async hydrate after a switch).
-      el.scrollTop = target;
+      setProgrammaticScrollTop(el, target);
+      return;
+    }
+
+    if (delta < 0) {
+      stopFollow();
+      checkSticky();
       return;
     }
 
@@ -165,14 +186,14 @@ export function useContinuousBottomScroll({
     // animating from a mid position, then disarm so subsequent streaming growth animates normally.
     if (instantLandingArmedRef.current) {
       instantLandingArmedRef.current = false;
-      el.scrollTop = target;
+      setProgrammaticScrollTop(el, target);
       stopFollow();
       return;
     }
 
     const largeJump = finiteNumber(largeJumpRef.current, DEFAULT_LARGE_JUMP_PX);
     if (delta > largeJump || prefersReducedMotion()) {
-      el.scrollTop = target;
+      setProgrammaticScrollTop(el, target);
       stopFollow();
       return;
     }
@@ -181,7 +202,7 @@ export function useContinuousBottomScroll({
     lastFrameTimeRef.current = null;
     followingRef.current = true;
     rafRef.current = window.requestAnimationFrame(runFrame);
-  }, [runFrame, scrollRef, stopFollow]);
+  }, [checkSticky, runFrame, scrollRef, stopFollow]);
 
   const scrollToBottom = useCallback((options: ScrollToBottomOptions = {}) => {
     const el = scrollRef.current;
@@ -191,11 +212,11 @@ export function useContinuousBottomScroll({
 
     const mode = options.mode ?? 'instant';
     if (mode === 'instant') {
-      el.scrollTop = maxScrollTop(el);
+      setProgrammaticScrollTop(el, maxScrollTop(el));
       return;
     }
     followBottom();
-  }, [followBottom, markSticky, scrollRef, stopFollow]);
+  }, [followBottom, markSticky, scrollRef, setProgrammaticScrollTop, stopFollow]);
 
   useEffect(() => {
     if (!active) stopFollow();
@@ -208,7 +229,26 @@ export function useContinuousBottomScroll({
     if (!el || !active) return undefined;
 
     const onScroll = () => {
-      if (followingRef.current) return;
+      if (followingRef.current) {
+        const expected = programmaticScrollTopRef.current;
+        const current = finiteNumber(el.scrollTop);
+        if (expected !== null && Math.abs(current - expected) <= 1) return;
+        // A scroll event whose scrollHeight already differs from what we last observed cannot be
+        // user intent (a wheel/touch/keyboard scroll is cancelled explicitly elsewhere, and a
+        // scrollbar drag never changes content height). It's the browser clamping/anchoring the
+        // scroll position in reaction to a same-frame content-size change (e.g. process-fold
+        // collapse or typing-indicator removal at turn end) — ignore it and let the
+        // ResizeObserver branch below handle the resulting follow.
+        const lastObserved = lastObservedScrollHeightRef.current;
+        if (lastObserved !== null
+          && Math.abs(finiteNumber(el.scrollHeight) - lastObserved) > SCROLL_EPSILON_PX) {
+          return;
+        }
+        if (distanceFromBottom(el) > finiteNumber(thresholdRef.current, DEFAULT_STICKY_THRESHOLD)) {
+          cancelFollow();
+          return;
+        }
+      }
       checkSticky();
     };
     const onWheel = (event: WheelEvent) => {
@@ -237,15 +277,52 @@ export function useContinuousBottomScroll({
 
   useLayoutEffect(() => {
     const ResizeObserverImpl = window.ResizeObserver;
+    const el = scrollRef.current;
     const target = contentRef?.current ?? scrollRef.current;
-    if (!active || !target || !ResizeObserverImpl) return undefined;
+    if (!active || !el || !target || !ResizeObserverImpl) return undefined;
+
+    lastObservedScrollHeightRef.current = finiteNumber(el.scrollHeight);
 
     const observer = new ResizeObserverImpl(() => {
+      const previousScrollHeight = lastObservedScrollHeightRef.current;
+      const nextScrollHeight = finiteNumber(el.scrollHeight);
+      lastObservedScrollHeightRef.current = nextScrollHeight;
+
+      if (
+        previousScrollHeight !== null
+        && nextScrollHeight < previousScrollHeight - SCROLL_EPSILON_PX
+      ) {
+        // Content shrank (e.g. process-fold collapse / typing-indicator removal at turn end).
+        // If we were actively sticky, keep following to the new bottom instead of dropping out —
+        // the user hadn't scrolled away, the content just got shorter underneath them.
+        if (isStickyRef.current) {
+          // If a follow animation is already mid-flight, let it be: its own runFrame will settle
+          // against the new (smaller) target on its next tick, and followBottom()'s reentrancy
+          // guard (rafRef.current !== null) would no-op here anyway. This preserves "don't force
+          // an upward snap mid-animation" — a shrink that lands behind an in-flight animation's
+          // current position shouldn't yank the view backwards mid-motion.
+          if (followingRef.current) {
+            followBottom();
+            return;
+          }
+          // Otherwise we were at rest (already caught up to the old bottom). The shrink can leave
+          // scrollTop resting past the new maxScrollTop — a real browser clamps that overscroll
+          // natively and instantly, so mirror that here instead of waiting for unrelated future
+          // growth to paper over the drift.
+          const stickyEl = scrollRef.current;
+          if (stickyEl) setProgrammaticScrollTop(stickyEl, maxScrollTop(stickyEl));
+          return;
+        }
+        stopFollow();
+        checkSticky();
+        return;
+      }
+
       followBottom();
     });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [active, contentRef, followBottom, scrollRef]);
+  }, [active, checkSticky, contentRef, followBottom, scrollRef, setProgrammaticScrollTop, stopFollow]);
 
   return useMemo(() => ({
     isStickyRef,

@@ -9,6 +9,7 @@ import {
 } from '../../utils/markdown-cover-generation';
 import { hanaFetch } from '../../hooks/use-hana-fetch';
 import { useI18n } from '../../hooks/use-i18n';
+import { useStore } from '../../stores';
 import { Tooltip } from '../../ui';
 import { extOfName, inferKindByExt } from '../../utils/file-kind';
 import type { RemoteContentRef, RemoteWorkbenchContentRef } from '../../types';
@@ -63,7 +64,7 @@ function getAgentGenerateDisabledText(status: CoverGenerationStatus): string {
       return t('cover.agentGenerate.defaultModelMissing');
     case 'default-image-model-invalid':
       return t('cover.agentGenerate.defaultModelInvalid');
-    case 'image-gen-unavailable':
+    case 'image-generation-unavailable':
       return t('cover.agentGenerate.imageGenUnavailable');
     case 'agent-unavailable':
       return t('cover.agentGenerate.agentUnavailable');
@@ -247,6 +248,11 @@ export function FloatingActions({
     });
   }, [content, contentType, filePath, language]);
 
+  const coverNotice = useCallback((key: string, vars?: Record<string, string>) => {
+    const translated = t(key, vars);
+    return translated !== key ? translated : key;
+  }, [t]);
+
   const handleGenerateCover = useCallback(async () => {
     const generationStatus = coverStatus?.agentGenerate ?? {};
     const generationEnabled = Boolean(generationStatus.enabled ?? coverStatus?.enabled);
@@ -257,15 +263,22 @@ export function FloatingActions({
       const executorAgentId = generationStatus.executorAgentId || coverStatus?.agentId || undefined;
       const result = await requestMarkdownCoverGeneration({ ...coverTarget, executorAgentId });
       dispatchCoverNotice(
-        result.ok ? '已创建 cover 后台任务。' : `Cover 生成失败：${result.error}`,
+        result.ok
+          ? coverNotice('cover.notice.taskCreated')
+          : coverNotice('cover.notice.generateFailed', { error: result.error || '' }),
         result.ok ? 'success' : 'error',
       );
     } catch (err) {
-      dispatchCoverNotice(`Cover 生成失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      dispatchCoverNotice(
+        coverNotice('cover.notice.generateFailed', {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        'error',
+      );
     } finally {
       setCoverBusy(false);
     }
-  }, [contentType, coverStatus, coverTarget]);
+  }, [contentType, coverNotice, coverStatus, coverTarget]);
 
   const applySelectedCoverImage = useCallback(async (image: MarkdownCoverImageInput) => {
     if (!coverTarget) return;
@@ -273,16 +286,23 @@ export function FloatingActions({
     try {
       const result = await applyMarkdownCoverImage({ ...coverTarget, ...image });
       dispatchCoverNotice(
-        result.ok ? '已应用上传图片为 cover。' : `Cover 应用失败：${result.error}`,
+        result.ok
+          ? coverNotice('cover.notice.applySuccess')
+          : coverNotice('cover.notice.applyFailed', { error: result.error || '' }),
         result.ok ? 'success' : 'error',
       );
       if (result.ok) await refreshCoverTargetPreview(coverTarget);
     } catch (err) {
-      dispatchCoverNotice(`Cover 应用失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      dispatchCoverNotice(
+        coverNotice('cover.notice.applyFailed', {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        'error',
+      );
     } finally {
       setCoverBusy(false);
     }
-  }, [coverTarget]);
+  }, [coverNotice, coverTarget]);
 
   const handleUploadCover = useCallback(async () => {
     if (!coverTarget || contentType !== 'markdown') return;
@@ -293,7 +313,7 @@ export function FloatingActions({
       if (!imageFilePath) return;
       const kind = inferKindByExt(extOfName(imageFilePath));
       if (kind !== 'image' && kind !== 'svg') {
-        dispatchCoverNotice('请选择图片文件作为 cover。', 'error');
+        dispatchCoverNotice(coverNotice('cover.notice.selectImageFile'), 'error');
         return;
       }
       if ('filePath' in coverTarget && coverTarget.filePath) {
@@ -302,7 +322,7 @@ export function FloatingActions({
       }
       const contentBase64 = await window.platform.readFileBase64?.(imageFilePath);
       if (!contentBase64) {
-        dispatchCoverNotice('读取图片失败。', 'error');
+        dispatchCoverNotice(coverNotice('cover.notice.readImageFailed'), 'error');
         return;
       }
       await applySelectedCoverImage({
@@ -314,7 +334,7 @@ export function FloatingActions({
       return;
     }
     fileInputRef.current?.click();
-  }, [applySelectedCoverImage, contentType, coverTarget]);
+  }, [applySelectedCoverImage, contentType, coverNotice, coverTarget]);
 
   const handleBrowserCoverInputChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
     if (!coverTarget) return;
@@ -323,13 +343,13 @@ export function FloatingActions({
     if (!file) return;
     const kind = inferKindByExt(extOfName(file.name));
     if (kind !== 'image' && kind !== 'svg') {
-      dispatchCoverNotice('请选择图片文件作为 cover。', 'error');
+      dispatchCoverNotice(coverNotice('cover.notice.selectImageFile'), 'error');
       return;
     }
     try {
       const contentBase64 = await readBrowserFileAsBase64(file);
       if (!contentBase64) {
-        dispatchCoverNotice('读取图片失败。', 'error');
+        dispatchCoverNotice(coverNotice('cover.notice.readImageFailed'), 'error');
         return;
       }
       await applySelectedCoverImage({
@@ -339,9 +359,14 @@ export function FloatingActions({
         },
       });
     } catch (err) {
-      dispatchCoverNotice(`Cover 应用失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      dispatchCoverNotice(
+        coverNotice('cover.notice.applyFailed', {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        'error',
+      );
     }
-  }, [applySelectedCoverImage, coverTarget]);
+  }, [applySelectedCoverImage, coverNotice, coverTarget]);
 
   const handlePresetCover = useCallback(() => {
     setCoverMenuOpen(false);
@@ -354,7 +379,9 @@ export function FloatingActions({
     try {
       const result = await applyMarkdownCoverPreset({ ...coverTarget, presetId: item.id });
       dispatchCoverNotice(
-        result.ok ? `已应用「${item.title}」为 cover。` : `Cover 应用失败：${result.error}`,
+        result.ok
+          ? coverNotice('cover.notice.applySuccessGallery', { title: item.title })
+          : coverNotice('cover.notice.applyFailed', { error: result.error || '' }),
         result.ok ? 'success' : 'error',
       );
       if (result.ok) {
@@ -362,11 +389,16 @@ export function FloatingActions({
         setCoverGalleryOpen(false);
       }
     } catch (err) {
-      dispatchCoverNotice(`Cover 应用失败：${err instanceof Error ? err.message : String(err)}`, 'error');
+      dispatchCoverNotice(
+        coverNotice('cover.notice.applyFailed', {
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        'error',
+      );
     } finally {
       setCoverBusy(false);
     }
-  }, [contentType, coverTarget]);
+  }, [contentType, coverNotice, coverTarget]);
 
   const visibleCoverGalleryItems = useMemo(
     () => COVER_GALLERY_ITEMS.filter(item => !brokenCoverGalleryIds.has(item.id)),
@@ -504,6 +536,26 @@ export function FloatingActions({
               ))}
             </div>
           </div>
+        )}
+        {filePath && (
+          <Tooltip content={t('preview.fileHistory')} placement="top" align="end">
+            {({ ref, ...tooltipProps }) => (
+              <button
+                ref={(node) => ref(node)}
+                className={styles.actionBtn}
+                onClick={() => useStore.getState().openFileHistoryForAbsolutePath(filePath)}
+                aria-label={t('preview.fileHistory')}
+                {...tooltipProps}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+                  <path d="M3 3v5h5" />
+                  <path d="M12 7v5l3 3" />
+                </svg>
+              </button>
+            )}
+          </Tooltip>
         )}
         {showMarkdownPreviewToggle && (
           <Tooltip content={t(markdownPreviewActive ? 'preview.exitMarkdownPreview' : 'preview.markdownPreview')} placement="top" align="end">

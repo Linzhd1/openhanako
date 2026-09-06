@@ -50,7 +50,8 @@ describe("current_status tool", () => {
     const tool = createCurrentStatusTool();
 
     expect(tool.description).toContain('key="time"');
-    expect(tool.description).toContain("stale");
+    expect(tool.description).toContain("Session started at");
+    expect(tool.description).toContain("frozen snapshot");
   });
 
   it("falls back to English toolDef for all locales", () => {
@@ -462,6 +463,20 @@ describe("current_status tool", () => {
               status: "expired",
               missingAt: 1778432859999,
             },
+            {
+              id: "sf_agent_report",
+              fileId: "sf_agent_report",
+              sessionPath,
+              filePath: "/workspace/report.md",
+              label: "report.md",
+              mime: "text/markdown",
+              kind: "text",
+              origin: "agent_write",
+              operations: ["created"],
+              storageKind: "external",
+              status: "available",
+              createdAt: 1778432860000,
+            },
           ]
         : [],
     });
@@ -475,6 +490,8 @@ describe("current_status tool", () => {
         files: [
           {
             fileId: "sf_browser",
+            sessionFileRef: { kind: "session-file", fileId: "sf_browser" },
+            writableLocalRef: null,
             label: "browser-screenshot.jpg",
             displayName: "Browser Screenshot",
             filename: "browser-screenshot.jpg",
@@ -489,11 +506,11 @@ describe("current_status tool", () => {
             missingAt: null,
             createdAt: 1778432852184,
             isDirectory: false,
-            filePath: "/tmp/session-files/browser-screenshot.jpg",
-            realPath: "/private/tmp/session-files/browser-screenshot.jpg",
           },
           {
             fileId: "sf_expired",
+            sessionFileRef: { kind: "session-file", fileId: "sf_expired" },
+            writableLocalRef: null,
             label: "old.png",
             displayName: null,
             filename: null,
@@ -508,8 +525,25 @@ describe("current_status tool", () => {
             missingAt: 1778432859999,
             createdAt: null,
             isDirectory: false,
-            filePath: "/tmp/session-files/old.png",
-            realPath: null,
+          },
+          {
+            fileId: "sf_agent_report",
+            sessionFileRef: { kind: "session-file", fileId: "sf_agent_report" },
+            writableLocalRef: { kind: "local-file", path: "/workspace/report.md" },
+            label: "report.md",
+            displayName: null,
+            filename: null,
+            ext: null,
+            kind: "text",
+            mime: "text/markdown",
+            size: null,
+            origin: "agent_write",
+            operations: ["created"],
+            storageKind: "external",
+            status: "available",
+            missingAt: null,
+            createdAt: 1778432860000,
+            isDirectory: false,
           },
         ],
       },

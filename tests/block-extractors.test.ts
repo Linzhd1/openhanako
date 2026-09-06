@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   BLOCK_EXTRACTORS,
+  dropUninstalledPluginCards,
   extractBlocks,
+  pluginInstalledPredicate,
   resolveMediaGenerationBlocks,
 } from '../server/block-extractors.ts';
 
@@ -178,7 +180,7 @@ describe('present_files', () => {
   });
 });
 
-// ─── image-gen media generation ─────────────────────────────────────────────
+// ─── media generation ────────────────────────────────────────────────────────
 
 describe('media generation blocks', () => {
   it('extracts one pending media_generation block per submitted image task', () => {
@@ -214,8 +216,18 @@ describe('media generation blocks', () => {
     ]);
   });
 
-  it('keeps historical image-gen tool names readable for old sessions', () => {
-    const blocks = (extractBlocks as any)('image-gen_generate-image', {
+  it('registers only the current media tool result names, no retired plugin-era aliases', () => {
+    // A prior COMPAT block mapped a since-retired plugin's own tool result
+    // names to the same extractor. That block is gone: only the two
+    // current media_* names should ever resolve to a media_generation
+    // extractor, and an unrecognized (e.g. historical) tool name must
+    // produce no block at all from this extractor table.
+    const generationKeys = Object.keys(BLOCK_EXTRACTORS)
+      .filter((key) => key.includes('generate-image') || key.includes('generate-video'))
+      .sort();
+    expect(generationKeys).toEqual(['media_generate-image', 'media_generate-video']);
+
+    const blocks = (extractBlocks as any)('some-retired-tool_generate-image', {
       mediaGeneration: {
         kind: 'image',
         batchId: 'legacy-batch',
@@ -223,14 +235,7 @@ describe('media generation blocks', () => {
         tasks: [{ taskId: 'legacy-task' }],
       },
     });
-
-    expect(blocks[0]).toMatchObject({
-      type: 'media_generation',
-      taskId: 'legacy-task',
-      kind: 'image',
-      batchId: 'legacy-batch',
-      status: 'pending',
-    });
+    expect(blocks).toEqual([]);
   });
 
   it('replaces historical pending media_generation blocks with completed session file blocks', () => {
@@ -987,6 +992,49 @@ describe('extractBlocks: plugin card extraction', () => {
   });
 });
 
+describe('dropUninstalledPluginCards', () => {
+  it('drops plugin_card blocks whose pluginId the predicate rejects, keeps everything else', () => {
+    const blocks = [
+      { type: 'file', filePath: '/a' },
+      { type: 'plugin_card', card: { pluginId: 'installed-plugin' } },
+      { type: 'plugin_card', card: { pluginId: 'retired-plugin' } },
+    ];
+    const result = dropUninstalledPluginCards(
+      blocks,
+      (pluginId) => pluginId === 'installed-plugin',
+    );
+    expect(result).toEqual([
+      { type: 'file', filePath: '/a' },
+      { type: 'plugin_card', card: { pluginId: 'installed-plugin' } },
+    ]);
+  });
+
+  it('is a no-op (returns blocks unchanged) when no predicate function is supplied', () => {
+    const blocks = [{ type: 'plugin_card', card: { pluginId: 'x' } }];
+    expect(dropUninstalledPluginCards(blocks)).toBe(blocks);
+  });
+});
+
+describe('pluginInstalledPredicate', () => {
+  it('reports installed when pluginManager.getPlugin resolves a truthy entry', () => {
+    const engine = { pluginManager: { getPlugin: (id) => (id === 'media' ? { id: 'media' } : null) } };
+    const predicate = pluginInstalledPredicate(engine);
+    expect(predicate('media')).toBe(true);
+  });
+
+  it('reports not-installed when pluginManager.getPlugin resolves null', () => {
+    const engine = { pluginManager: { getPlugin: () => null } };
+    const predicate = pluginInstalledPredicate(engine);
+    expect(predicate('retired-plugin')).toBe(false);
+  });
+
+  it('fails open (reports installed) when pluginManager is unavailable, so a caller without plugin-manager access never silently hides a real card', () => {
+    const predicate = pluginInstalledPredicate({});
+    expect(predicate('anything')).toBe(true);
+    expect(pluginInstalledPredicate(null)('anything')).toBe(true);
+  });
+});
+
 // ─── coexistence: tool-specific block + plugin card ───────────────────────────
 
 describe('extractBlocks: tool block + plugin card coexistence', () => {
@@ -1010,5 +1058,61 @@ describe('extractBlocks: tool block + plugin card coexistence', () => {
     expect(blocks).toHaveLength(2);
     expect(blocks[0].type).toBe('skill');
     expect(blocks[1].type).toBe('plugin_card');
+  });
+});
+
+// ─── show_card ──────────────────────────────────────────────────────────────
+
+describe('show_card', () => {
+  const extractor = BLOCK_EXTRACTORS.show_card;
+
+  it('extracts interactive_card block from details', () => {
+    const details = {
+      cardId: 'c_abc123',
+      title: 'revenue_chart',
+      code: '<div><h2>Revenue</h2></div>',
+    };
+    const result = extractor(details);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      type: 'interactive_card',
+      cardId: 'c_abc123',
+      title: 'revenue_chart',
+      code: '<div><h2>Revenue</h2></div>',
+    });
+  });
+
+  it('returns null when code is missing', () => {
+    expect(extractor({ cardId: 'c_1', title: 'test' })).toBeNull();
+    expect(extractor({})).toBeNull();
+  });
+
+  it('defaults cardId and title to empty string', () => {
+    const result = extractor({ code: '<p>hello</p>' });
+    expect(result[0].cardId).toBe('');
+    expect(result[0].title).toBe('');
+    expect(result[0].code).toBe('<p>hello</p>');
+  });
+
+  it('works through extractBlocks', () => {
+    const details = {
+      cardId: 'c_xyz',
+      title: 'test_card',
+      code: '<svg viewBox="0 0 100 100"></svg>',
+    };
+    const blocks = extractBlocks('show_card', details, undefined);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].type).toBe('interactive_card');
+    expect(blocks[0].code).toBe('<svg viewBox="0 0 100 100"></svg>');
+  });
+
+  it('preserves multi-line code verbatim', () => {
+    const code = `<style>
+h1 { color: var(--accent); }
+</style>
+<h1>Title</h1>
+<script>console.log("ok")</script>`;
+    const result = extractor({ cardId: 'c_1', title: 't', code });
+    expect(result[0].code).toBe(code);
   });
 });

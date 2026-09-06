@@ -33,6 +33,17 @@ describe("server transport ownership", () => {
     expect(identityIndex).toBeLessThan(engineIndex);
   });
 
+  it("registers compaction framework extensions before plugin startup lifecycles", () => {
+    const source = fs.readFileSync(path.join(root, "server", "index.ts"), "utf-8");
+
+    const compactionIndex = source.indexOf("await engine.registerExtensionFactory(createCompactionGuardExtension");
+    const pluginInitIndex = source.indexOf("await engine.initPlugins(");
+
+    expect(compactionIndex).toBeGreaterThan(-1);
+    expect(pluginInitIndex).toBeGreaterThan(-1);
+    expect(compactionIndex).toBeLessThan(pluginInitIndex);
+  });
+
   it("reports PORT_IN_USE with host, port, network mode, and recovery suggestions", () => {
     const source = fs.readFileSync(path.join(root, "server", "index.ts"), "utf-8");
 
@@ -72,7 +83,10 @@ describe("server transport ownership", () => {
         HANA_HOME: hanaHome,
         HANA_PORT: String(port),
         HANA_ROOT: root,
-        HANA_SERVER_ENTRY: path.join(root, "server", "index.ts"),
+        // server/main-full.ts is the thin closed composition entry:
+        // server/index.ts itself only exports startServer() and boots
+        // nothing on mere import.
+        HANA_SERVER_ENTRY: path.join(root, "server", "main-full.ts"),
         HANA_CREATE_STARTUP_SESSION: "0",
       },
       stdio: ["ignore", "pipe", "pipe"],

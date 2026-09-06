@@ -4,14 +4,93 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createJimengImageAdapter,
-  createJimengVideoAdapter,
+  createJimengImageAdapter as createRawJimengImageAdapter,
+  createJimengVideoAdapter as createRawJimengVideoAdapter,
+  dreaminaCandidatePaths,
   parseDreaminaTaskOutput,
   resolveDreaminaCommand,
 } from "../plugins/jimeng-cli/adapters/dreamina.ts";
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "hana-jimeng-cli-"));
+}
+
+const IMAGE_RATIOS = ["21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"];
+const VIDEO_RATIOS = ["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"];
+
+function imageMode(id, resolutions) {
+  return {
+    id,
+    parameterSchema: {
+      properties: {
+        ratio: { enum: IMAGE_RATIOS, default: "3:2" },
+        resolution: { enum: resolutions, default: resolutions.at(-1) },
+      },
+    },
+    defaults: { ratio: "3:2", resolution: resolutions.at(-1) },
+  };
+}
+
+function videoMode(id, { min = 4, max = 15, resolutions = ["720p"] }: any = {}) {
+  return {
+    id,
+    parameterSchema: {
+      properties: {
+        ...(id === "text2video" ? { ratio: { enum: VIDEO_RATIOS, default: "16:9" } } : {}),
+        duration: { minimum: min, maximum: max, default: 5 },
+        video_resolution: { enum: resolutions, default: "720p" },
+      },
+    },
+    defaults: {
+      ...(id === "text2video" ? { ratio: "16:9" } : {}),
+      duration: 5,
+      video_resolution: "720p",
+    },
+  };
+}
+
+function videoModel(id, modes) {
+  return { id, modes };
+}
+
+const TEST_CAPABILITY_SNAPSHOT: any = {
+  providerId: "jimeng-cli",
+  media: {
+    imageGeneration: {
+      defaultModelId: "jimeng-image-5.0",
+      models: [{
+        id: "jimeng-image-5.0",
+        modes: [imageMode("text2image", ["2k", "4k"]), imageMode("image2image", ["2k", "4k"])],
+      }],
+    },
+    videoGeneration: {
+      defaultModelId: "seedance2.0fast",
+      models: [
+        videoModel("seedance2.0fast", [videoMode("text2video"), videoMode("image2video")]),
+        videoModel("seedance2.0_vip", [
+          videoMode("text2video", { resolutions: ["720p", "1080p", "4k"] }),
+          videoMode("image2video", { resolutions: ["720p", "1080p", "4k"] }),
+        ]),
+        videoModel("seedance2.0fast_vip", [videoMode("text2video"), videoMode("image2video")]),
+        videoModel("seedance2.0mini", [videoMode("text2video"), videoMode("image2video")]),
+        videoModel("seedance1.5pro", [videoMode("image2video", { min: 4, max: 12 })]),
+      ],
+    },
+  },
+};
+
+function createJimengImageAdapter(options: any = {}) {
+  return createRawJimengImageAdapter({
+    getCapabilitySnapshot: async () => TEST_CAPABILITY_SNAPSHOT,
+    ...options,
+  });
+}
+
+function createJimengVideoAdapter(options: any = {}) {
+  return createRawJimengVideoAdapter({
+    getCapabilitySnapshot: async () => TEST_CAPABILITY_SNAPSHOT,
+    ...options,
+  });
 }
 
 describe("Jimeng CLI command resolution", () => {
@@ -25,6 +104,58 @@ describe("Jimeng CLI command resolution", () => {
       platform: "linux",
     })).toBe("/opt/dreamina");
     expect(exists).toHaveBeenCalledWith("/opt/dreamina");
+  });
+
+  it("accepts DREAMINA_CLI_PATH as an install directory", () => {
+    expect(resolveDreaminaCommand({
+      env: { DREAMINA_CLI_PATH: "/opt/dreamina-cli", PATH: "/usr/bin" },
+      exists: (filePath: string) => filePath === "/opt/dreamina-cli/dreamina",
+      which: () => null,
+      homeDir: "/home/hana",
+      platform: "linux",
+    })).toBe("/opt/dreamina-cli/dreamina");
+  });
+
+  it("checks the official user install directory even when GUI app PATH is minimal", () => {
+    expect(resolveDreaminaCommand({
+      env: { PATH: "/usr/bin:/bin" },
+      exists: (filePath: string) => filePath === "/Users/hana/.local/bin/dreamina",
+      which: () => null,
+      homeDir: "/Users/hana",
+      platform: "darwin",
+    })).toBe("/Users/hana/.local/bin/dreamina");
+  });
+
+  it("documents common GUI app lookup paths", () => {
+    expect(dreaminaCandidatePaths({
+      env: {},
+      homeDir: "/Users/hana",
+      platform: "darwin",
+    })).toEqual(expect.arrayContaining([
+      "/Users/hana/.local/bin/dreamina",
+      "/Users/hana/bin/dreamina",
+      "/usr/local/bin/dreamina",
+      "/opt/homebrew/bin/dreamina",
+    ]));
+  });
+
+  it("uses target platform path rules instead of the host OS", () => {
+    const command = resolveDreaminaCommand({
+      env: { PATH: "C:\\Dreamina;D:\\Tools" },
+      exists: (filePath: string) => filePath === "D:\\Tools\\dreamina.exe",
+      homeDir: "C:\\Users\\hana",
+      platform: "win32",
+    });
+
+    expect(command).toBe("D:\\Tools\\dreamina.exe");
+    expect(dreaminaCandidatePaths({
+      env: { LOCALAPPDATA: "C:\\Users\\hana\\AppData\\Local" },
+      homeDir: "C:\\Users\\hana",
+      platform: "win32",
+    })).toEqual(expect.arrayContaining([
+      "C:\\Users\\hana\\bin\\dreamina.exe",
+      "C:\\Users\\hana\\AppData\\Local\\Programs\\dreamina\\dreamina.exe",
+    ]));
   });
 
   it("returns null when dreamina is not installed", () => {
@@ -96,6 +227,52 @@ describe("Jimeng CLI adapters", () => {
       "--poll",
       "0",
     ], expect.objectContaining({ shell: false }));
+  });
+
+  it("creates the plugin-owned working directory before invoking dreamina", async () => {
+    const root = makeTempDir();
+    roots.push(root);
+    const generatedDir = path.join(root, "plugin-data", "jimeng-cli", "generated");
+    const run = vi.fn(async (_command, _args, options) => {
+      expect(options.cwd).toBe(generatedDir);
+      expect(fs.statSync(generatedDir).isDirectory()).toBe(true);
+      return {
+        stdout: JSON.stringify({ submit_id: "img-task", gen_status: "querying" }),
+        stderr: "",
+      };
+    });
+    const adapter = createJimengImageAdapter({
+      resolveCommand: () => "/usr/local/bin/dreamina",
+      runCommand: run,
+    });
+
+    await adapter.submit({
+      prompt: "一只猫",
+      model: "jimeng-image-5.0",
+    }, { generatedDir } as any);
+
+    expect(run).toHaveBeenCalledOnce();
+  });
+
+  it("reports an unusable working directory separately from a missing CLI", async () => {
+    const root = makeTempDir();
+    roots.push(root);
+    const blocker = path.join(root, "not-a-directory");
+    fs.writeFileSync(blocker, "file");
+    const run = vi.fn();
+    const adapter = createJimengImageAdapter({
+      resolveCommand: () => "/usr/local/bin/dreamina",
+      runCommand: run,
+    });
+
+    await expect(adapter.submit({
+      prompt: "一只猫",
+      model: "jimeng-image-5.0",
+    }, { generatedDir: path.join(blocker, "generated") } as any)).rejects.toMatchObject({
+      code: "cli_workdir_unavailable",
+      message: expect.stringContaining("工作目录"),
+    });
+    expect(run).not.toHaveBeenCalled();
   });
 
   it("reads image provider defaults from image config, not video config", async () => {
@@ -253,7 +430,7 @@ describe("Jimeng CLI adapters", () => {
     ], expect.objectContaining({ shell: false }));
   });
 
-  it("allows Dreamina 1080p only on seedance2.0_vip", async () => {
+  it("allows resolutions discovered for seedance2.0_vip", async () => {
     const run = vi.fn(async () => ({
       stdout: "submit_id: vid-task\ngen_status: querying",
       stderr: "",
@@ -275,6 +452,73 @@ describe("Jimeng CLI adapters", () => {
       "--video_resolution",
       "1080p",
     ]), expect.objectContaining({ shell: false }));
+
+    await adapter.submit({
+      prompt: "雨夜街道",
+      model: "seedance2.0_vip",
+      video_resolution: "4k",
+    }, { generatedDir: "/tmp/out" } as any);
+    expect(run).toHaveBeenLastCalledWith("/usr/local/bin/dreamina", expect.arrayContaining([
+      "--model_version",
+      "seedance2.0_vip",
+      "--video_resolution",
+      "4k",
+    ]), expect.objectContaining({ shell: false }));
+  });
+
+  it("accepts a newly discovered Dreamina model without adapter source changes", async () => {
+    const run = vi.fn(async () => ({
+      stdout: "submit_id: vid-task\ngen_status: querying",
+      stderr: "",
+    }));
+    const adapter = createJimengVideoAdapter({
+      resolveCommand: () => "/usr/local/bin/dreamina",
+      runCommand: run,
+    });
+
+    await adapter.submit({
+      prompt: "雨夜街道",
+      model: "seedance2.0mini",
+    }, { generatedDir: "/tmp/out" } as any);
+
+    expect(run).toHaveBeenCalledWith("/usr/local/bin/dreamina", expect.arrayContaining([
+      "--model_version",
+      "seedance2.0mini",
+    ]), expect.objectContaining({ shell: false }));
+  });
+
+  it("rejects models absent from the current CLI snapshot", async () => {
+    const run = vi.fn();
+    const adapter = createJimengVideoAdapter({
+      resolveCommand: () => "/usr/local/bin/dreamina",
+      runCommand: run,
+    });
+
+    await expect(adapter.submit({
+      prompt: "雨夜街道",
+      model: "seedance-future",
+    }, { generatedDir: "/tmp/out" } as any)).rejects.toThrow(/seedance-future.*当前.*CLI/i);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("surfaces capability discovery failures before invoking dreamina", async () => {
+    const run = vi.fn();
+    const adapter = createJimengImageAdapter({
+      resolveCommand: () => "/usr/local/bin/dreamina",
+      runCommand: run,
+      getCapabilitySnapshot: async () => {
+        throw Object.assign(new Error("CLI help changed"), { code: "output_unparseable" });
+      },
+    });
+
+    await expect(adapter.submit({
+      prompt: "一只猫",
+      model: "jimeng-image-5.0",
+    }, { generatedDir: "/tmp/out" } as any)).rejects.toMatchObject({
+      code: "output_unparseable",
+      message: "CLI help changed",
+    });
+    expect(run).not.toHaveBeenCalled();
   });
 
   it("rejects unsupported Jimeng video resolution before invoking dreamina", async () => {
@@ -303,8 +547,8 @@ describe("Jimeng CLI adapters", () => {
       prompt: "镜头推进",
       image: "/tmp/first.png",
       duration: 15,
-      model: "3.5pro",
-    }, { generatedDir: "/tmp/out" } as any)).rejects.toThrow(/duration.*3\.5pro/i);
+      model: "seedance1.5pro",
+    }, { generatedDir: "/tmp/out" } as any)).rejects.toThrow(/duration.*seedance1\.5pro/i);
     expect(run).not.toHaveBeenCalled();
   });
 
@@ -317,7 +561,7 @@ describe("Jimeng CLI adapters", () => {
 
     await expect(adapter.submit({
       prompt: "雨夜街道",
-      model: "3.5pro",
+      model: "seedance1.5pro",
     }, { generatedDir: "/tmp/out" } as any)).rejects.toThrow(/text2video/);
     expect(run).not.toHaveBeenCalled();
   });
@@ -376,6 +620,46 @@ describe("Jimeng CLI adapters", () => {
       code: "cli_missing",
       installCommand: "curl -s https://jimeng.jianying.com/cli | bash",
       message: expect.stringContaining("dreamina"),
+    });
+  });
+
+  it("reports execFile ENOENT during auth as a missing CLI instead of unavailable CLI", async () => {
+    const adapter = createJimengVideoAdapter({
+      resolveCommand: () => "/Users/hana/.local/bin/dreamina",
+      runCommand: vi.fn(async () => {
+        throw Object.assign(new Error("spawn /Users/hana/.local/bin/dreamina ENOENT"), {
+          code: "ENOENT",
+          path: "/Users/hana/.local/bin/dreamina",
+        });
+      }),
+    });
+
+    await expect(adapter.checkAuth({} as any)).resolves.toMatchObject({
+      ok: false,
+      code: "cli_missing",
+      installCommand: "curl -s https://jimeng.jianying.com/cli | bash",
+      message: expect.stringContaining("DREAMINA_CLI_PATH"),
+    });
+  });
+
+  it("translates execFile ENOENT during video submit into actionable CLI guidance", async () => {
+    const adapter = createJimengVideoAdapter({
+      resolveCommand: () => "/Users/hana/.local/bin/dreamina",
+      runCommand: vi.fn(async () => {
+        throw Object.assign(new Error("spawn /Users/hana/.local/bin/dreamina ENOENT"), {
+          code: "ENOENT",
+          path: "/Users/hana/.local/bin/dreamina",
+        });
+      }),
+    });
+
+    await expect(adapter.submit({
+      prompt: "雨夜街道",
+      model: "seedance2.0fast",
+    }, { generatedDir: "/tmp/out" } as any)).rejects.toMatchObject({
+      code: "cli_missing",
+      installCommand: "curl -s https://jimeng.jianying.com/cli | bash",
+      message: expect.stringContaining("DREAMINA_CLI_PATH"),
     });
   });
 });

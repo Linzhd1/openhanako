@@ -10,20 +10,21 @@ import { SessionManager } from "../lib/pi-sdk/index.ts";
 import { isSessionJsonlFilename } from "../lib/session-jsonl.ts";
 import { DEFERRED_RESULT_RECORD_TYPE } from "../lib/deferred-result-notification.ts";
 import {
+  AGENT_REVIEW_RECORD_TYPE,
+  MESSAGE_ORIGIN_RECORD_TYPE,
+  MESSAGE_PRESENTATION_RECORD_TYPE,
+} from "./desktop-session-submit.ts";
+import { SESSION_COLLAB_DECISION_RECORD_TYPE } from "../lib/session-collab/decision-record.ts";
+import {
   TURN_INPUT_CONSUMPTION_EVENT_TYPE,
   TURN_INPUT_PRESENTATION_EVENT_TYPE,
 } from "../lib/turn-input-presentation.ts";
 import { repairOversizedSessionEntriesInFile } from "./session-jsonl-file.ts";
 import { isAssistantCommentaryTextBlock } from "../shared/text-signature.ts";
-
-/**
- * 工具调用参数摘要键列表
- * 提取工具调用时只保留这些键作为摘要信息
- */
-export const TOOL_ARG_SUMMARY_KEYS = [
-  "file_path", "path", "command", "pattern", "url", "query",
-  "key", "value", "action", "type", "schedule", "prompt", "label",
-];
+import { TOOL_ARG_SUMMARY_KEYS, summarizeToolArgs } from "../shared/tool-arg-summary.ts";
+import { projectSessionMessageForDisplay } from "./session-reminders.ts";
+import { isKnownLegacyHanaToolFailure } from "../shared/tool-outcome.ts";
+export { TOOL_ARG_SUMMARY_KEYS };
 
 const SESSION_TAIL_READ_THRESHOLD = 256 * 1024;
 const ATTACHED_IMAGE_MARKER_RE = /\[attached_image:\s*[^\]]+\]/g;
@@ -69,17 +70,12 @@ export function extractTextContent(content, { stripThink = false } = {}) {
   const toolUses = content
     .filter(isToolCallBlock)
     .map(block => {
-      const args = {};
       const params = getToolArgs(block);
-      if (params && typeof params === "object") {
-        for (const k of TOOL_ARG_SUMMARY_KEYS) {
-          if (params[k] !== undefined) args[k] = params[k];
-        }
-      }
+      const args = summarizeToolArgs(params);
       return {
         id: typeof block.id === "string" && block.id ? block.id : undefined,
         name: block.name,
-        args: Object.keys(args).length ? args : undefined,
+        ...(args ? { args } : {}),
       };
     });
   return { text, thinking, toolUses, images };
@@ -103,7 +99,7 @@ export function filterUnreferencedInlineImages(text, images) {
 }
 
 /**
- * 优先从 session JSONL 读取完整历史。
+ * 优先从 session JSONL 读取完整历史，并在返回边界移除模型专用的 Reminder 展示内容。
  * engine.messages 可能只是当前上下文窗口，切回页面时会导致旧消息缺失。
  * 读文件失败时再退回内存态，避免历史接口直接空白。
  */
@@ -114,14 +110,16 @@ export async function loadSessionHistoryMessages(engine, explicitPath) {
   try {
     if (await looksLikePiSessionFile(sessionPath)) {
       repairOversizedSessionEntriesInFile(sessionPath);
-      const manager = SessionManager.open(sessionPath, path.dirname(sessionPath));
+      const manager = typeof engine?.openSessionManagerAtCurrentBranch === "function"
+        ? engine.openSessionManagerAtCurrentBranch(sessionPath, path.dirname(sessionPath))
+        : SessionManager.open(sessionPath, path.dirname(sessionPath));
       const branch = manager.getBranch();
       const messages = [];
       for (const entry of branch) {
         const message = historyMessageFromEntry(entry);
         if (message) messages.push(message);
       }
-      if (messages.length > 0) return messages;
+      return messages.map(projectSessionMessageForDisplay);
     }
   } catch {
     // 旧文件或损坏文件继续走兼容读取，不让历史页直接空白。
@@ -142,7 +140,7 @@ export async function loadSessionHistoryMessages(engine, explicitPath) {
       }
     }
 
-    if (messages.length > 0) return messages;
+    if (messages.length > 0) return messages.map(projectSessionMessageForDisplay);
   } catch {
     // 文件读取失败
   }
@@ -152,7 +150,11 @@ export async function loadSessionHistoryMessages(engine, explicitPath) {
 
 function historyMessageFromEntry(entry) {
   if (entry?.type === "message" && entry.message) {
-    const message = { ...entry.message };
+    const message = entry.message.role === "toolResult"
+      && entry.message.isError !== true
+      && isKnownLegacyHanaToolFailure(entry.message)
+      ? { ...entry.message, isError: true }
+      : { ...entry.message };
     if (entry.id) message.id = entry.id;
     if (entry.timestamp) message.timestamp = entry.timestamp;
     return message;
@@ -175,6 +177,10 @@ function historyMessageFromEntry(entry) {
       entry.customType === DEFERRED_RESULT_RECORD_TYPE
       || entry.customType === TURN_INPUT_PRESENTATION_EVENT_TYPE
       || entry.customType === TURN_INPUT_CONSUMPTION_EVENT_TYPE
+      || entry.customType === MESSAGE_ORIGIN_RECORD_TYPE
+      || entry.customType === AGENT_REVIEW_RECORD_TYPE
+      || entry.customType === MESSAGE_PRESENTATION_RECORD_TYPE
+      || entry.customType === SESSION_COLLAB_DECISION_RECORD_TYPE
     )
   ) {
     const message: Record<string, any> = {
@@ -188,6 +194,68 @@ function historyMessageFromEntry(entry) {
     return message;
   }
   return null;
+}
+
+/** origin custom 条目注释其后第一条 user 消息（契约见 desktop-session-submit recordMessageOriginEntry）。返回过滤掉 origin 条目的新数组。 */
+export function annotateOriginMessages(messages) {
+  const out = [];
+  let pendingOrigin = null;
+  for (const m of messages || []) {
+    if (m?.role === "custom" && m.customType === MESSAGE_ORIGIN_RECORD_TYPE) {
+      pendingOrigin = m.data || null;
+      continue;
+    }
+    if (m?.role === "custom" && (
+      m.customType === AGENT_REVIEW_RECORD_TYPE
+      || m.customType === MESSAGE_PRESENTATION_RECORD_TYPE
+    )) {
+      continue;
+    }
+    if (m?.role === "user" && pendingOrigin?.origin) {
+      out.push({
+        ...m,
+        origin: pendingOrigin.origin,
+        ...(typeof pendingOrigin.displayText === "string" ? { displayText: pendingOrigin.displayText } : {}),
+      });
+      pendingOrigin = null;
+      continue;
+    }
+    if (m?.role === "user") { pendingOrigin = null; }
+    out.push(m);
+  }
+  return out;
+}
+
+/**
+ * 草稿卡确认状态持久化（灰测修复 C，契约见 lib/session-collab/decision-record.ts）：
+ * 从原始消息流里收集决策 custom 条目，按 suggestionId 建索引，供
+ * overlaySessionCollabDecision 覆盖 suggestion_card block 的 status。
+ * 同一 suggestionId 出现多条决策时后者覆盖前者（消息流本身有序，正常不会发生）。
+ */
+export function collectSessionCollabDecisions(messages) {
+  const map = new Map();
+  for (const m of messages || []) {
+    if (m?.role !== "custom" || m.customType !== SESSION_COLLAB_DECISION_RECORD_TYPE) continue;
+    const suggestionId = m.data?.suggestionId;
+    if (typeof suggestionId === "string" && suggestionId) map.set(suggestionId, m.data);
+  }
+  return map;
+}
+
+/**
+ * 用决策记录覆盖 suggestion_card block 的 status（+ resultSessionId），
+ * 让重开 session 后草稿卡不再回弹 pending。非 suggestion_card 或未命中决策
+ * 的 block 原样返回（不拷贝，避免无意义的引用变更）。
+ */
+export function overlaySessionCollabDecision(block, decisionsBySuggestionId) {
+  if (!block || block.type !== "suggestion_card" || !block.suggestionId) return block;
+  const decision = decisionsBySuggestionId?.get?.(block.suggestionId);
+  if (!decision) return block;
+  return {
+    ...block,
+    status: decision.status,
+    ...(decision.resultSessionId ? { resultSessionId: decision.resultSessionId } : {}),
+  };
 }
 
 async function looksLikePiSessionFile(sessionPath) {

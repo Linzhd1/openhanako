@@ -1,10 +1,15 @@
 import { memo, useCallback, useId, useMemo, useState } from 'react';
 import { Collapse } from '@/ui';
-import { useStore } from '../../stores';
-import { AgentAvatar, resolveAgentDisplayInfo } from '../../utils/agent-display';
+import { AgentAvatar, type AgentDisplayInfo } from '../../utils/agent-display';
 import { AssistantMessage } from './AssistantMessage';
 import { MessageFooterActions, formatMessageTime } from './MessageFooterActions';
 import { buildProcessFoldSummary, type ProcessFoldRenderItem } from './process-fold';
+import { useSessionNodeActions } from './SessionNodeActions';
+import type {
+  ForkedSessionHandler,
+  SessionNodeTarget,
+} from '../../stores/message-turn-actions';
+import type { ChatMessage } from '../../stores/chat-types';
 import styles from './Chat.module.css';
 
 interface Props {
@@ -15,8 +20,14 @@ interface Props {
   readOnly: boolean;
   turnCompletionAssistantIndexes?: ReadonlySet<number>;
   assistantTurnSelectionIdsByCompletionIndex?: ReadonlyMap<number, readonly string[]>;
+  assistantTurnTargetsByCompletionIndex?: ReadonlyMap<number, SessionNodeTarget>;
+  assistantTurnRetryMessagesByCompletionIndex?: ReadonlyMap<number, ChatMessage>;
   completionTimePersistent?: boolean;
+  agentDisplay: AgentDisplayInfo & { yuan: string };
+  isStreaming: boolean;
+  selectedIds: readonly string[];
   registerMessageElement?: (messageId: string, element: HTMLDivElement | null) => void;
+  onForkCreated?: ForkedSessionHandler;
 }
 
 export const ProcessFoldBlock = memo(function ProcessFoldBlock({
@@ -27,23 +38,21 @@ export const ProcessFoldBlock = memo(function ProcessFoldBlock({
   readOnly,
   turnCompletionAssistantIndexes,
   assistantTurnSelectionIdsByCompletionIndex,
+  assistantTurnTargetsByCompletionIndex,
+  assistantTurnRetryMessagesByCompletionIndex,
   completionTimePersistent = false,
+  agentDisplay,
+  isStreaming,
+  selectedIds,
   registerMessageElement,
+  onForkCreated,
 }: Props) {
-  const agents = useStore(s => s.agents);
-  const globalAgentName = useStore(s => s.agentName) || 'Hanako';
-  const globalYuan = useStore(s => s.agentYuan) || 'hanako';
   const [open, setOpen] = useState(false);
   const panelId = useId();
   const t = window.t ?? ((p: string) => p);
 
-  const displayInfo = resolveAgentDisplayInfo({
-    id: agentId || null,
-    agents,
-    fallbackAgentName: globalAgentName,
-    fallbackAgentYuan: globalYuan,
-  });
-  const displayName = displayInfo.displayName;
+  const displayName = agentDisplay.displayName;
+  const displayInfo = agentDisplay;
   const summary = useMemo(
     () => buildProcessFoldSummary(
       group.stats,
@@ -61,6 +70,18 @@ export const ProcessFoldBlock = memo(function ProcessFoldBlock({
     ? group.items.find((entry) => turnCompletionAssistantIndexes.has(entry.originalIndex))
     : null;
   const completionTimeText = formatMessageTime(turnCompletionEntry?.item.data.timestamp);
+  const completionTarget = turnCompletionEntry
+    ? assistantTurnTargetsByCompletionIndex?.get(turnCompletionEntry.originalIndex) ?? null
+    : null;
+  const { actions: completionActions } = useSessionNodeActions({
+    sessionPath,
+    target: readOnly || !turnCompletionEntry || isStreaming ? null : completionTarget,
+    retryMessage: turnCompletionEntry
+      ? assistantTurnRetryMessagesByCompletionIndex?.get(turnCompletionEntry.originalIndex)
+      : undefined,
+    onForkCreated,
+    disabled: isStreaming,
+  });
 
   return (
     <>
@@ -99,19 +120,27 @@ export const ProcessFoldBlock = memo(function ProcessFoldBlock({
                 sessionPath={sessionPath}
                 agentId={agentId}
                 readOnly={readOnly}
+                agentDisplay={agentDisplay}
+                isStreaming={isStreaming}
+                isSelected={selectedIds.includes(entry.item.data.id)}
                 showTurnCompletionTime={turnCompletionAssistantIndexes?.has(entry.originalIndex) ?? false}
                 assistantTurnSelectionIds={assistantTurnSelectionIdsByCompletionIndex?.get(entry.originalIndex)}
+                turnTarget={assistantTurnTargetsByCompletionIndex?.get(entry.originalIndex) ?? null}
+                retrySourceMessage={assistantTurnRetryMessagesByCompletionIndex?.get(entry.originalIndex) ?? null}
+                onForkCreated={onForkCreated}
                 messageRef={messageRef(entry.item.data.id)}
               />
             ))}
           </div>
         </Collapse>
-        {!open && completionTimeText && (
+        {!open && (completionTimeText || completionActions.length > 0) && (
           <MessageFooterActions
             align="left"
             timeText={completionTimeText}
             timePersistent={completionTimePersistent}
+            leadingActions={completionActions}
             actions={[]}
+            testId="process-fold-completion-actions"
           />
         )}
       </div>

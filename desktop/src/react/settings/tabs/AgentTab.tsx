@@ -4,7 +4,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useSettingsStore } from '../store';
 import { hanaFetch } from '../api';
 import { t, autoSaveConfig } from '../helpers';
-import { SelectWidget, ProviderIcon, ProviderGroupHeader, selectWidgetStyles } from '@/ui';
+import { SelectWidget, Toggle, ProviderIcon, ProviderGroupHeader, selectWidgetStyles } from '@/ui';
 import { browseAgent, setPrimaryAgent, loadSettingsConfig, loadAgents } from '../actions';
 import { AgentCardStack } from './agent/AgentCardStack';
 import { YuanSelector } from './agent/YuanSelector';
@@ -13,7 +13,6 @@ import { AgentToolsSection } from './agent/AgentToolsSection';
 import { CharacterCardPreviewOverlay, type CharacterCardPlan } from '../overlays/CharacterCardPreviewOverlay';
 import { SettingsSection } from '../components/SettingsSection';
 import { SettingsRow } from '../components/SettingsRow';
-import { Toggle } from '../widgets/Toggle';
 import { readConfigBoolean } from '../resource-state';
 import styles from '../Settings.module.css';
 import {
@@ -46,7 +45,7 @@ export function AgentTab() {
 
   const [agentName, setAgentName] = useState('');
   const [identity, setIdentity] = useState('');
-  const [ishiki, setIshiki] = useState('');
+  const [agentsMd, setAgentsMd] = useState('');
   const [expCategories, setExpCategories] = useState<ExpCategory[]>([]);
   const [exportPlanningAgentId, setExportPlanningAgentId] = useState<string | null>(null);
   const [exportingCharacterCard, setExportingCharacterCard] = useState(false);
@@ -57,7 +56,7 @@ export function AgentTab() {
     if (settingsConfig) {
       setAgentName(settingsConfig.agent?.name || '');
       setIdentity(settingsConfig._identity || '');
-      setIshiki(settingsConfig._ishiki || '');
+      setAgentsMd(settingsConfig._agents || '');
       setExpCategories(parseExperience(settingsConfig._experience || ''));
     }
   }, [settingsConfig]);
@@ -100,6 +99,7 @@ export function AgentTab() {
   const currentModelUnavailable = !!currentModel && !availableModels.some(m => `${m.provider}/${m.id}` === currentModel);
 
   const memoryEnabled = readConfigBoolean(settingsConfig, cfg => cfg.memory?.enabled, true);
+  const autoDreamEnabled = readConfigBoolean(settingsConfig, cfg => cfg.memory?.dream?.auto_enabled, false);
   const experienceEnabled = readConfigBoolean(settingsConfig, cfg => cfg.experience?.enabled, false);
   const hasAvailableToolsField = !!settingsConfig && Object.prototype.hasOwnProperty.call(settingsConfig, 'availableTools');
   const availableTools = hasAvailableToolsField ? settingsConfig?.availableTools : undefined;
@@ -138,9 +138,9 @@ export function AgentTab() {
     try {
       const agentId = getSettingsAgentId()!;
       const identityChanged = identity !== (settingsConfig?._identity || '');
-      const ishikiChanged = ishiki !== (settingsConfig?._ishiki || '');
+      const agentsMdChanged = agentsMd !== (settingsConfig?._agents || '');
 
-      if (!identityChanged && !ishikiChanged) {
+      if (!identityChanged && !agentsMdChanged) {
         showToast(t('settings.noChanges'), 'success');
         return;
       }
@@ -154,11 +154,11 @@ export function AgentTab() {
           body: JSON.stringify({ content: identity }),
         }));
       }
-      if (ishikiChanged) {
-        requests.push(hanaFetch(`${agentBase}/ishiki`, {
+      if (agentsMdChanged) {
+        requests.push(hanaFetch(`${agentBase}/agents-md`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: ishiki }),
+          body: JSON.stringify({ content: agentsMd }),
         }));
       }
 
@@ -230,8 +230,7 @@ export function AgentTab() {
   return (
     <div className={`${styles['settings-tab-content']} ${styles['active']}`} data-tab="agent">
       {/* Agent 卡片堆叠 */}
-      <section className={styles['settings-section']}>
-        <h2 className={styles['settings-section-title']}>{t('settings.agent.title')}</h2>
+      <SettingsSection title={t('settings.agent.title')} surface="plain">
         <AgentCardStack
           agents={agents}
           selectedId={selectedSettingsAgentId}
@@ -282,6 +281,7 @@ export function AgentTab() {
             <span className={styles['model-capsule-label']}>{t('settings.agent.chatModel')}</span>
             <SelectWidget
               className={styles['model-capsule-select']}
+              triggerBare
               triggerClassName={styles['model-capsule-trigger']}
               options={modelOptions}
               value={currentModel}
@@ -337,11 +337,10 @@ export function AgentTab() {
           </button>
         </div>
         {/* 图片模型选择器暂时隐藏，后续重新设计 */}
-      </section>
+      </SettingsSection>
 
-      {/* 关于 Ta（保持原样，不改） */}
-      <section className={styles['settings-section']}>
-        <h2 className={styles['settings-section-title']}>{t('settings.about.title')}</h2>
+      {/* 关于 Ta 的内容保持原样，外层归入标准 Section。 */}
+      <SettingsSection title={t('settings.about.title')} surface="plain">
         <div className={`${styles['settings-form-field']} ${styles['settings-form-field-center']}`}>
           <span className={styles['settings-form-hint']}>{t('settings.agent.yuanHint')}</span>
           <YuanSelector
@@ -375,22 +374,22 @@ export function AgentTab() {
           <span className={styles['settings-form-hint']}>{t('settings.agent.identityHint')}</span>
         </div>
         <div className={styles['settings-form-field']}>
-          <label className={styles['settings-form-label']}>{t('settings.agent.ishiki')}</label>
+          <label className={styles['settings-form-label']}>{t('settings.agent.agentsMd')}</label>
           <textarea
             className={styles['settings-textarea']}
             rows={10}
             spellCheck={false}
-            value={ishiki}
-            onChange={(e) => setIshiki(e.target.value)}
+            value={agentsMd}
+            onChange={(e) => setAgentsMd(e.target.value)}
           />
-          <span className={styles['settings-form-hint']}>{t('settings.agent.ishikiHint')}</span>
+          <span className={styles['settings-form-hint']}>{t('settings.agent.agentsMdHint')}</span>
         </div>
-        <div className={styles['settings-form-field']} style={{ display: 'flex', justifyContent: 'center' }}>
+        <div className={`${styles['settings-form-field']} ${styles['settings-form-actions-center']}`}>
           <button className={styles['settings-save-btn-sm']} onClick={saveAgent}>
             {t('settings.save')}
           </button>
         </div>
-      </section>
+      </SettingsSection>
 
       {/* 以下是本 phase 需要改造的部分：Memory / Experience / Tools */}
 
@@ -398,6 +397,7 @@ export function AgentTab() {
         agentId={selectedSettingsAgentId}
         hasUtilityModel={hasUtilityModel}
         memoryEnabled={memoryEnabled}
+        autoDreamEnabled={autoDreamEnabled === true}
         currentPins={currentPins}
       />
 
@@ -414,7 +414,7 @@ export function AgentTab() {
             }}
           />}
         />
-        <div style={{ padding: 'var(--space-sm) var(--space-md)' }}>
+        <div className={styles['settings-section-inset']}>
           {experienceEnabled === undefined ? null : experienceEnabled === false ? (
             <div className={styles['exp-empty']}>{t('settings.experience.paused')}</div>
           ) : expCategories.length === 0 ? (
@@ -442,10 +442,10 @@ export function AgentTab() {
         </div>
       </SettingsSection>
 
-      {/* 默认关闭 dm / beautify / workflow，与后端 DEFAULT_DISABLED_TOOL_NAMES 保持同步 */}
+      {/* 默认关闭 dm / workflow，与后端 DEFAULT_DISABLED_TOOL_NAMES 保持同步 */}
       <AgentToolsSection
         availableTools={availableTools}
-        disabled={settingsConfig ? settingsConfig.tools?.disabled ?? ["dm", "beautify", "workflow"] : undefined}
+        disabled={settingsConfig ? settingsConfig.tools?.disabled ?? ["workflow"] : undefined}
       />
 
       {exportPlanningAgentId && createPortal((

@@ -4,6 +4,7 @@ import path from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { createSettingsSnapshotRoute } from "../server/routes/settings-snapshot.ts";
+import { MASKED_SECRET } from "../shared/secret-custody.ts";
 
 let tmpRoot: string | null = null;
 
@@ -101,14 +102,15 @@ async function makeEngine() {
     "",
   ].join("\n"));
   await writeFile(path.join(agentDir, "identity.md"), "identity");
-  await writeFile(path.join(agentDir, "ishiki.md"), "ishiki");
-  await writeFile(path.join(agentDir, "public-ishiki.md"), "public");
+  await writeFile(path.join(agentDir, "AGENTS.md"), "persona");
+  await writeFile(path.join(agentDir, "AGENTS.public.md"), "public");
   await writeFile(path.join(agentDir, "pinned.md"), "keep this");
   await writeFile(path.join(userDir, "user.md"), "user profile");
 
   return {
     hanakoHome: tmpRoot,
     agentsDir,
+    productDir: path.join(tmpRoot, "product"),
     userDir,
     currentAgentId: "agent-a",
     listAgents: () => [{ id: "agent-a", name: "Agent A" }],
@@ -132,7 +134,11 @@ async function makeEngine() {
     getSearchConfig: () => ({ provider: "", api_key: "", api_keys: {} }),
     getUtilityApi: () => ({ provider: "", base_url: "", api_key: "" }),
     getQuickChatPreferences: () => ({ shortcut: "CommandOrControl+Shift+K", reuseTimeoutMinutes: 12 }),
-    getNotificationPreferences: () => ({ turnCompletion: "when_session_unfocused" }),
+    getNotificationPreferences: () => ({
+      chatCompletion: "when_session_unfocused",
+      scheduledTaskCompletion: "always",
+      patrolCompletion: "when_unfocused",
+    }),
     getBridgePermissionMode: () => "operate",
     getBridgeReadOnly: () => false,
     getBridgeReceiptEnabled: () => false,
@@ -177,9 +183,87 @@ describe("settings snapshot route", () => {
     expect(body.plugins.allowFullAccess).toBe(false);
     expect(body.plugins.devToolsEnabled).toBe(false);
     expect(body.identity).toBe("identity");
-    expect(body.ishiki).toBe("ishiki");
-    expect(body.publicIshiki).toBe("public");
+    expect(body.agents).toBe("persona");
+    expect(body.publicAgents).toBe("public");
     expect(body.userProfile).toBe("user profile");
+  });
+
+  it("falls back to template content for identity/AGENTS.md when the agent has not customized them (lazy materialization)", async () => {
+    const engine = await makeEngine();
+    const agentDir = path.join(engine.agentsDir, "agent-a");
+    // 惰性材料化：模拟一个从未定制过人格的 agent，identity.md/AGENTS.md 都
+    // 没有落盘（覆盖掉 makeEngine 里默认写好的两个落盘文件）。
+    await fs.rm(path.join(agentDir, "identity.md"));
+    await fs.rm(path.join(agentDir, "AGENTS.md"));
+    const productDir = path.join(tmpRoot!, "product");
+    await writeFile(path.join(productDir, "identity-templates", "hanako.md"), "Template identity content");
+    await writeFile(path.join(productDir, "agents-templates", "hanako.md"), "Template persona content");
+    (engine as any).productDir = productDir;
+
+    const app = new Hono();
+    app.route("/api", createSettingsSnapshotRoute(engine));
+
+    const res = await app.request("/api/settings/snapshot?agentId=agent-a");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // 快照必须反映 agent 此刻实际生效的内容（回落到模板），不能是空字符串。
+    expect(body.identity).toBe("Template identity content");
+    expect(body.agents).toBe("Template persona content");
+    // AGENTS.public.md 不在本次惰性材料化范围内，行为不变（原样读落盘文件）。
+    expect(body.publicAgents).toBe("public");
+  });
+
+  it("answers for the primary agent when the request omits an agent id", async () => {
+    const engine = await makeEngine();
+    // A second agent the server happens to be focused on. A bare snapshot
+    // request must describe the primary agent, not whoever holds the focus.
+    const otherDir = path.join(engine.agentsDir, "agent-b");
+    await writeFile(path.join(otherDir, "config.yaml"), "agent:\n  name: Agent B\n");
+    (engine as any).currentAgentId = "agent-b";
+    (engine as any).getPrimaryAgentId = () => "agent-a";
+    (engine as any).listAgents = () => [
+      { id: "agent-b", name: "Agent B" },
+      { id: "agent-a", name: "Agent A" },
+    ];
+    const app = new Hono();
+    app.route("/api", createSettingsSnapshotRoute(engine));
+
+    const res = await app.request("/api/settings/snapshot");
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.agentId).toBe("agent-a");
+    expect(body.config.agent.name).toBe("Agent A");
+  });
+
+  it("reports an error for a bare request when no primary agent is configured", async () => {
+    const engine = await makeEngine();
+    (engine as any).currentAgentId = "agent-a";
+    (engine as any).getPrimaryAgentId = () => null;
+    const app = new Hono();
+    app.route("/api", createSettingsSnapshotRoute(engine));
+
+    const res = await app.request("/api/settings/snapshot");
+
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("settings snapshot agent not found");
+  });
+
+  it("accepts a safe legacy uppercase and underscore agent id", async () => {
+    const engine = await makeEngine();
+    const legacyId = "Legacy_AGENT-1";
+    await fs.rename(
+      path.join(engine.agentsDir, "agent-a"),
+      path.join(engine.agentsDir, legacyId),
+    );
+    const app = new Hono();
+    app.route("/api", createSettingsSnapshotRoute(engine));
+
+    const res = await app.request(`/api/settings/snapshot?agentId=${legacyId}`);
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).agentId).toBe(legacyId);
   });
 
   it("includes first-frame access and bridge truth in the unified settings snapshot", async () => {
@@ -225,6 +309,57 @@ describe("settings snapshot route", () => {
       richStreamingEnabled: true,
     });
     expect(JSON.stringify(body)).not.toContain("tg-secret");
+  });
+
+  it("redacts DingTalk credential aliases from the real settings snapshot response", async () => {
+    const engine = await makeEngine();
+    await writeFile(path.join(engine.agentsDir, "agent-a", "config.yaml"), [
+      "agent:",
+      "  name: Agent A",
+      "bridge:",
+      "  dingtalk:",
+      "    appSecret: test-only-app-secret",
+      "    clientSecret: test-only-client-secret",
+      "    corpSecret: test-only-corp-secret",
+      "    webhookSecret: test-only-webhook-secret",
+      "    webhookToken: test-only-webhook-token",
+      "    robotToken: test-only-robot-token",
+      "    oauthClientSecret: test-only-oauth-client-secret",
+      "    suiteSecret: test-only-suite-secret",
+      "    clientSecretLabel: visible label",
+      "",
+    ].join("\n"));
+    const app = new Hono();
+    app.route("/api", createSettingsSnapshotRoute(engine));
+
+    const res = await app.request("/api/settings/snapshot?agentId=agent-a");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.config.bridge.dingtalk).toEqual({
+      appSecret: MASKED_SECRET,
+      clientSecret: MASKED_SECRET,
+      corpSecret: MASKED_SECRET,
+      webhookSecret: MASKED_SECRET,
+      webhookToken: MASKED_SECRET,
+      robotToken: MASKED_SECRET,
+      oauthClientSecret: MASKED_SECRET,
+      suiteSecret: MASKED_SECRET,
+      clientSecretLabel: "visible label",
+    });
+    const serializedConfig = JSON.stringify(body.config);
+    for (const secretMarker of [
+      "test-only-app-secret",
+      "test-only-client-secret",
+      "test-only-corp-secret",
+      "test-only-webhook-secret",
+      "test-only-webhook-token",
+      "test-only-robot-token",
+      "test-only-oauth-client-secret",
+      "test-only-suite-secret",
+    ]) {
+      expect(serializedConfig).not.toContain(secretMarker);
+    }
   });
 
   it("includes first-frame Computer Use truth in the unified settings snapshot", async () => {

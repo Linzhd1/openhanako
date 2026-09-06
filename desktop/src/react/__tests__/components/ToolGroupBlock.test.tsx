@@ -17,6 +17,23 @@ describe('ToolGroupBlock', () => {
     cleanup();
   });
 
+  it('renders failed and unknown outcomes without presenting either as success', () => {
+    render(
+      <ToolGroupBlock
+        collapsed={false}
+        tools={[
+          { id: 'failed', name: 'read', done: true, success: false, status: 'failed', error: 'file not found' },
+          { id: 'unknown', name: 'read', done: true, success: false, status: 'unknown' },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('file not found')).toBeInTheDocument();
+    expect(screen.getByText('✗')).toBeInTheDocument();
+    expect(screen.getByText('?')).toBeInTheDocument();
+    expect(screen.queryByText('✓')).not.toBeInTheDocument();
+  });
+
   it('shows the full bash command in the hover title when the visible detail is truncated', () => {
     const command = 'rm -rf /Users/jason/.claude/plugins/marketplaces/temp_*';
 
@@ -35,6 +52,52 @@ describe('ToolGroupBlock', () => {
     const detail = screen.getByTitle(command);
 
     expect(detail.textContent).toBe('rm -rf /Users/jason/.claude/plugins/mar…');
+  });
+
+  it('renders exec_command with the legacy bash user-facing copy', () => {
+    window.t = ((key: string, vars?: Record<string, unknown>) => {
+      if (key === 'tool.bash.done') return `💻 ${vars?.name} 用完电脑了`;
+      return key;
+    }) as typeof window.t;
+
+    render(
+      <ToolGroupBlock
+        collapsed={false}
+        agentName="Hanako"
+        tools={[{
+          name: 'exec_command',
+          args: { cmd: 'npm test' },
+          done: true,
+          success: true,
+        }]}
+      />,
+    );
+
+    expect(screen.getByText('💻 Hanako 用完电脑了')).toBeInTheDocument();
+    expect(screen.getByText('npm test')).toBeInTheDocument();
+  });
+
+  it('renders write_stdin with the legacy terminal user-facing copy', () => {
+    window.t = ((key: string, vars?: Record<string, unknown>) => {
+      if (key === 'tool.terminal.done') return `💻 ${vars?.name} 敲完了`;
+      return key;
+    }) as typeof window.t;
+
+    render(
+      <ToolGroupBlock
+        collapsed={false}
+        agentName="Hanako"
+        tools={[{
+          name: 'write_stdin',
+          args: { process_id: 'term_1', chars: 'q\n' },
+          done: true,
+          success: true,
+        }]}
+      />,
+    );
+
+    expect(screen.getByText('💻 Hanako 敲完了')).toBeInTheDocument();
+    expect(document.querySelector('[data-tool="write_stdin"] [title]')).toHaveAttribute('title', 'q\n');
   });
 
   it('syncs a multi-tool group to collapsed when the completed block updates', async () => {
@@ -139,6 +202,32 @@ describe('ToolGroupBlock', () => {
     expect(container.firstChild).toBeNull();
   });
 
+  it('hides interactive card guide and render tools because the card is the UI', () => {
+    const { container } = render(
+      <ToolGroupBlock
+        collapsed={false}
+        tools={[
+          {
+            name: 'hana_card_guide',
+            args: {},
+            done: true,
+            success: true,
+          },
+          {
+            name: 'show_card',
+            args: {
+              title: 'dorm_comparison',
+            },
+            done: true,
+            success: true,
+          },
+        ]}
+      />,
+    );
+
+    expect(container.firstChild).toBeNull();
+  });
+
   it('hides current card-backed tools while keeping visible browser and compatibility tools', () => {
     render(
       <ToolGroupBlock
@@ -198,14 +287,47 @@ describe('ToolGroupBlock', () => {
     expect(screen.queryByText('Tea')).not.toBeInTheDocument();
   });
 
-  it('keeps the tool layout box full width within its message for selection and side controls', () => {
+  it('keeps the tool layout box aligned to the task-block width', () => {
     const css = fs.readFileSync(
       path.join(process.cwd(), 'desktop/src/react/components/chat/Chat.module.css'),
       'utf8',
     );
     const toolGroupRule = css.match(/\.toolGroup\s*\{(?<body>[^}]*)\}/)?.groups?.body || '';
 
-    expect(toolGroupRule).toContain('width: 100%');
+    expect(toolGroupRule).toContain('width: var(--chat-task-block-width)');
+    expect(toolGroupRule).toContain('max-width: 100%');
     expect(toolGroupRule).toContain('box-sizing: border-box');
+  });
+
+  it('fuses consecutive subagent cards into one rounded block', () => {
+    const css = fs.readFileSync(
+      path.join(process.cwd(), 'desktop/src/react/components/chat/Chat.module.css'),
+      'utf8',
+    );
+    const leading = css.match(/\.subagentResourceCard\[data-chat-resource-card\]:has\(\+ \.subagentResourceCard\[data-chat-resource-card\]\)\s*\{(?<body>[^}]*)\}/)?.groups?.body || '';
+    const trailing = css.match(/\.subagentResourceCard\[data-chat-resource-card\]\s*\+\s*\.subagentResourceCard\[data-chat-resource-card\]\s*\{(?<body>[^}]*)\}/)?.groups?.body || '';
+
+    expect(leading).toContain('margin-bottom: 0');
+    expect(leading).toContain('border-bottom-left-radius: 0');
+    expect(leading).toContain('border-bottom-right-radius: 0');
+    expect(trailing).toContain('margin-top: 0');
+    expect(trailing).toContain('border-top-left-radius: 0');
+    expect(trailing).toContain('border-top-right-radius: 0');
+    expect(trailing).toContain('border-top: 1px solid var(--overlay-light');
+  });
+
+  it('renders the task-family container: four-corner radius, no accent quote bar', () => {
+    const css = fs.readFileSync(
+      path.join(process.cwd(), 'desktop/src/react/components/chat/Chat.module.css'),
+      'utf8',
+    );
+    const toolGroupRule = css.match(/\.toolGroup\s*\{(?<body>[^}]*)\}/)?.groups?.body || '';
+    expect(toolGroupRule).toContain('border-radius: var(--radius-sm)');
+    expect(toolGroupRule).not.toContain('padding-left');
+    expect(css).not.toMatch(/\.toolGroup::before/);
+    expect(css).not.toContain('hana-tool-bar-in');
+
+    const toolDotsRule = css.match(/\.toolDots\s*\{(?<body>[^}]*)\}/)?.groups?.body || '';
+    expect(toolDotsRule).toContain('color: var(--tool-text)');
   });
 });

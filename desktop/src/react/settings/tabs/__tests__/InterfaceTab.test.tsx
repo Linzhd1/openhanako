@@ -2,12 +2,18 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InterfaceTab } from '../InterfaceTab';
 import { useSettingsStore } from '../../store';
 import registry from '../../../../shared/theme-registry';
+
+const hanaFetchMock = vi.fn();
+
+vi.mock('../../api', () => ({
+  hanaFetch: (...args: unknown[]) => hanaFetchMock(...args),
+}));
 
 vi.mock('../../../services/appearance-sync', () => ({
   persistAppearancePreferences: vi.fn().mockResolvedValue(undefined),
@@ -60,6 +66,37 @@ describe('InterfaceTab appearance state', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    hanaFetchMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/api/preferences/sidebar-ui' && init?.method === 'PUT') {
+        return {
+          json: async () => ({
+            sidebarUi: {
+              projectView: {
+                collapsedProjectIds: [],
+                collapsedFolderIds: [],
+                showAllProjectIds: [],
+              },
+              sessionList: { rowMode: 'single-line' },
+            },
+          }),
+        };
+      }
+      if (path === '/api/preferences/sidebar-ui') {
+        return {
+          json: async () => ({
+            sidebarUi: {
+              projectView: {
+                collapsedProjectIds: [],
+                collapsedFolderIds: [],
+                showAllProjectIds: [],
+              },
+              sessionList: { rowMode: 'two-line' },
+            },
+          }),
+        };
+      }
+      return { json: async () => ({}) };
+    });
     localStorage.clear();
     document.body.className = '';
     document.documentElement.setAttribute('data-theme', registry.DEFAULT_THEME);
@@ -171,7 +208,7 @@ describe('InterfaceTab appearance state', () => {
     expect(editorWidthSlider.max).toBe('3');
     expect(editorWidthSlider.step).toBe('1');
     expect(editorWidthSlider.value).toBe('1');
-    expect(editorNumberInputs[0].value).toBe('15');
+    expect(editorNumberInputs[0].value).toBe('16');
 
     expect(screen.queryByText('720 px')).toBeNull();
     expect(screen.queryByText('settings.appearance.documentWidth')).toBeNull();
@@ -190,14 +227,14 @@ describe('InterfaceTab appearance state', () => {
     expect(css).toMatch(/\.stepSliderTicks span\s*\{[\s\S]*transform:\s*translateX\(-50%\)/);
   });
 
-  it('keeps standard row padding inside nested setting cards in flush sections', () => {
+  it('keeps standard row padding inside nested setting cards on plain surfaces', () => {
     const css = readSettingsComponentStyles();
 
-    expect(css).toMatch(/\.sectionFlush\s*>\s*\.sectionBody\s*>\s*\.row\s*\{[\s\S]*padding-left:\s*0/);
-    expect(css).toMatch(/\.sectionFlush\s*>\s*\.sectionBody\s*>\s*\.row\s*\{[\s\S]*padding-right:\s*0/);
-    expect(css).toMatch(/\.sectionFlush\s*>\s*\.sectionBody\s*>\s*\.row\s*\+\s*\.row::before\s*\{[\s\S]*display:\s*none/);
-    expect(css).not.toMatch(/\.sectionFlush\s+\.row\s*\{/);
-    expect(css).not.toMatch(/\.sectionFlush\s+\.row\s*\+\s*\.row::before\s*\{/);
+    expect(css).toMatch(/\.sectionPlain\s*>\s*\.sectionBody\s*>\s*\.row\s*\{[\s\S]*padding-left:\s*0/);
+    expect(css).toMatch(/\.sectionPlain\s*>\s*\.sectionBody\s*>\s*\.row\s*\{[\s\S]*padding-right:\s*0/);
+    expect(css).toMatch(/\.sectionPlain\s*>\s*\.sectionBody\s*>\s*\.row\s*\+\s*\.row::before\s*\{[\s\S]*display:\s*none/);
+    expect(css).not.toMatch(/\.sectionPlain\s+\.row\s*\{/);
+    expect(css).not.toMatch(/\.sectionPlain\s+\.row\s*\+\s*\.row::before\s*\{/);
   });
 
   it('hides fourth through sixth heading typography controls', () => {
@@ -219,5 +256,31 @@ describe('InterfaceTab appearance state', () => {
     expect(screen.getByText('settings.interface.shortcuts')).toBeTruthy();
     expect(screen.getByText('settings.interface.voiceRecordingShortcut')).toBeTruthy();
     expect(screen.getByLabelText('⌘ + ⇧ + M')).toBeTruthy();
+  });
+
+  it('saves the single-line session list preference through sidebar UI preferences', async () => {
+    render(React.createElement(InterfaceTab));
+
+    const label = await screen.findByText('settings.interface.sessionListSingleLine');
+    const row = label.parentElement?.parentElement;
+    expect(row).toBeTruthy();
+    const densitySwitch = within(row as HTMLElement).getByRole('switch') as HTMLButtonElement;
+
+    await waitFor(() => {
+      expect(densitySwitch.getAttribute('aria-checked')).toBe('false');
+    });
+    fireEvent.click(densitySwitch);
+
+    await waitFor(() => {
+      expect(hanaFetchMock).toHaveBeenCalledWith('/api/preferences/sidebar-ui', expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ sessionList: { rowMode: 'single-line' } }),
+      }));
+      expect(window.platform.settingsChanged).toHaveBeenCalledWith('sidebar-ui-changed', expect.objectContaining({
+        sidebarUi: expect.objectContaining({
+          sessionList: { rowMode: 'single-line' },
+        }),
+      }));
+    });
   });
 });

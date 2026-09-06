@@ -15,7 +15,8 @@
  *   3. git / python / node 这类 argv 稳定的工具走专用 runner
  *   4. 只有显式 POSIX shell 命令走 bash/ash/sh 兼容层
  *
- * POSIX/Git runtime 优先使用打包进 resources/git 的 bundled PortableGit runtime。
+ * POSIX/Git runtime 优先使用打包进 resources/git 的 bundled Git runtime（MinGit：
+ * git.exe + usr/bin/sh.exe，无 bash.exe；旧安装可能仍是 PortableGit 布局）。
  * 沙盒开启时找不到 bundled runtime 就 fail fast；沙盒关闭时才允许系统 Git Bash 兜底。
  */
 
@@ -28,16 +29,22 @@ import { assertSafeWin32BashCommand } from "./win32-bash-guard.ts";
 import { buildWin32SandboxGrants } from "./win32-policy.ts";
 import {
   buildWin32SandboxHelperArgs,
+  createWin32SandboxTerminalStderrFilter,
   resolveWin32SandboxHelper,
   resourceSiblingDir,
 } from "./win32-sandbox-helper.ts";
-import { prepareSandboxRuntime } from "./win32-runtime-cache.ts";
+import {
+  getSandboxPowerShellProbeResult,
+  prepareSandboxRuntime,
+  setSandboxPowerShellProbeResult,
+} from "./win32-runtime-cache.ts";
 import { createModuleLogger } from "../debug-log.ts";
 import {
   isWin32PathLike,
   normalizeBackslashEscapedDoubleQuotes,
   quoteCmdArg,
   resolveWin32CmdExecutable,
+  resolveWin32DefaultPowerShellExecutable,
   resolveWin32PowerShellExecutable,
   splitShellLikeArgs as splitShellLikeArgsBase,
 } from "../shell/shell-utils.ts";
@@ -58,6 +65,9 @@ const STATUS_DLL_INIT_FAILED_UNSIGNED = 0xC0000142;
 const STATUS_DLL_INIT_FAILED_SIGNED = -1073741502;
 const WIN32_SANDBOX_HELPER_LAUNCH_FAILURE_RE = /hana-win-sandbox:\s+CreateProcessAsUserW failed/i;
 const WIN32_DIAGNOSTIC_OUTPUT_PREVIEW_LIMIT = 8192;
+const WIN32_SANDBOX_TERMINATION_GRACE_MS = 5000;
+const WIN32_SANDBOX_HELPER_WATCHDOG_EXTRA_MS = WIN32_SANDBOX_TERMINATION_GRACE_MS + 2000;
+const WIN32_SANDBOX_HELPER_STDIO_GRACE_MS = 2000;
 
 // 枚举 Windows 盘符 C-Z（A/B 是软盘遗留，不扫）。
 // 用户可能把 Git/MSYS2/Cygwin 装在任意非 C 盘（如 D:\Git、E:\msys64），
@@ -153,7 +163,7 @@ function probeShell(shell, args, env = process.env) {
  * 查找顺序：
  * 1. 系统 Git Bash（标准 + 常见安装位置）
  * 2. 注册表查询 Git 安装路径
- * 3. 内嵌 PortableGit 的 POSIX runtime（打包进 resources/git/）
+ * 3. 内嵌 bundled Git runtime 的 POSIX shell（打包进 resources/git/，MinGit 为 usr/bin/sh.exe）
  * 4. PATH 上的 bash.exe / sh.exe
  * 5. MSYS2 / Cygwin
  */
@@ -166,6 +176,9 @@ function getBundledShellCandidates(env = process.env, deps: Record<string, any> 
       { relative: ["bin", "bash.exe"], args: ["-lc"], label: "PortableGit bash.exe" },
       { relative: ["usr", "bin", "bash.exe"], args: ["-lc"], label: "PortableGit usr/bin/bash.exe" },
       { relative: ["mingw64", "bin", "bash.exe"], args: ["-lc"], label: "PortableGit mingw64/bin/bash.exe" },
+      // MinGit 的 POSIX shell：usr/bin/sh.exe（bash 以 POSIX/sh 模式运行）。
+      // 对外契约是 sh-compatible，不承诺 Bash 特性；label 里不能出现 bash。
+      { relative: ["usr", "bin", "sh.exe"], args: ["-c"], label: "MinGit usr/bin/sh.exe" },
       { relative: ["mingw64", "bin", "sh.exe"], args: ["-c"], label: "PortableGit sh.exe" },
       { relative: ["mingw64", "bin", "ash.exe"], args: ["-c"], label: "Legacy MinGit ash.exe" },
       { relative: ["mingw64", "bin", "busybox.exe"], args: ["sh", "-c"], label: "Legacy MinGit busybox.exe" },
@@ -197,7 +210,7 @@ function getBundledGitCandidates(env = process.env, deps: Record<string, any> = 
       if (exists(git) && !found.some(c => c.git === git)) {
         found.push({
           git,
-          label: `Bundled PortableGit git.exe (${git})`,
+          label: `Bundled Git runtime git.exe (${git})`,
           bundledRoot: gitRoot,
         });
       }
@@ -254,12 +267,12 @@ function findGitRuntime({ env = process.env, bundledOnly = false } = {}) {
   if (bundledOnly) {
     throw new Error(
       "[win32-exec] Sandboxed Git commands require bundled Git runtime, " +
-      "but resources/git/cmd/git.exe was not found. Rebuild the Windows package with vendor/git-portable."
+      "but resources/git/cmd/git.exe was not found. Rebuild the Windows package with vendor/mingit."
     );
   }
 
   throw new Error(
-    "[win32-exec] No usable git.exe found. Install Git for Windows or rebuild HanaAgent with bundled PortableGit."
+    "[win32-exec] No usable git.exe found. Install Git for Windows or rebuild HanaAgent with bundled MinGit."
   );
 }
 
@@ -319,7 +332,7 @@ function getAllShellCandidates({ preferBundled = false, bundledOnly = false, env
     } catch {}
   }
 
-  // ── 3. 内嵌 PortableGit 的 POSIX runtime ──
+  // ── 3. 内嵌 bundled Git runtime 的 POSIX shell ──
   if (!preferBundled) {
     for (const candidate of bundled) {
       if (!found.some(c => c.shell === candidate.shell)) found.push(candidate);
@@ -411,7 +424,7 @@ function findAndCacheShell(startAfter: any, options: Record<string, any> = {}) {
     throw new Error(
       `[win32-exec] Sandboxed POSIX commands require bundled POSIX runtime under resources/git.\n` +
       `Tried bundled candidates:\n${allLabels.map(s => `  - ${s}`).join("\n") || "  - (none found)"}\n\n` +
-      `Rebuild the Windows package with vendor/git-portable, or disable sandbox explicitly.`
+      `Rebuild the Windows package with vendor/mingit, or disable sandbox explicitly.`
     );
   }
   throw new Error(
@@ -762,8 +775,77 @@ function findPythonRuntime({ command, cwd, env = process.env }: { command?: any;
   );
 }
 
-function powerShellBaseArgs() {
-  return ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass"];
+function powerShellBaseArgs({ sandboxed = false }: { sandboxed?: boolean } = {}) {
+  return [
+    "-NoLogo",
+    "-NoProfile",
+    ...(sandboxed ? ["-NonInteractive"] : []),
+    "-ExecutionPolicy",
+    "Bypass",
+  ];
+}
+
+const POWERSHELL_UTF8_PRELUDE =
+  "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
+  "$OutputEncoding = [Console]::OutputEncoding";
+
+function quotePowerShellSingleArg(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function withPowerShellUtf8Prelude(command) {
+  const raw = String(command || "");
+  return raw.trim()
+    ? `${POWERSHELL_UTF8_PRELUDE}; ${raw}`
+    : POWERSHELL_UTF8_PRELUDE;
+}
+
+function isPowerShellCommandFlag(value) {
+  const flag = String(value || "").toLowerCase();
+  return flag === "-command" || flag === "/command" || flag === "-c";
+}
+
+function isPowerShellEncodedCommandFlag(value) {
+  const flag = String(value || "").toLowerCase();
+  return flag === "-encodedcommand" || flag === "/encodedcommand" || flag === "-enc";
+}
+
+function isPowerShellFileFlag(value) {
+  const flag = String(value || "").toLowerCase();
+  return flag === "-file" || flag === "/file";
+}
+
+function powerShellFileInvocation(script, args) {
+  const scriptPart = quotePowerShellSingleArg(script);
+  const argPart = args.map((arg) => quotePowerShellSingleArg(arg)).join(" ");
+  return `& ${scriptPart}${argPart ? ` ${argPart}` : ""}`;
+}
+
+function powerShellArgsWithUtf8Prelude(args) {
+  if (args.some(isPowerShellEncodedCommandFlag)) return args;
+
+  const commandIndex = args.findIndex(isPowerShellCommandFlag);
+  if (commandIndex >= 0) {
+    if (commandIndex + 1 >= args.length) return args;
+    const next = [...args];
+    next[commandIndex + 1] = withPowerShellUtf8Prelude(next[commandIndex + 1]);
+    return next;
+  }
+
+  const fileIndex = args.findIndex(isPowerShellFileFlag);
+  if (fileIndex >= 0) {
+    if (fileIndex + 1 >= args.length) return args;
+    const before = args.slice(0, fileIndex);
+    const script = args[fileIndex + 1];
+    const scriptArgs = args.slice(fileIndex + 2);
+    return [
+      ...before,
+      "-Command",
+      withPowerShellUtf8Prelude(powerShellFileInvocation(script, scriptArgs)),
+    ];
+  }
+
+  return args;
 }
 
 function resolvePowerShellExecutable(token, env = process.env) {
@@ -772,7 +854,15 @@ function resolvePowerShellExecutable(token, env = process.env) {
   });
 }
 
-function parsePowerShellCommand(command, env) {
+function resolveDefaultPowerShellExecutable(env = process.env) {
+  return resolveWin32DefaultPowerShellExecutable(env, {
+    resolveOnPath: (commandName) => firstPathResult(commandName, env),
+    exists: existsSync,
+    spawn: spawnSync,
+  });
+}
+
+function parsePowerShellCommand(command, env, options = {}) {
   const args = splitShellLikeArgs(command);
   const token = args[0] || "";
   const commandName = basenameRuntimePath(token).toLowerCase();
@@ -781,26 +871,34 @@ function parsePowerShellCommand(command, env) {
   }
   return {
     executable: resolvePowerShellExecutable(token, env),
-    args: [...powerShellBaseArgs(), ...args.slice(1)],
+    args: powerShellArgsWithUtf8Prelude([...powerShellBaseArgs(options), ...args.slice(1)]),
   };
 }
 
-function parsePowerShellFileCommand(command, env) {
+function parsePowerShellFileCommand(command, env, options = {}) {
   const args = splitShellLikeArgs(command);
   const script = args[0] || "";
   if (!/\.ps1$/i.test(basenameRuntimePath(script))) {
     throw new Error(`[win32-exec] Internal error: PowerShell file runner received non-.ps1 command: ${command}`);
   }
   return {
-    executable: resolvePowerShellExecutable("powershell.exe", env),
-    args: [...powerShellBaseArgs(), "-File", script, ...args.slice(1)],
+    executable: resolveDefaultPowerShellExecutable(env),
+    args: [
+      ...powerShellBaseArgs(options),
+      "-Command",
+      withPowerShellUtf8Prelude(powerShellFileInvocation(script, args.slice(1))),
+    ],
   };
 }
 
-function parseDefaultPowerShellCommand(command, env) {
+function parseDefaultPowerShellCommand(command, env, options = {}) {
   return {
-    executable: resolvePowerShellExecutable("powershell.exe", env),
-    args: [...powerShellBaseArgs(), "-Command", normalizeBackslashEscapedDoubleQuotes(command)],
+    executable: resolveDefaultPowerShellExecutable(env),
+    args: [
+      ...powerShellBaseArgs(options),
+      "-Command",
+      withPowerShellUtf8Prelude(normalizeBackslashEscapedDoubleQuotes(command)),
+    ],
   };
 }
 
@@ -817,7 +915,9 @@ function cmdScriptCommand(command) {
 }
 
 function cmdArgsForCommand(command) {
-  return ["/d", "/s", "/c", `chcp 65001 >NUL & ${command}`];
+  // /s 会剥掉整段的首尾引号；外层引号由此处补上，两条执行路径都必须
+  // verbatim 传递本数组，任何一层再做 MSVCRT 转义都会破坏 cmd 解析。
+  return ["/d", "/s", "/c", `"chcp 65001 >NUL & ${command}"`];
 }
 
 function sandboxIsEnabled(sandbox) {
@@ -834,50 +934,23 @@ function formatWin32ExitCodeHex(exitCode) {
   return `0x${(exitCode >>> 0).toString(16).toUpperCase().padStart(8, "0")}`;
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function envValue(env, key) {
   if (!env) return "";
   const found = Object.keys(env).find((candidate) => candidate.toLowerCase() === key.toLowerCase());
   return found ? String(env[found] || "") : "";
 }
 
-function redactWin32DiagnosticText(value: any, { sandbox, env }: { sandbox?: any; env?: any } = {}) {
-  let text = String(value || "");
-  const replacements = [
-    [sandbox?.hanakoHome, "<HANA_HOME>"],
-    [envValue(env, "HANA_HOME"), "<HANA_HOME>"],
-    [envValue(env, "USERPROFILE"), "<USERPROFILE>"],
-    [envValue(env, "HOME"), "<HOME>"],
-    [process.env.USERPROFILE, "<USERPROFILE>"],
-    [process.env.HOME, "<HOME>"],
-  ];
-  for (const [raw, marker] of replacements) {
-    const pathText = typeof raw === "string" ? raw.trim() : "";
-    if (!pathText) continue;
-    text = text.replace(new RegExp(escapeRegExp(pathText), "gi"), marker);
-  }
-  text = text.replace(/\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 <redacted>");
-  text = text.replace(/\b(api[_-]?key|authorization|password|secret|token)(\s*[:=]\s*)(["']?)[^\s"'&]+/gi, "$1$2$3<redacted>");
-  return text;
+function diagnosticValueMetadata(label, value) {
+  const text = value == null ? "" : String(value);
+  return `${label}: present=${text.length > 0} length=${text.length}`;
 }
 
-function redactWin32DiagnosticPath(value, sandbox, env) {
-  return redactWin32DiagnosticText(value, { sandbox, env });
-}
-
-function truncateDiagnosticValue(value, max = 120) {
-  const text = String(value || "");
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
-}
-
-function safeArgPreview(args, context) {
-  return (args || []).slice(0, 8).map((arg) => truncateDiagnosticValue(
-    redactWin32DiagnosticText(arg, context),
-    100
-  ));
+function diagnosticArgsMetadata(args) {
+  const values = Array.isArray(args) ? args.map((arg) => String(arg)) : [];
+  const lengths = values.map((arg) => arg.length);
+  const totalLength = lengths.reduce((sum, length) => sum + length, 0);
+  const maxLength = lengths.length > 0 ? Math.max(...lengths) : 0;
+  return `Args: count=${values.length} totalLength=${totalLength} maxLength=${maxLength}`;
 }
 
 function splitWin32PathEnv(env) {
@@ -889,26 +962,24 @@ function pathIndex(entries, pattern) {
   return entries.findIndex((entry) => pattern.test(entry));
 }
 
-function collectWin32EnvironmentDiagnostics(env, context) {
+function collectWin32EnvironmentDiagnostics(env) {
   const pathEntries = splitWin32PathEnv(env);
-  const firstEntries = pathEntries.slice(0, 6)
-    .map((entry) => redactWin32DiagnosticPath(entry, context.sandbox, env));
   const system32Index = pathIndex(pathEntries, /\\windows\\system32(?:\\|$)/i);
-  const portableGitIndex = pathIndex(pathEntries, /\\(?:resources\\git|git)\\(?:bin|usr\\bin|mingw64\\bin|cmd)(?:\\|$)/i);
+  const bundledGitIndex = pathIndex(pathEntries, /\\(?:resources\\git|git)\\(?:bin|usr\\bin|mingw64\\bin|cmd)(?:\\|$)/i);
   return [
-    `ComSpec: ${redactWin32DiagnosticPath(envValue(env, "ComSpec") || envValue(env, "COMSPEC") || "(unset)", context.sandbox, env)}`,
-    `SystemRoot: ${redactWin32DiagnosticPath(envValue(env, "SystemRoot") || "(unset)", context.sandbox, env)}`,
-    `PATHEXT: ${envValue(env, "PATHEXT") || "(unset)"}`,
-    `PATH entries: ${pathEntries.length}; first 6: ${JSON.stringify(firstEntries)}`,
+    diagnosticValueMetadata("ComSpec", envValue(env, "ComSpec") || envValue(env, "COMSPEC")),
+    diagnosticValueMetadata("SystemRoot", envValue(env, "SystemRoot")),
+    diagnosticValueMetadata("PATHEXT", envValue(env, "PATHEXT")),
+    `PATH entries: ${pathEntries.length}`,
     `PATH System32 index: ${system32Index}`,
-    `PATH PortableGit index: ${portableGitIndex}`,
-    `TEMP: ${redactWin32DiagnosticPath(envValue(env, "TEMP") || "(unset)", context.sandbox, env)}`,
-    `TMP: ${redactWin32DiagnosticPath(envValue(env, "TMP") || "(unset)", context.sandbox, env)}`,
-    `LOCALAPPDATA: ${redactWin32DiagnosticPath(envValue(env, "LOCALAPPDATA") || "(unset)", context.sandbox, env)}`,
-    `APPDATA: ${redactWin32DiagnosticPath(envValue(env, "APPDATA") || "(unset)", context.sandbox, env)}`,
-    `HANA_ROOT: ${redactWin32DiagnosticPath(envValue(env, "HANA_ROOT") || "(unset)", context.sandbox, env)}`,
-    `HANA_SERVER_ENTRY: ${redactWin32DiagnosticPath(envValue(env, "HANA_SERVER_ENTRY") || "(unset)", context.sandbox, env)}`,
-    `process.execPath: ${redactWin32DiagnosticPath(process.execPath || "(unknown)", context.sandbox, env)}`,
+    `PATH bundled Git index: ${bundledGitIndex}`,
+    diagnosticValueMetadata("TEMP", envValue(env, "TEMP")),
+    diagnosticValueMetadata("TMP", envValue(env, "TMP")),
+    diagnosticValueMetadata("LOCALAPPDATA", envValue(env, "LOCALAPPDATA")),
+    diagnosticValueMetadata("APPDATA", envValue(env, "APPDATA")),
+    diagnosticValueMetadata("HANA_ROOT", envValue(env, "HANA_ROOT")),
+    diagnosticValueMetadata("HANA_SERVER_ENTRY", envValue(env, "HANA_SERVER_ENTRY")),
+    diagnosticValueMetadata("process.execPath", process.execPath),
     `Node: ${process.versions.node || "unknown"} ABI ${process.versions.modules || "unknown"}`,
   ];
 }
@@ -930,23 +1001,22 @@ function emitWin32RuntimeFailureDiagnostic(onData, {
   if (typeof onData !== "function") return;
   const runner = route?.runner || "unknown";
   const runnerReason = route?.reason || "unknown";
-  const resolvedExecutable = executable || runtimeInfo?.shell || runtimeInfo?.git || runtimeInfo?.executable || "(unknown)";
-  const context = { sandbox, env };
+  const resolvedExecutable = executable || runtimeInfo?.shell || runtimeInfo?.git || runtimeInfo?.executable || "";
   const lines = [
     "",
     `[win32-exec] ${runner} runner failed before command output (STATUS_DLL_INIT_FAILED / 0xC0000142).`,
     `Exit code: ${exitCode} (${formatWin32ExitCodeHex(exitCode)})`,
     `Route: runner=${runner} reason=${runnerReason} mode=${mode || "unknown"} sandbox=${sandboxIsEnabled(sandbox)}`,
-    `Executable: ${redactWin32DiagnosticPath(resolvedExecutable, sandbox, env)}`,
-    `Args count: ${(args || []).length}; preview: ${JSON.stringify(safeArgPreview(args, context))}`,
-    `CWD: ${redactWin32DiagnosticPath(cwd || "(unset)", sandbox, env)}`,
-    helperPath ? `Helper: ${redactWin32DiagnosticPath(helperPath, sandbox, env)}` : "Helper: (none)",
-    runtimeInfo?.label ? `Runtime label: ${redactWin32DiagnosticText(runtimeInfo.label, context)}` : null,
-    runtimeInfo?.bundledRoot ? `Runtime root: ${redactWin32DiagnosticPath(runtimeInfo.bundledRoot, sandbox, env)}` : null,
-    sandbox?.hanakoHome ? "HANA_HOME: <HANA_HOME>" : null,
+    diagnosticValueMetadata("Executable", resolvedExecutable),
+    diagnosticArgsMetadata(args),
+    diagnosticValueMetadata("CWD", cwd),
+    diagnosticValueMetadata("Helper", helperPath),
+    diagnosticValueMetadata("Runtime label", runtimeInfo?.label),
+    diagnosticValueMetadata("Runtime root", runtimeInfo?.bundledRoot),
+    diagnosticValueMetadata("HANA_HOME", sandbox?.hanakoHome || envValue(env, "HANA_HOME")),
     `Output bytes before failure: ${outputBytes ?? 0}`,
     `Duration ms: ${durationMs ?? "unknown"}`,
-    ...collectWin32EnvironmentDiagnostics(env, context),
+    ...collectWin32EnvironmentDiagnostics(env),
     "Default PowerShell/cmd/terminal execution is not changed by this diagnostic path.",
     "No fallback was attempted for this STATUS_DLL_INIT_FAILED result.",
     "Likely causes: Windows child process DLL initialization failed, the restricted-token helper environment is incomplete, or a runtime cache/AV block is preventing startup.",
@@ -973,26 +1043,25 @@ function emitWin32SandboxHelperLaunchFailureDiagnostic(onData, {
   if (typeof onData !== "function") return;
   const runner = route?.runner || "unknown";
   const runnerReason = route?.reason || "unknown";
-  const resolvedExecutable = executable || runtimeInfo?.shell || runtimeInfo?.git || runtimeInfo?.executable || "(unknown)";
-  const context = { sandbox, env };
+  const resolvedExecutable = executable || runtimeInfo?.shell || runtimeInfo?.git || runtimeInfo?.executable || "";
   const lines = [
     "",
     "[win32-exec] sandbox helper launch failed before command execution.",
     "Native helper reported CreateProcessAsUserW failure.",
     `Exit code: ${exitCode ?? "unknown"}`,
     `Route: runner=${runner} reason=${runnerReason} mode=${mode || "unknown"} sandbox=${sandboxIsEnabled(sandbox)}`,
-    `Executable: ${redactWin32DiagnosticPath(resolvedExecutable, sandbox, env)}`,
-    `Args count: ${(args || []).length}; preview: ${JSON.stringify(safeArgPreview(args, context))}`,
-    `CWD: ${redactWin32DiagnosticPath(cwd || "(unset)", sandbox, env)}`,
-    helperPath ? `Helper: ${redactWin32DiagnosticPath(helperPath, sandbox, env)}` : "Helper: (none)",
-    runtimeInfo?.label ? `Runtime label: ${redactWin32DiagnosticText(runtimeInfo.label, context)}` : null,
-    runtimeInfo?.bundledRoot ? `Runtime root: ${redactWin32DiagnosticPath(runtimeInfo.bundledRoot, sandbox, env)}` : null,
-    sandbox?.hanakoHome ? "HANA_HOME: <HANA_HOME>" : null,
+    diagnosticValueMetadata("Executable", resolvedExecutable),
+    diagnosticArgsMetadata(args),
+    diagnosticValueMetadata("CWD", cwd),
+    diagnosticValueMetadata("Helper", helperPath),
+    diagnosticValueMetadata("Runtime label", runtimeInfo?.label),
+    diagnosticValueMetadata("Runtime root", runtimeInfo?.bundledRoot),
+    diagnosticValueMetadata("HANA_HOME", sandbox?.hanakoHome || envValue(env, "HANA_HOME")),
     `Output bytes before failure: ${outputBytes ?? 0}`,
     `Duration ms: ${durationMs ?? "unknown"}`,
-    ...collectWin32EnvironmentDiagnostics(env, context),
+    ...collectWin32EnvironmentDiagnostics(env),
     "No fallback was attempted for this CreateProcessAsUserW result.",
-    "Use the native launch-failure lines above to compare executable, cwd, commandLine, desktop, token probes, and named-object namespace probes.",
+    "Use the structured native launch-failure fields above to compare launch-stage metadata and token probes without exposing command content.",
     "",
   ].filter(Boolean);
   onData(Buffer.from(`${lines.join("\n")}\n`, "utf-8"));
@@ -1113,7 +1182,47 @@ function cleanupRootsForSandboxGrants(grants) {
   ];
 }
 
-async function spawnViaSandboxHelper({ sandbox, executable, args, cwd, env, onData, signal, timeout }) {
+// A write-restricted token can only write inside the paths the sandbox
+// explicitly granted. PowerShell writes a small policy-probe script file to
+// %TEMP% while starting up to figure out whether an AppLocker-style script
+// restriction applies; when that write is denied — the user's real %TEMP% is
+// not one of the granted paths — PowerShell falls back to Constrained
+// Language Mode, which breaks most one-shot commands. withWin32SandboxRuntimeEnv
+// (above) already points TEMP/TMP at <hanakoHome>/.ephemeral/win32-sandbox-env
+// for sandboxed sessions; this makes sure that directory is one of the
+// sandbox's *required* write roots. The restricted-token startup probe needs
+// a guaranteed write grant for this directory; an optional root does not
+// provide the same contract. This lets the token write there under every code
+// path, not just the ones that happen to also touch a required root for other
+// reasons.
+function win32SandboxEnvRoot(hanakoHome) {
+  if (!hanakoHome) return null;
+  return joinRuntimePath(hanakoHome, ".ephemeral", WIN32_SANDBOX_ENV_DIR);
+}
+
+function withSandboxEnvRootAsRequiredWritePath(grants, hanakoHome) {
+  const root = win32SandboxEnvRoot(hanakoHome);
+  // No hanakoHome means withWin32SandboxRuntimeEnv never redirected TEMP in
+  // the first place; nothing to promote to a required root here.
+  if (!root) return grants;
+  mkdirSync(root, { recursive: true });
+  const existingWritePaths = grants?.writePaths || [];
+  if (existingWritePaths.some((p) => String(p).toLowerCase() === root.toLowerCase())) return grants;
+  return { ...grants, writePaths: [...existingWritePaths, root] };
+}
+
+async function spawnViaSandboxHelper({
+  sandbox,
+  executable,
+  args,
+  cwd,
+  env,
+  onData,
+  signal,
+  timeout,
+  desktopMode = "private",
+  verbatimLastArg = false,
+}) {
   const helper = sandbox.helperPath || resolveWin32SandboxHelper({ env });
   if (!helper) {
     throw new Error(
@@ -1122,9 +1231,15 @@ async function spawnViaSandboxHelper({ sandbox, executable, args, cwd, env, onDa
     );
   }
   assertSandboxNetworkSupported(sandbox);
-  const grants = grantsForSandbox(sandbox, cwd);
+  const grants = withSandboxEnvRootAsRequiredWritePath(grantsForSandbox(sandbox, cwd), sandbox.hanakoHome);
+  const nativeTimeoutMs = timeout == null || timeout <= 0
+    ? 0
+    : Math.min(Math.ceil(timeout * 1000), 0xFFFFFFFE);
   const helperArgs = buildWin32SandboxHelperArgs({
     cwd,
+    timeoutMs: nativeTimeoutMs,
+    desktopMode,
+    verbatimLastArg,
     grants,
     executable,
     args,
@@ -1133,17 +1248,117 @@ async function spawnViaSandboxHelper({ sandbox, executable, args, cwd, env, onDa
   const cleanupRoots = cleanupRootsForSandboxGrants(grants);
   const lease = cleanupQueue?.beginRootUse?.(cleanupRoots);
   try {
-    return await spawnAndStream(helper, helperArgs, { cwd, env, onData, signal, timeout });
+    const stderrFilter = createWin32SandboxTerminalStderrFilter({ onData });
+    const watchdogTimeout = nativeTimeoutMs > 0
+      ? (nativeTimeoutMs + WIN32_SANDBOX_HELPER_WATCHDOG_EXTRA_MS) / 1000
+      : undefined;
+    let result;
+    try {
+      result = await spawnAndStream(helper, helperArgs, {
+        cwd,
+        env,
+        onData,
+        onStdout: onData,
+        onStderr: (data) => stderrFilter.push(data),
+        signal,
+        timeout: watchdogTimeout,
+        timeoutErrorValue: timeout,
+        exitStdioGraceMs: WIN32_SANDBOX_HELPER_STDIO_GRACE_MS,
+        // Terminating the helper closes its KILL_ON_JOB_CLOSE handle. Do not start
+        // taskkill for sandbox execution; the private Job owns the command tree.
+        killMode: "process",
+      });
+    } finally {
+      stderrFilter.flush();
+    }
+    const terminal = stderrFilter.terminalRecord;
+    if (!terminal) {
+      const error: any = new Error("[win32-sandbox] helper terminal record missing or invalid");
+      error.code = "HANA_WIN32_SANDBOX_TERMINAL_PROTOCOL";
+      throw error;
+    }
+    if (terminal.status === "timed_out") {
+      throw new Error(`timeout:${timeout}`);
+    }
+    if (terminal.status === "termination_failed") {
+      const error: any = new Error(
+        `[win32-sandbox] native Job termination failed (win32Error=${terminal.win32Error})`
+      );
+      error.code = "HANA_WIN32_SANDBOX_TERMINATION_FAILED";
+      error.win32Error = terminal.win32Error;
+      throw error;
+    }
+    if (terminal.status === "exited" && terminal.exitCode !== null) {
+      return { exitCode: terminal.exitCode };
+    }
+    return result;
   } finally {
     cleanupQueue?.endRootUse?.(lease);
     cleanupQueue?.enqueueRoots?.(cleanupRoots);
   }
 }
 
+// ── 沙盒 PowerShell 启动探针 ──
+//
+// Even with TEMP redirected (see withWin32SandboxRuntimeEnv and
+// withSandboxEnvRootAsRequiredWritePath above), a PowerShell build
+// or a machine policy this codebase hasn't seen yet could still fail the same
+// way. Rather than trust that in the dark, the first sandboxed PowerShell
+// command for a given executable in this process runs a tiny scripted probe
+// through the real sandbox helper before anything user-facing does; the
+// verdict is cached so every later command for that same executable skips
+// the probe. A failed probe fails the whole PowerShell route with a clear,
+// actionable error instead of letting a command silently run in Constrained
+// Language Mode and produce confusing partial output.
+
+const SANDBOX_POWERSHELL_PROBE_TIMEOUT_SECONDS = 15;
+const SANDBOX_POWERSHELL_PROBE_ARGS = ["-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('ok')"];
+const SANDBOX_POWERSHELL_CLM_MARKER = "MethodInvocationNotSupportedInConstrainedLanguage";
+
+async function probeSandboxPowerShellExecutable(executable, { sandbox, cwd, env }) {
+  let stdout = "";
+  try {
+    const result = await spawnViaSandboxHelper({
+      sandbox,
+      executable,
+      args: SANDBOX_POWERSHELL_PROBE_ARGS,
+      cwd,
+      env,
+      onData: (chunk) => { stdout += String(chunk ?? ""); },
+      signal: undefined,
+      timeout: SANDBOX_POWERSHELL_PROBE_TIMEOUT_SECONDS,
+      desktopMode: "private",
+    });
+    if (stdout.includes(SANDBOX_POWERSHELL_CLM_MARKER)) return "unsupported";
+    return result?.exitCode === 0 && stdout.includes("ok") ? "ok" : "unsupported";
+  } catch {
+    return "unsupported";
+  }
+}
+
+async function ensureSandboxPowerShellExecutableProbed(executable, probeCtx) {
+  const cached = getSandboxPowerShellProbeResult(executable);
+  if (cached === "ok") return true;
+  if (cached === "unsupported") return false;
+  const result = await probeSandboxPowerShellExecutable(executable, probeCtx);
+  setSandboxPowerShellProbeResult(executable, result);
+  return result === "ok";
+}
+
+function throwSandboxPowerShellUnsupported() {
+  const error: any = new Error(
+    "[win32-sandbox] PowerShell failed its restricted-token startup probe and cannot run inside the sandbox. "
+    + "Rerun it with sandbox_permissions=\"require_escalated\" and a one-sentence justification; "
+    + "the user reviews it before it runs unsandboxed.",
+  );
+  error.code = "HANA_WIN32_SANDBOX_POWERSHELL_UNSUPPORTED";
+  throw error;
+}
+
 // ── 导出 ──
 
 /**
- * 创建 Windows 平台的 bash exec 函数
+ * 创建 Windows 平台的命令执行函数
  *
  * spawn 失败时自动降级到下一个可用 shell（清缓存 + 重试）。
  * 只对 spawn 级错误（ENOENT/EACCES/EPERM）降级，abort/timeout/命令错误原样抛出。
@@ -1180,6 +1395,7 @@ export function createWin32Exec({ sandbox = null } = {}) {
             onData: diagnosticOnData,
             signal,
             timeout,
+            verbatimLastArg: true,
           }),
         });
       }
@@ -1200,6 +1416,7 @@ export function createWin32Exec({ sandbox = null } = {}) {
           onData: diagnosticOnData,
           signal,
           timeout,
+          windowsVerbatimArguments: true,
         }),
       });
     }
@@ -1229,6 +1446,7 @@ export function createWin32Exec({ sandbox = null } = {}) {
             onData: diagnosticOnData,
             signal,
             timeout,
+            verbatimLastArg: true,
           }),
         });
       }
@@ -1249,18 +1467,43 @@ export function createWin32Exec({ sandbox = null } = {}) {
           onData: diagnosticOnData,
           signal,
           timeout,
+          windowsVerbatimArguments: true,
         }),
       });
     }
 
     if (route.runner === "powershell" || route.runner === "powershell-file" || route.runner === "powershell-command") {
+      const sandboxed = sandboxIsEnabled(sandbox);
+      const powerShellOptions = { sandboxed };
       const powerShellInfo = route.runner === "powershell"
-        ? parsePowerShellCommand(command, shellEnv)
+        ? parsePowerShellCommand(command, shellEnv, powerShellOptions)
         : route.runner === "powershell-file"
-          ? parsePowerShellFileCommand(command, shellEnv)
-          : parseDefaultPowerShellCommand(command, shellEnv);
+          ? parsePowerShellFileCommand(command, shellEnv, powerShellOptions)
+          : parseDefaultPowerShellCommand(command, shellEnv, powerShellOptions);
 
-      if (sandboxIsEnabled(sandbox)) {
+      if (sandboxed) {
+        const probeCtx = { sandbox, cwd, env: shellEnv };
+        if (route.runner === "powershell") {
+          // The model explicitly named this shell (pwsh vs. powershell.exe); probe
+          // exactly that executable and fail rather than silently swap runtimes.
+          if (!(await ensureSandboxPowerShellExecutableProbed(powerShellInfo.executable, probeCtx))) {
+            throwSandboxPowerShellUnsupported();
+          }
+        } else {
+          // Default routing: prefer pwsh, same as the unsandboxed default, but
+          // only trust whichever executable actually passes the sandboxed
+          // startup probe. If neither does, fail the whole route rather than
+          // quietly falling back to cmd.
+          if (!(await ensureSandboxPowerShellExecutableProbed(powerShellInfo.executable, probeCtx))) {
+            const legacy = resolvePowerShellExecutable("powershell.exe", shellEnv);
+            const legacyIsDifferent = legacy.toLowerCase() !== powerShellInfo.executable.toLowerCase();
+            if (!legacyIsDifferent || !(await ensureSandboxPowerShellExecutableProbed(legacy, probeCtx))) {
+              throwSandboxPowerShellUnsupported();
+            }
+            powerShellInfo.executable = legacy;
+          }
+        }
+
         const helperPath = sandbox.helperPath || resolveWin32SandboxHelper({ env: shellEnv });
         return runWithWin32Diagnostics({
           route,
@@ -1281,6 +1524,7 @@ export function createWin32Exec({ sandbox = null } = {}) {
             onData: diagnosticOnData,
             signal,
             timeout,
+            desktopMode: "private",
           }),
         });
       }

@@ -56,6 +56,16 @@ import { dispatchStreamKey } from '../../services/stream-key-dispatcher';
 import { handleAppEvent } from '../../services/app-event-actions';
 import { clearMessageLiveVersion, readMessageLiveVersion } from '../../stores/message-live-version';
 import { loadSessions } from '../../stores/session-actions';
+import zh from '../../../locales/zh.json';
+
+/** Resolve a dotted i18n key against the real Chinese pack, the way window.t does. */
+function translateZh(key: string): string {
+  const value = key.split('.').reduce<unknown>(
+    (node, part) => (node && typeof node === 'object' ? (node as Record<string, unknown>)[part] : undefined),
+    zh as unknown,
+  );
+  return typeof value === 'string' ? value : key;
+}
 
 afterEach(() => {
   resetSessionRefreshSchedulerForTest();
@@ -147,6 +157,8 @@ describe('ws-message-handler session-scoped desktop events', () => {
   beforeEach(() => {
     useStore.setState({
       currentSessionPath: '/session/a.jsonl',
+      currentSessionId: null,
+      sessionLocatorsById: {},
       pendingNewSession: false,
       sessions: [{
         path: '/session/a.jsonl',
@@ -187,6 +199,67 @@ describe('ws-message-handler session-scoped desktop events', () => {
     expect(first.data.text).toBe('hello from bridge');
     expect(first.data.quotedText).toBe('quote');
     expect(first.data.attachments).toEqual([{ path: '/tmp/a.png', name: 'a.png', isDir: false }]);
+  });
+
+  it('drops a websocket event whose sessionId is already bound to a different known path (#2078)', () => {
+    useStore.setState({
+      currentSessionId: 'sess_a',
+      currentSessionPath: '/session/a.jsonl',
+      sessions: [
+        { path: '/session/a.jsonl', sessionId: 'sess_a', agentId: 'a1', agentName: 'Hana' },
+        { path: '/session/b.jsonl', sessionId: 'sess_b', agentId: 'a1', agentName: 'Hana' },
+      ],
+      sessionLocatorsById: {
+        sess_a: { path: '/session/a.jsonl' },
+        sess_b: { path: '/session/b.jsonl' },
+      },
+      streamingSessions: [],
+      activeSessionStreams: {},
+    } as never);
+
+    handleServerMessage({
+      type: 'status',
+      sessionId: 'sess_a',
+      sessionPath: '/session/b.jsonl',
+      streamId: 'stream-wrong',
+      isStreaming: true,
+    });
+
+    expect(useStore.getState().streamingSessions).toEqual([]);
+    expect(useStore.getState().sessionLocatorsById.sess_a).toEqual({ path: '/session/a.jsonl' });
+  });
+
+  it('session_user_message 透传 origin 到 store 里的 ChatMessage.origin', () => {
+    handleServerMessage({
+      type: 'session_user_message',
+      sessionPath: '/session/a.jsonl',
+      message: {
+        text: '干净正文',
+        origin: { kind: 'agent', agentId: 'hana', agentName: 'Hana' },
+      },
+    });
+
+    const items = useStore.getState().chatSessions['/session/a.jsonl']?.items || [];
+    const first = items[0];
+    expect(first?.type).toBe('message');
+    if (!first || first.type !== 'message') throw new Error('expected message item');
+    expect(first.data.origin).toEqual({ kind: 'agent', agentId: 'hana', agentName: 'Hana' });
+  });
+
+  it('session_user_message 无 origin 字段时不在 ChatMessage 上生成 origin', () => {
+    handleServerMessage({
+      type: 'session_user_message',
+      sessionPath: '/session/a.jsonl',
+      message: {
+        text: 'hello from bridge no origin',
+      },
+    });
+
+    const items = useStore.getState().chatSessions['/session/a.jsonl']?.items || [];
+    const first = items[0];
+    expect(first?.type).toBe('message');
+    if (!first || first.type !== 'message') throw new Error('expected message item');
+    expect(first.data.origin).toBeUndefined();
   });
 
   it('session_user_message 保存附件-only 消息时不生成 textHtml', () => {
@@ -246,7 +319,7 @@ describe('ws-message-handler session-scoped desktop events', () => {
     expect(first.data.sendStatus).toBeUndefined();
   });
 
-  it('session_user_message uses sessionId from the event when the session path moved before refresh', () => {
+  it('drops an ordinary stream event that tries to move a known sessionId to an unknown new path', () => {
     const sessionId = 'sess_ws_moved';
     const oldPath = '/session/old-a.jsonl';
     const newPath = '/session/new-a.jsonl';
@@ -285,15 +358,8 @@ describe('ws-message-handler session-scoped desktop events', () => {
     });
 
     const state = useStore.getState();
-    expect(state.sessionLocatorsById[sessionId]).toEqual({ path: newPath });
-    expect(state.chatSessions[sessionId]?.items).toHaveLength(1);
-    expect(state.chatSessions[sessionId]?.items[0]).toMatchObject({
-      type: 'message',
-      data: {
-        id: 'moved-u1',
-        text: 'moved path event',
-      },
-    });
+    expect(state.sessionLocatorsById[sessionId]).toEqual({ path: oldPath });
+    expect(state.chatSessions[sessionId]?.items).toHaveLength(0);
     expect(state.chatSessions[newPath]).toBeUndefined();
   });
 
@@ -339,6 +405,12 @@ describe('ws-message-handler session-scoped desktop events', () => {
 
   it('session_created 乐观插入后延迟刷新 session 列表，避免同一波事件重复全量拉取', async () => {
     vi.useFakeTimers();
+    useStore.setState({
+      sessionLocatorsById: {
+        ...useStore.getState().sessionLocatorsById,
+        sess_ws_created: { path: '/session/creation-reservation.jsonl' },
+      },
+    } as never);
 
     handleServerMessage({
       type: 'session_created',
@@ -416,17 +488,161 @@ describe('ws-message-handler session-scoped desktop events', () => {
       type: 'message',
       data: { id: 'a2', role: 'assistant', blocks: [] },
     });
+    useStore.getState().setSessionTodosForPath('/session/a.jsonl', [{ content: 'old todo', activeForm: 'old todo', status: 'pending' }]);
+    useStore.getState().setSessionRegistryFiles('/session/a.jsonl', [{ fileId: 'old-file', filePath: '/tmp/old.txt' }]);
 
     handleServerMessage({
       type: 'session_branch_reset',
       sessionPath: '/session/a.jsonl',
       messageId: 'entry-u2',
       clientMessageId: 'client-u2',
+      todos: [{ content: 'kept todo', activeForm: 'keeping todo', status: 'in_progress' }],
+      sessionFiles: [{ fileId: 'kept-file', filePath: '/tmp/kept.txt' }],
     });
 
     const items = useStore.getState().chatSessions['/session/a.jsonl']?.items || [];
     expect(items.map(item => item.type === 'message' ? item.data.id : item.id)).toEqual(['u1', 'a1']);
     expect(readMessageLiveVersion('/session/a.jsonl')).toBe(1);
+    expect(useStore.getState().todosBySession['/session/a.jsonl']).toEqual([
+      { content: 'kept todo', activeForm: 'keeping todo', status: 'in_progress' },
+    ]);
+    expect(useStore.getState().sessionRegistryFilesByPath['/session/a.jsonl']).toEqual([
+      { fileId: 'kept-file', filePath: '/tmp/kept.txt' },
+    ]);
+  });
+
+  it('session_branch_reset 带 sessionFiles 时，通过 applyBranchResetSessionFiles 整表替换 registry（#2188）', () => {
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'u1', role: 'user', text: 'old' },
+    });
+    useStore.getState().setSessionRegistryFiles('/session/a.jsonl', [{ fileId: 'old-file', filePath: '/tmp/old.txt' }]);
+    const spy = vi.spyOn(useStore.getState(), 'applyBranchResetSessionFiles');
+
+    handleServerMessage({
+      type: 'session_branch_reset',
+      sessionPath: '/session/a.jsonl',
+      messageId: 'u1',
+      todos: [],
+      sessionFiles: [{ fileId: 'kept-file', filePath: '/tmp/kept.txt' }],
+    });
+
+    expect(spy).toHaveBeenCalledWith('/session/a.jsonl', [{ fileId: 'kept-file', filePath: '/tmp/kept.txt' }]);
+    expect(useStore.getState().sessionRegistryFilesByPath['/session/a.jsonl']).toEqual([
+      { fileId: 'kept-file', filePath: '/tmp/kept.txt' },
+    ]);
+    spy.mockRestore();
+  });
+
+  it('session_branch_reset 不带 sessionFiles 时，仍调用 applyBranchResetSessionFiles(path, null) 而不是跳过', () => {
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'u1', role: 'user', text: 'old' },
+    });
+    useStore.getState().setSessionRegistryFiles('/session/a.jsonl', [{ fileId: 'old-file', filePath: '/tmp/old.txt' }]);
+    const spy = vi.spyOn(useStore.getState(), 'applyBranchResetSessionFiles');
+
+    handleServerMessage({
+      type: 'session_branch_reset',
+      sessionPath: '/session/a.jsonl',
+      messageId: 'u1',
+      todos: [],
+    });
+
+    expect(spy).toHaveBeenCalledWith('/session/a.jsonl', null);
+    // registry 未被清空／覆盖：applyBranchResetSessionFiles(path, null) 只标记 resetSeen，不动 registry
+    expect(useStore.getState().sessionRegistryFilesByPath['/session/a.jsonl']).toEqual([
+      { fileId: 'old-file', filePath: '/tmp/old.txt' },
+    ]);
+    spy.mockRestore();
+  });
+
+  it('session_branch_reset 在 live client id 失配时回退到历史 sourceEntryId', () => {
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'history-0', sourceEntryId: 'entry-u1', role: 'user', text: 'fork point' },
+    });
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'history-1', role: 'assistant', blocks: [] },
+    });
+
+    handleServerMessage({
+      type: 'session_branch_reset',
+      sessionPath: '/session/a.jsonl',
+      clientMessageId: 'source-live-uuid',
+      messageId: 'entry-u1',
+      todos: [],
+      sessionFiles: [],
+    });
+
+    expect(useStore.getState().chatSessions['/session/a.jsonl']?.items).toEqual([]);
+  });
+
+  it('session_branch_reset 用显式投影边界截断隐藏输入触发的 Agent turn', () => {
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'u1', sourceEntryId: 'entry-visible-user', role: 'user', text: 'visible question' },
+    });
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'a1', sourceEntryId: 'entry-visible-assistant', role: 'assistant', blocks: [] },
+    });
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: {
+        id: 'a2',
+        sourceEntryId: 'entry-hidden-assistant',
+        turnInputEntryId: 'entry-hidden-input',
+        role: 'assistant',
+        blocks: [],
+      },
+    });
+
+    handleServerMessage({
+      type: 'session_branch_reset',
+      sessionPath: '/session/a.jsonl',
+      messageId: 'entry-hidden-input',
+      projectionMessageId: 'entry-hidden-assistant',
+      todos: [],
+      sessionFiles: [],
+    });
+
+    const items = useStore.getState().chatSessions['/session/a.jsonl']?.items || [];
+    expect(items.map(item => item.type === 'message' ? item.data.id : item.id)).toEqual(['u1', 'a1']);
+  });
+
+  it('session_branch_reset 在首个持久化回复不可见时按 turn input 截断可见回复', () => {
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'u1', sourceEntryId: 'entry-visible-user', role: 'user', text: 'visible question' },
+    });
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: { id: 'a1', sourceEntryId: 'entry-visible-assistant', role: 'assistant', blocks: [] },
+    });
+    useStore.getState().appendItem('/session/a.jsonl', {
+      type: 'message',
+      data: {
+        id: 'visible-success',
+        sourceEntryId: 'entry-success-assistant',
+        turnInputEntryId: 'entry-hidden-input',
+        role: 'assistant',
+        blocks: [],
+      },
+    });
+
+    handleServerMessage({
+      type: 'session_branch_reset',
+      sessionPath: '/session/a.jsonl',
+      messageId: 'entry-hidden-input',
+      projectionMessageId: 'entry-empty-error-assistant',
+      todos: [],
+      sessionFiles: [],
+    });
+
+    const items = useStore.getState().chatSessions['/session/a.jsonl']?.items || [];
+    expect(items.map(item => item.type === 'message' ? item.data.id : item.id)).toEqual(['u1', 'a1']);
   });
 
   it('computer_overlay 写入当前 session 的 overlay keyed 状态并支持 clear', () => {
@@ -634,16 +850,6 @@ describe('ws-message-handler session-scoped desktop events', () => {
       metadata: {
         pinnedAt: '2026-04-29T08:00:00.000Z',
         thinkingLevel: 'high',
-        capabilityDrift: {
-          version: 1,
-          hasDrift: true,
-          fingerprint: 'fp-live',
-          frozenFingerprint: 'fp-frozen',
-          addedToolNames: ['mcp_github_search'],
-          removedToolNames: [],
-          invalidToolNames: [],
-          promptChanged: false,
-        },
       },
     });
 
@@ -655,22 +861,70 @@ describe('ws-message-handler session-scoped desktop events', () => {
       { path: '/session/b.jsonl', pinnedAt: null },
     ]);
     expect(useStore.getState().thinkingLevel).toBe('high');
-    expect(useStore.getState().capabilityDriftBySession['/session/a.jsonl']).toMatchObject({
-      fingerprint: 'fp-live',
-      addedToolNames: ['mcp_github_search'],
-    });
 
     handleServerMessage({
       type: 'session_metadata_updated',
       sessionPath: '/session/b.jsonl',
       metadata: {
         thinkingLevel: 'off',
-        capabilityDrift: null,
       },
     });
 
     expect(useStore.getState().thinkingLevel).toBe('high');
-    expect(useStore.getState().capabilityDriftBySession['/session/b.jsonl']).toBeUndefined();
+  });
+
+  it('merges a pin order update into the matching session', () => {
+    useStore.setState({
+      sessions: [
+        {
+          path: '/session/a.jsonl',
+          title: 'A',
+          firstMessage: 'hello',
+          modified: '2026-04-24T10:00:00.000Z',
+          messageCount: 1,
+          agentId: 'a1',
+          agentName: 'Hana',
+          cwd: null,
+          pinnedAt: null,
+        },
+        {
+          path: '/session/b.jsonl',
+          title: 'B',
+          firstMessage: 'other',
+          modified: '2026-04-24T10:00:00.000Z',
+          messageCount: 1,
+          agentId: 'a1',
+          agentName: 'Hana',
+          cwd: null,
+          pinnedAt: '2026-04-29T08:00:00.000Z',
+        },
+      ],
+    } as never);
+
+    handleServerMessage({
+      type: 'session_metadata_updated',
+      sessionPath: '/session/b.jsonl',
+      metadata: { pinOrder: 3072 },
+    });
+
+    expect(useStore.getState().sessions.map(session => ({
+      path: session.path,
+      pinOrder: session.pinOrder,
+    }))).toEqual([
+      { path: '/session/a.jsonl', pinOrder: undefined },
+      { path: '/session/b.jsonl', pinOrder: 3072 },
+    ]);
+
+    handleServerMessage({
+      type: 'session_metadata_updated',
+      sessionPath: '/session/b.jsonl',
+      metadata: { pinnedAt: null, pinOrder: null },
+    });
+
+    expect(useStore.getState().sessions[1]).toMatchObject({
+      pinnedAt: null,
+      pinOrder: null,
+    });
   });
 });
 
@@ -845,10 +1099,13 @@ describe('ws-message-handler compaction lifecycle', () => {
       ],
       chatSessions: {},
       compactingSessions: [],
+      compactionModeBySession: {},
       contextTokens: null,
       contextWindow: null,
       contextPercent: null,
       contextBySession: {},
+      sessionLocatorsById: {},
+      toasts: [],
     } as never);
   });
 
@@ -857,14 +1114,19 @@ describe('ws-message-handler compaction lifecycle', () => {
       type: 'compaction_start',
       sessionPath: '/session/b.jsonl',
       reason: 'threshold',
+      mode: 'lossy_local',
     });
 
     expect(useStore.getState().compactingSessions).toEqual(['/session/b.jsonl']);
+    expect(useStore.getState().compactionModeBySession).toEqual({
+      '/session/b.jsonl': 'lossy_local',
+    });
   });
 
   it('tracks compaction_end and preserves the provided context window when tokens are unknown', () => {
     useStore.setState({
       compactingSessions: ['/session/b.jsonl'],
+      compactionModeBySession: { '/session/b.jsonl': 'lossy_local' },
     } as never);
 
     handleServerMessage({
@@ -876,11 +1138,76 @@ describe('ws-message-handler compaction lifecycle', () => {
     });
 
     expect(useStore.getState().compactingSessions).toEqual([]);
+    expect(useStore.getState().compactionModeBySession).toEqual({});
     expect(useStore.getState().contextBySession['/session/b.jsonl']).toEqual({
       tokens: null,
       window: 200_000,
       percent: null,
     });
+  });
+
+  it('routes lifecycle by sessionId without trusting stale path metadata as locator truth', () => {
+    useStore.setState({
+      sessionLocatorsById: {
+        sess_b: { path: '/session/current-b.jsonl' },
+      },
+    } as never);
+
+    handleServerMessage({
+      type: 'compaction_start',
+      sessionId: 'sess_b',
+      sessionPath: '/session/stale-a.jsonl',
+      reason: 'manual',
+    });
+
+    expect(useStore.getState().compactingSessions).toEqual(['sess_b']);
+    expect(useStore.getState().sessionLocatorsById.sess_b).toEqual({ path: '/session/current-b.jsonl' });
+
+    handleServerMessage({
+      type: 'compaction_end',
+      sessionId: 'sess_b',
+      sessionPath: '/session/stale-a.jsonl',
+      tokens: 20_000,
+      contextWindow: 200_000,
+      percent: 10,
+    });
+
+    expect(useStore.getState().compactingSessions).toEqual([]);
+    expect(useStore.getState().contextBySession.sess_b).toEqual({
+      tokens: 20_000,
+      window: 200_000,
+      percent: 10,
+    });
+    expect(useStore.getState().sessionLocatorsById.sess_b).toEqual({ path: '/session/current-b.jsonl' });
+  });
+
+  it('tracks accepted and clears succeeded results by sessionId', () => {
+    handleServerMessage({ type: 'compaction_accepted', sessionId: 'sess_a', mode: 'lossy_local' });
+    expect(useStore.getState().compactingSessions).toEqual(['sess_a']);
+    expect(useStore.getState().compactionModeBySession).toEqual({ sess_a: 'lossy_local' });
+
+    handleServerMessage({ type: 'compaction_start', sessionId: 'sess_a' });
+    expect(useStore.getState().compactionModeBySession).toEqual({ sess_a: 'lossy_local' });
+
+    handleServerMessage({ type: 'compaction_result', sessionId: 'sess_a', status: 'succeeded' });
+    expect(useStore.getState().compactingSessions).toEqual([]);
+    expect(useStore.getState().compactionModeBySession).toEqual({});
+  });
+
+  it('clears busy and surfaces noop and failed results', () => {
+    for (const [status, message] of [
+      ['noop', 'Nothing to compact'],
+      ['failed', 'Compaction failed: provider unavailable'],
+    ]) {
+      handleServerMessage({ type: 'compaction_accepted', sessionId: 'sess_a' });
+      handleServerMessage({ type: 'compaction_result', sessionId: 'sess_a', status, message });
+    }
+
+    expect(useStore.getState().compactingSessions).toEqual([]);
+    expect(useStore.getState().toasts.slice(-2)).toEqual([
+      expect.objectContaining({ text: 'Nothing to compact', type: 'info' }),
+      expect.objectContaining({ text: 'Compaction failed: provider unavailable', type: 'error' }),
+    ]);
   });
 
   it('preserves context_usage window even when tokens are unknown', () => {
@@ -985,17 +1312,21 @@ describe('ws-message-handler turn_end side effects', () => {
     } as never);
   });
 
-  it('turn_end requests input focus for the current session', () => {
+  it('turn_end for the current session does not request input focus', () => {
     handleServerMessage({
       type: 'turn_end',
       sessionPath: '/session/a.jsonl',
     });
 
-    expect(useStore.getState().inputFocusTrigger).toBe(1);
+    expect(useStore.getState().inputFocusTrigger).toBe(0);
     expect(previewRefreshMocks.refreshOpenPreviewDocumentsForResourceChange).not.toHaveBeenCalled();
   });
 
-  it('background turn_end does not request input focus', () => {
+  it('background turn_end keeps refresh and context usage but does not request input focus', async () => {
+    vi.useFakeTimers();
+    vi.mocked(loadSessions).mockClear();
+    const requestContextUsage = vi.fn();
+    configureWsMessageHandler({ requestContextUsage });
     useStore.setState({
       sessions: [
         ...useStore.getState().sessions,
@@ -1018,6 +1349,12 @@ describe('ws-message-handler turn_end side effects', () => {
     });
 
     expect(useStore.getState().inputFocusTrigger).toBe(0);
+    expect(requestContextUsage).toHaveBeenCalledWith('/session/b.jsonl');
+    expect(loadSessions).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(loadSessions).toHaveBeenCalledTimes(1);
   });
 
   it('status=false requests input focus when the focused session was streaming', () => {
@@ -1034,6 +1371,7 @@ describe('ws-message-handler turn_end side effects', () => {
 
     expect(useStore.getState().streamingSessions).toEqual([]);
     expect(useStore.getState().inputFocusTrigger).toBe(1);
+    expect(useStore.getState().inputFocusTriggerSource).toBe('restore');
   });
 
   it('stale status=false does not finish the newer local stream turn', () => {
@@ -1077,6 +1415,109 @@ describe('ws-message-handler turn_end side effects', () => {
     expect(useStore.getState().streamingSessions).toEqual(['/session/a.jsonl']);
     expect(streamBufferManager.finishTurn).not.toHaveBeenCalledWith('/session/a.jsonl');
     expect(useStore.getState().inputFocusTrigger).toBe(0);
+  });
+
+  it('already_stopped abort_result clears a stale streaming marker when no stream identity exists', () => {
+    vi.mocked(streamBufferManager.finishTurn).mockClear();
+    useStore.setState({
+      streamingSessions: ['/session/a.jsonl'],
+      activeSessionStreams: {},
+      inputFocusTrigger: 0,
+    } as never);
+
+    handleServerMessage({
+      type: 'abort_result',
+      status: 'already_stopped',
+      sessionPath: '/session/a.jsonl',
+      streamId: null,
+    });
+
+    expect(useStore.getState().streamingSessions).toEqual([]);
+    expect(streamBufferManager.finishTurn).toHaveBeenCalledWith('/session/a.jsonl', null);
+    expect(useStore.getState().inputFocusTrigger).toBe(1);
+  });
+
+  it('rejected abort_result leaves local stream state untouched', () => {
+    useStore.setState({
+      streamingSessions: ['/session/a.jsonl'],
+      activeSessionStreams: {
+        '/session/a.jsonl': { streamId: 'stream_old', turnId: null },
+      },
+    } as never);
+
+    handleServerMessage({
+      type: 'abort_result',
+      status: 'rejected',
+      reason: 'stale_stream',
+      sessionPath: '/session/a.jsonl',
+      streamId: 'stream_current',
+    });
+
+    expect(useStore.getState().streamingSessions).toEqual(['/session/a.jsonl']);
+    expect(useStore.getState().activeSessionStreams['/session/a.jsonl']?.streamId).toBe('stream_old');
+  });
+
+  it('turn_end does not clear the matching stream before status=false arrives', () => {
+    useStore.setState({
+      streamingSessions: ['/session/a.jsonl'],
+      activeSessionStreams: {
+        '/session/a.jsonl': { streamId: 'stream_done', turnId: null },
+      },
+      inputFocusTrigger: 0,
+    } as never);
+
+    handleServerMessage({
+      type: 'turn_end',
+      sessionPath: '/session/a.jsonl',
+      streamId: 'stream_done',
+    });
+
+    expect(useStore.getState().streamingSessions).toEqual(['/session/a.jsonl']);
+    expect(useStore.getState().activeSessionStreams['/session/a.jsonl']?.streamId).toBe('stream_done');
+    expect(useStore.getState().inputFocusTrigger).toBe(0);
+  });
+
+  it('intermediate turn_end keeps streaming state and input focus untouched', () => {
+    useStore.setState({
+      streamingSessions: ['/session/a.jsonl'],
+      activeSessionStreams: {
+        '/session/a.jsonl': { streamId: 'stream_mid', turnId: 'turn_mid' },
+      },
+      inputFocusTrigger: 0,
+    } as never);
+
+    handleServerMessage({
+      type: 'turn_end',
+      sessionPath: '/session/a.jsonl',
+      streamId: 'stream_mid',
+      turnId: 'turn_mid',
+    });
+
+    expect(useStore.getState().streamingSessions).toEqual(['/session/a.jsonl']);
+    expect(useStore.getState().activeSessionStreams['/session/a.jsonl']).toEqual({
+      streamId: 'stream_mid',
+      turnId: 'turn_mid',
+    });
+    expect(useStore.getState().inputFocusTrigger).toBe(0);
+  });
+
+  it('stale turn_end does not clear a newer stream identity', () => {
+    useStore.setState({
+      streamingSessions: ['/session/a.jsonl'],
+      activeSessionStreams: {
+        '/session/a.jsonl': { streamId: 'stream_new', turnId: null },
+      },
+      inputFocusTrigger: 0,
+    } as never);
+
+    handleServerMessage({
+      type: 'turn_end',
+      sessionPath: '/session/a.jsonl',
+      streamId: 'stream_old',
+    });
+
+    expect(useStore.getState().streamingSessions).toEqual(['/session/a.jsonl']);
+    expect(useStore.getState().activeSessionStreams['/session/a.jsonl']?.streamId).toBe('stream_new');
   });
 
   it('passes sessionId from status events into stream buffer lifecycle', () => {
@@ -1145,6 +1586,30 @@ describe('ws-message-handler turn_end side effects', () => {
     });
 
     expect(requestContextUsage).toHaveBeenCalledWith('/session/a.jsonl');
+  });
+
+  it('shows focused slash_result through the inline notice bridge', () => {
+    const windowTarget = new EventTarget();
+    vi.stubGlobal('window', windowTarget);
+    const listener = vi.fn();
+    window.addEventListener('hana-inline-notice', listener);
+
+    try {
+      handleServerMessage({
+        type: 'slash_result',
+        sessionPath: '/session/a.jsonl',
+        text: 'plugin command finished',
+      });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect((listener.mock.calls[0]?.[0] as CustomEvent).detail).toEqual({
+        text: 'plugin command finished',
+        type: 'success',
+      });
+    } finally {
+      window.removeEventListener('hana-inline-notice', listener);
+      vi.unstubAllGlobals();
+    }
   });
 
   it('does not mark an old browser thumbnail as fresh when a running update omits thumbnail data', () => {
@@ -1241,5 +1706,57 @@ describe('ws-message-handler turn_end side effects', () => {
     await vi.advanceTimersByTimeAsync(300);
 
     expect(loadSessions).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ws-message-handler error presentation', () => {
+  beforeEach(() => {
+    vi.stubGlobal('window', { t: translateZh });
+    useStore.setState({
+      currentSessionPath: '/session/a.jsonl',
+      pendingNewSession: false,
+      sessionLocatorsById: {},
+      sessions: [],
+      inlineErrors: {},
+      toasts: [],
+    } as never);
+  });
+
+  it('shows the generic internal-contract sentence and hides the raw assertion in the details', () => {
+    handleServerMessage({
+      type: 'error',
+      code: 'internal_contract',
+      message: 'agentId required',
+      sessionPath: '/session/a.jsonl',
+    });
+
+    const shown = useStore.getState().inlineErrors['/session/a.jsonl'];
+    expect(shown).toEqual({
+      text: translateZh('error.code.internalContract'),
+      detail: 'agentId required',
+      code: 'internal_contract',
+    });
+    expect(shown?.text).not.toContain('agentId');
+  });
+
+  // 一条既没有 sessionPath 也没有 sessionId 的身份错误没有会话可以挂靠，只能走 toast。
+  // 少了这一档，服务端认定的调用方 bug 会退化成一行 console.warn，用户什么也看不到。
+  it('toasts an identity error that carries no session to attach to', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    handleServerMessage({
+      type: 'error',
+      code: 'internal_contract',
+      message: 'session identity required',
+    });
+
+    expect(useStore.getState().toasts).toEqual([expect.objectContaining({
+      text: translateZh('error.code.internalContract'),
+      type: 'error',
+      errorCode: 'internal_contract',
+    })]);
+    expect(warn).not.toHaveBeenCalled();
+
+    warn.mockRestore();
   });
 });

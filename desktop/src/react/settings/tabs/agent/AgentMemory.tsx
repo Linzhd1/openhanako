@@ -4,7 +4,8 @@ import { t, autoSaveConfig, savePins } from '../../helpers';
 import { hanaFetch } from '../../api';
 import { PinItem } from './AgentPins';
 import { SettingsSection } from '../../components/SettingsSection';
-import { Toggle } from '../../widgets/Toggle';
+import { Toggle } from '@/ui';
+import { AgentMemoryDream } from './AgentMemoryDream';
 import styles from '../../Settings.module.css';
 
 type MemoryHealthStatus = 'healthy' | 'degraded' | 'unhealthy' | 'disabled' | 'unavailable';
@@ -104,10 +105,11 @@ function MemoryHealthNotice({ health, error }: {
   );
 }
 
-export function MemorySection({ agentId, hasUtilityModel, memoryEnabled, currentPins }: {
+export function MemorySection({ agentId, hasUtilityModel, memoryEnabled, autoDreamEnabled = false, currentPins }: {
   agentId: string | null;
   hasUtilityModel: boolean | undefined;
   memoryEnabled: boolean | undefined;
+  autoDreamEnabled?: boolean;
   currentPins: string[];
 }) {
   const [pinInput, setPinInput] = useState('');
@@ -179,9 +181,9 @@ export function MemorySection({ agentId, hasUtilityModel, memoryEnabled, current
 
   return (
     <SettingsSection title={t('settings.memory.sectionTitle')} context={memoryToggle}>
-      <div style={{ padding: 'var(--space-sm) var(--space-md)' }}>
+      <div style={{ padding: 'var(--space-8) var(--space-16)' }}>
         {utilityModelReady && !hasUtilityModel && (
-          <p className={styles['settings-inline-note']} style={{ opacity: 0.6, marginTop: 0, marginBottom: 'var(--space-md)' }}>{t('settings.memory.needsUtilityModel')}</p>
+          <p className={styles['settings-inline-note']} style={{ opacity: 0.6, marginTop: 0, marginBottom: 'var(--space-16)' }}>{t('settings.memory.needsUtilityModel')}</p>
         )}
 
         <div className={hasUtilityModel !== true || memoryEnabled !== true ? 'settings-disabled' : ''}>
@@ -226,6 +228,10 @@ export function MemorySection({ agentId, hasUtilityModel, memoryEnabled, current
               {t('settings.memory.compiledView')}
             </button>
           </div>
+
+          {agentId && (
+            <AgentMemoryDream agentId={agentId} autoEnabled={autoDreamEnabled} />
+          )}
 
           <div className={styles['settings-subsection']}>
             <h3 className={styles['settings-subsection-title']}>{t('settings.memory.allMemories')}</h3>

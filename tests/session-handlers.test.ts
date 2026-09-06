@@ -6,6 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventBus } from "../hub/event-bus.ts";
+import { stripSessionReminderBlocks } from "../core/session-reminders.ts";
 
 // ── helpers: register handlers inline (mirrors _setupSessionHandlers logic) ──
 
@@ -68,8 +69,9 @@ function registerHandlers(bus, engine) {
     for (const m of sourceMessages) {
       if (m.role === "user") {
         const { text, images } = extractTextContent(m.content);
-        if (text || images.length) {
-          messages.push({ role: "user", content: text, images: images.length ? images : undefined });
+        const visibleText = stripSessionReminderBlocks(text);
+        if (visibleText || images.length) {
+          messages.push({ role: "user", content: visibleText, images: images.length ? images : undefined });
         }
       } else if (m.role === "assistant") {
         const { text, thinking, toolUses } = extractTextContent(m.content, { stripThink: true });
@@ -259,6 +261,19 @@ describe("session:history", () => {
     expect(result.messages[1]).toMatchObject({ role: "assistant", content: "world" });
   });
 
+  it("does not expose reminder blocks through plugin session history", async () => {
+    mockEngine._fakeMessages = [{
+      role: "user",
+      content: "[hana_reminder at 2026-07-05 14:05]\n- Plugin demo loaded\n[/hana_reminder]\n\nhello",
+    }];
+
+    const result = await bus.request("session:history", {
+      sessionPath: "/agents/agent1/sessions/s.jsonl",
+    });
+
+    expect(result.messages[0].content).toBe("hello");
+  });
+
   it("respects limit parameter", async () => {
     mockEngine._fakeMessages = Array.from({ length: 10 }, (_, i) => ({
       role: "user",
@@ -354,7 +369,11 @@ describe("agent:list", () => {
 
 function registerProviderHandlers(bus, engine) {
   bus.handle("provider:credentials", async ({ providerId }) => {
-    const creds = engine.providerRegistry.getCredentials(providerId);
+    if (typeof engine.resolveProviderCredentialsFresh !== "function") {
+      return { error: "fresh_credentials_unavailable" };
+    }
+    const fresh = await engine.resolveProviderCredentialsFresh(providerId);
+    const creds = { apiKey: fresh?.api_key, baseUrl: fresh?.base_url, api: fresh?.api };
     if (!creds?.apiKey) return { error: "no_credentials" };
     return { apiKey: creds.apiKey, baseUrl: creds.baseUrl, api: creds.api };
   });
@@ -377,9 +396,7 @@ describe("provider:credentials", () => {
   it("returns credentials for configured provider", async () => {
     const bus = new EventBus();
     const engine = {
-      providerRegistry: {
-        getCredentials: vi.fn(() => ({ apiKey: "sk-test", baseUrl: "https://api.test.com", api: "openai-completions" })),
-      },
+      resolveProviderCredentialsFresh: vi.fn(async () => ({ api_key: "sk-test", base_url: "https://api.test.com", api: "openai-completions" })),
     };
     registerProviderHandlers(bus, engine);
 
@@ -391,7 +408,7 @@ describe("provider:credentials", () => {
   it("returns error for unconfigured provider", async () => {
     const bus = new EventBus();
     const engine = {
-      providerRegistry: { getCredentials: vi.fn(() => ({})) },
+      resolveProviderCredentialsFresh: vi.fn(async () => ({})),
     };
     registerProviderHandlers(bus, engine);
 

@@ -19,6 +19,12 @@ import { safeCopyDir } from "../../shared/safe-fs.ts";
 import { relativePathInsideBase } from "../../core/message-utils.ts";
 import { fromRoot } from "../../shared/hana-root.ts";
 import { loadSkillBundleStore, recordSkillBundle } from "../skill-bundles/store.ts";
+import { isValidAgentId } from "../../shared/agent-id.ts";
+import {
+  PUBLIC_PERSONA_FILE_NAME,
+  resolvePersonaLocale,
+  resolvePersonaSource,
+} from "../../core/persona-source.ts";
 
 const VALID_YUAN = new Set(["hanako", "butter", "ming", "kong"]);
 const CARD_FILE_NAMES = [
@@ -208,13 +214,23 @@ function hasImportableOrExportableMemory(plan) {
   return hasCompiledMemory(plan.memoryCompiled);
 }
 
+/**
+ * 把角色卡里的人格文本收敛成当前的 key 名（agents / publicAgents）。
+ *
+ * 读取链把历史上出现过的每个 key 都排在后面：卡包是已经发布出去的文件，装在
+ * 用户硬盘上和分享链接里，改不动了，所以这里的旧 key 兼容是永久的，不是过渡
+ * 期措施。顺序即优先级，新 key 在前。
+ */
 function normalizeTextFiles(card) {
   const identity = card?.identity;
   const prompts = card?.prompts || {};
   return {
     identity: trimString(prompts.identity || identity?.content || identity?.prompt || (typeof identity === "string" ? identity : "")) || null,
-    ishiki: trimString(prompts.ishiki || prompts.yuan || card?.ishiki) || null,
-    publicIshiki: trimString(prompts.publicIshiki || prompts.public_ishiki || card?.publicIshiki) || null,
+    agents: trimString(prompts.agents || prompts.ishiki || prompts.yuan || card?.agents || card?.ishiki) || null,
+    publicAgents: trimString(
+      prompts.publicAgents || prompts.publicIshiki || prompts.public_ishiki
+      || card?.publicAgents || card?.publicIshiki,
+    ) || null,
   };
 }
 
@@ -223,8 +239,11 @@ function normalizeAgent(card) {
   const name = trimString(agent.name || card?.name);
   if (!name) throw new CharacterCardError("agent.name is required");
   const id = trimString(agent.id || card?.id) || null;
-  if (id && (/[\/\\]|\.\./.test(id))) {
-    throw new CharacterCardError("agent.id is invalid");
+  if (id && !isValidAgentId(id)) {
+    throw new CharacterCardError(
+      "agent.id is invalid: use ASCII letters, digits, underscores, or hyphens and include a letter or digit",
+      400,
+    );
   }
   const yuan = VALID_YUAN.has(agent.yuan || card?.yuan) ? (agent.yuan || card?.yuan) : "hanako";
   const description = trimString(agent.description || card?.agentDescription || card?.description);
@@ -347,8 +366,8 @@ function serializePlan(plan) {
     agent: agentForPreview,
     prompts: {
       identity: plan.prompts?.identity || "",
-      ishiki: plan.prompts?.ishiki || "",
-      publicIshiki: plan.prompts?.publicIshiki || "",
+      agents: plan.prompts?.agents || "",
+      publicAgents: plan.prompts?.publicAgents || "",
     },
     memory: {
       available: hasImportableOrExportableMemory(plan),
@@ -683,9 +702,15 @@ export function createCharacterCardService(engine) {
     const config = YAML.load(fs.readFileSync(configPath, "utf-8")) || {};
     const yuan = VALID_YUAN.has(config?.agent?.yuan) ? config.agent.yuan : "hanako";
     const name = trimString(config?.agent?.name) || agent?.agentName || agentId;
-    const identity = readOptionalText(path.join(agentDir, "identity.md"));
-    const ishiki = readOptionalText(path.join(agentDir, "ishiki.md"));
-    const publicIshiki = readOptionalText(path.join(agentDir, "public-ishiki.md"));
+    // identity.md / AGENTS.md 惰性材料化后可能没有落盘文件；导出必须捕捉
+    // agent 此刻实际生效的人格（回落到模板，见 core/persona-source.ts），
+    // 空字符串会让导出的角色卡本身失真。locale 优先走已加载 Agent 实例的
+    // resolveLocale()，agent 未加载进内存时退化为同一条链（config.locale →
+    // 全局 prefs → "en"）。
+    const locale = agent?.resolveLocale?.() ?? resolvePersonaLocale(config?.locale, engine.getLocale?.());
+    const identity = resolvePersonaSource({ agentDir, productDir: engine.productDir, yuanType: yuan, locale, kind: "identity" }).content;
+    const agents = resolvePersonaSource({ agentDir, productDir: engine.productDir, yuanType: yuan, locale, kind: "agents" }).content;
+    const publicAgents = readOptionalText(path.join(agentDir, PUBLIC_PERSONA_FILE_NAME));
     const description = readOptionalDescription(agentDir);
     const memoryFacts = exportMemoryFactsForAgent(agent, agentDir);
     const memoryCompiled = readCompiledMemorySnapshot(path.join(agentDir, "memory"));
@@ -696,8 +721,8 @@ export function createCharacterCardService(engine) {
       name,
       yuan,
       identity,
-      ishiki,
-      publicIshiki,
+      agents,
+      publicAgents,
       description,
       identitySummary: firstNonEmptyLine(identity),
       memoryFacts: Array.isArray(memoryFacts) ? memoryFacts : [],
@@ -763,8 +788,8 @@ export function createCharacterCardService(engine) {
       },
       prompts: {
         identity: source.identity,
-        ishiki: source.ishiki,
-        publicIshiki: source.publicIshiki,
+        agents: source.agents,
+        publicAgents: source.publicAgents,
       },
       memory: {
         available: hasImportableOrExportableMemory(planLike),
@@ -831,8 +856,8 @@ export function createCharacterCardService(engine) {
       },
       prompts: {
         identity: plan.prompts.identity || "",
-        ishiki: plan.prompts.ishiki || "",
-        publicIshiki: plan.prompts.publicIshiki || "",
+        agents: plan.prompts.agents || "",
+        publicAgents: plan.prompts.publicAgents || "",
       },
       assets: Object.fromEntries(
         Object.entries(plan.assets).map(([key, asset]: [string, any]) => [key, asset.rel]),
@@ -874,8 +899,8 @@ export function createCharacterCardService(engine) {
       },
       prompts: {
         identity: source.identity,
-        ishiki: source.ishiki,
-        publicIshiki: source.publicIshiki,
+        agents: source.agents,
+        publicAgents: source.publicAgents,
       },
       memoryFacts: source.memoryFacts,
       memoryCompiled: source.memoryCompiled,

@@ -9,6 +9,8 @@
  *   1. GLM 4.7/5/5.1 thinking is controlled with thinking.type.
  *   2. Tool-call turns in thinking mode must replay real reasoning_content.
  *   3. Preserved thinking uses thinking.clear_thinking=false.
+ *   4. OpenCode Go's GLM endpoint follows the same thinking/replay shape, but
+ *      does not accept the clear_thinking preservation flag.
  *
  * Official docs:
  *   - https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode
@@ -21,7 +23,6 @@
 
 import {
   ensureAssistantContentForToolCalls,
-  ensureReasoningContentForToolCalls,
   stripReasoningContent,
 } from "./reasoning-content-replay.ts";
 
@@ -110,6 +111,18 @@ function hasAssistantReasoningHistory(messages) {
   });
 }
 
+function isOpenCodeGoEndpoint(model) {
+  if (!model || typeof model !== "object") return false;
+  const provider = lower(model.provider);
+  const baseUrl = lower(model.baseUrl || model.base_url);
+  return provider === "opencode-go"
+    || baseUrl.includes("opencode.ai/zen/go");
+}
+
+function supportsClearThinkingFlag(model) {
+  return !isOpenCodeGoEndpoint(model);
+}
+
 function resolveReasoningReplay(payload, options) {
   const value = typeof options?.reasoningReplay === "string"
     ? lower(options.reasoningReplay)
@@ -151,26 +164,22 @@ function normalizeThinking(payload, model, options) {
   next.thinking = { type: "enabled" };
   const reasoningReplay = resolveReasoningReplay(payload, options);
   const clearHistory = reasoningReplay === "clear";
+  const canSendClearThinking = supportsClearThinkingFlag(model);
   const hasToolCalls = hasAssistantToolCallHistory(next.messages);
 
   if (clearHistory) {
-    next.thinking.clear_thinking = true;
+    if (canSendClearThinking) {
+      next.thinking.clear_thinking = true;
+    }
     if (Array.isArray(next.messages)) {
       const stripped = stripReasoningContent(next.messages);
       if (stripped !== next.messages) next.messages = stripped;
     }
-  } else if (hasToolCalls || hasAssistantReasoningHistory(next.messages)) {
+  } else if (canSendClearThinking && (hasToolCalls || hasAssistantReasoningHistory(next.messages))) {
     next.thinking.clear_thinking = false;
   }
 
   if (hasToolCalls) {
-    if (!clearHistory) {
-      const ensured = ensureReasoningContentForToolCalls(next.messages, { providerLabel: "Zhipu" });
-      if (ensured !== next.messages) {
-        next.messages = ensured;
-      }
-    }
-
     const contentEnsured = ensureAssistantContentForToolCalls(next.messages);
     if (contentEnsured !== next.messages) {
       next.messages = contentEnsured;

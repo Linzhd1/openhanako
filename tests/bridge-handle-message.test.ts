@@ -13,6 +13,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // ── Mock adapter imports (避免拉真实 SDK) ──
 
+const bridgeDebugMock = vi.hoisted(() => ({
+  log: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+const bridgeModuleLoggerMock = vi.hoisted(() => ({
+  log: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
 vi.mock("../lib/bridge/telegram-adapter.js", () => ({
   createTelegramAdapter: vi.fn(),
 }));
@@ -20,8 +32,8 @@ vi.mock("../lib/bridge/feishu-adapter.js", () => ({
   createFeishuAdapter: vi.fn(),
 }));
 vi.mock("../lib/debug-log.js", () => ({
-  debugLog: () => null,
-  createModuleLogger: () => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  debugLog: () => bridgeDebugMock,
+  createModuleLogger: () => bridgeModuleLoggerMock,
 }));
 
 import os from "os";
@@ -89,6 +101,12 @@ function createMocks() {
 describe("BridgeManager._handleMessage", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    bridgeDebugMock.log.mockClear();
+    bridgeDebugMock.warn.mockClear();
+    bridgeDebugMock.error.mockClear();
+    bridgeModuleLoggerMock.log.mockClear();
+    bridgeModuleLoggerMock.warn.mockClear();
+    bridgeModuleLoggerMock.error.mockClear();
   });
 
   afterEach(() => {
@@ -557,9 +575,162 @@ describe("BridgeManager._handleMessage", () => {
 
       const result = await bm.sendProactive("hello", "hana");
 
-      expect(result).toBeNull();
+      expect(result).toMatchObject({
+        ok: false,
+        error: "reply_context_unavailable",
+        deliveries: [{
+          status: "failed",
+          platform: "wechat",
+          chatId: "wx-user",
+          error: "reply_context_unavailable",
+        }],
+      });
       expect(wechatAdapter.sendReply).not.toHaveBeenCalled();
       expect(engine.bridgeSessionManager.recordAssistantMessage).not.toHaveBeenCalled();
+    });
+
+    it("returns reply_context_unavailable when an explicit deliveryTarget lacks WeChat reply context", async () => {
+      const { bm, engine } = createMocks();
+      const wechatAdapter = {
+        capabilities: { proactive: false },
+        canReply: vi.fn().mockReturnValue(false),
+        sendReply: (vi.fn().mockResolvedValue as any)(),
+      };
+      bm._platforms.clear();
+      bm._platforms.set("wechat:hana", {
+        adapter: wechatAdapter,
+        status: "connected",
+        agentId: "hana",
+        platform: "wechat",
+      });
+      engine.getAgent.mockImplementation((id) => {
+        if (id === "hana") return { agentName: "TestAgent", config: { bridge: { wechat: { owner: "wx-user" } } }, sessionDir: os.tmpdir() };
+        return null;
+      });
+
+      const result = await bm.sendProactive("hello", "hana", {
+        deliveryTarget: {
+          kind: "bridge",
+          platform: "wechat",
+          chatId: "wx-user",
+          sessionKey: "wx_dm_wx-user@hana",
+          agentId: "hana",
+        },
+      });
+
+      expect(wechatAdapter.canReply).toHaveBeenCalledWith("wx-user");
+      expect(wechatAdapter.sendReply).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        ok: false,
+        error: "reply_context_unavailable",
+        deliveries: [{
+          status: "failed",
+          platform: "wechat",
+          chatId: "wx-user",
+          error: "reply_context_unavailable",
+        }],
+      });
+    });
+
+    it("returns send_failed when a connected adapter with reply context throws from sendReply", async () => {
+      const { bm, engine } = createMocks();
+      const wechatAdapter = {
+        capabilities: { proactive: false },
+        canReply: vi.fn().mockReturnValue(true),
+        sendReply: vi.fn().mockRejectedValue(new Error("upstream 503")),
+      };
+      bm._platforms.clear();
+      bm._platforms.set("wechat:hana", {
+        adapter: wechatAdapter,
+        status: "connected",
+        agentId: "hana",
+        platform: "wechat",
+      });
+      engine.getAgent.mockImplementation((id) => {
+        if (id === "hana") return { agentName: "TestAgent", config: { bridge: { wechat: { owner: "wx-user" } } }, sessionDir: os.tmpdir() };
+        return null;
+      });
+      engine.getBridgeIndex = vi.fn().mockReturnValue({
+        "wx_dm_wx-user@hana": {
+          file: "owner/wx.jsonl",
+          userId: "wx-user",
+          name: "微信用户",
+        },
+      });
+
+      const result = await bm.sendProactive("hello", "hana");
+
+      expect(wechatAdapter.canReply).toHaveBeenCalledWith("wx-user");
+      expect(wechatAdapter.sendReply).toHaveBeenCalledWith("wx-user", "hello");
+      expect(result).toMatchObject({
+        ok: false,
+        error: "send_failed",
+        message: "upstream 503",
+        deliveries: [{
+          status: "failed",
+          platform: "wechat",
+          chatId: "wx-user",
+          error: "upstream 503",
+        }],
+      });
+      expect(engine.bridgeSessionManager.recordAssistantMessage).not.toHaveBeenCalled();
+    });
+
+    it("returns target_missing when no owner delivery target can be resolved", async () => {
+      const { bm, engine } = createMocks();
+      const wechatAdapter = {
+        capabilities: { proactive: false },
+        canReply: vi.fn().mockReturnValue(true),
+        sendReply: (vi.fn().mockResolvedValue as any)(),
+      };
+      bm._platforms.clear();
+      bm._platforms.set("wechat:hana", {
+        adapter: wechatAdapter,
+        status: "connected",
+        agentId: "hana",
+        platform: "wechat",
+      });
+      engine.getAgent.mockImplementation((id) => {
+        if (id === "hana") return { agentName: "TestAgent", config: { bridge: { wechat: {} } }, sessionDir: os.tmpdir() };
+        return null;
+      });
+      engine.getBridgeIndex = vi.fn().mockReturnValue({});
+
+      const result = await bm.sendProactive("hello", "hana");
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: "target_missing",
+      });
+      expect(wechatAdapter.sendReply).not.toHaveBeenCalled();
+    });
+
+    it("returns disconnected when Bridge platforms exist but none are connected", async () => {
+      const { bm, engine } = createMocks();
+      const wechatAdapter = {
+        capabilities: { proactive: false },
+        canReply: vi.fn().mockReturnValue(true),
+        sendReply: (vi.fn().mockResolvedValue as any)(),
+      };
+      bm._platforms.clear();
+      bm._platforms.set("wechat:hana", {
+        adapter: wechatAdapter,
+        status: "disconnected",
+        agentId: "hana",
+        platform: "wechat",
+      });
+      engine.getAgent.mockImplementation((id) => {
+        if (id === "hana") return { agentName: "TestAgent", config: { bridge: { wechat: { owner: "wx-user" } } }, sessionDir: os.tmpdir() };
+        return null;
+      });
+
+      const result = await bm.sendProactive("hello", "hana");
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: "disconnected",
+      });
+      expect(wechatAdapter.sendReply).not.toHaveBeenCalled();
     });
 
     it("does not send proactive replies through a Bridge entry owned by another agent", async () => {
@@ -586,7 +757,10 @@ describe("BridgeManager._handleMessage", () => {
 
       const result = await bm.sendProactive("hello", "hana");
 
-      expect(result).toBeNull();
+      expect(result).toMatchObject({
+        ok: false,
+        error: "target_missing",
+      });
       expect(otherAdapter.sendReply).not.toHaveBeenCalled();
       expect(unboundAdapter.sendReply).not.toHaveBeenCalled();
     });
@@ -1235,7 +1409,101 @@ describe("BridgeManager._handleMessage", () => {
       await vi.advanceTimersByTimeAsync(2100);
       await vi.waitFor(() => expect(feishuAdapter.sendReply).toHaveBeenCalledWith("oc_chat", "Hello"));
       expect(feishuAdapter.finishRichStreamReply).toHaveBeenCalledOnce();
+      expect(bridgeDebugMock.error).toHaveBeenCalledWith(
+        "bridge",
+        expect.stringContaining("platform=feishu mode=cardkit_stream chatId=oc_chat stage=finish error=CardKit unavailable"),
+      );
       expect(bm._processing.has("fs_dm_owner123@hana")).toBe(false);
+    });
+
+    it("logs Feishu edit-message update failures and falls back to a normal message", async () => {
+      const { bm, hub, engine } = createMocks();
+      engine.getBridgeReceiptEnabled.mockReturnValue(false);
+      const feishuAdapter = {
+        streamingCapabilities: {
+          mode: "edit_message",
+          scopes: ["dm"],
+          minIntervalMs: 0,
+          maxChars: 150_000,
+          renderer: "post",
+          receiptMode: "fold_into_stream",
+        },
+        startStreamReply: vi.fn().mockResolvedValue({ messageId: "om_stream_001" }),
+        updateStreamReply: vi.fn().mockRejectedValue(new Error("update denied")),
+        finishStreamReply: (vi.fn().mockResolvedValue as any)(),
+        sendReply: (vi.fn().mockResolvedValue as any)(),
+        sendBlockReply: (vi.fn().mockResolvedValue as any)(),
+        stop: vi.fn(),
+      };
+      bm._platforms.set("feishu:hana", { adapter: feishuAdapter, status: "connected", agentId: "hana", platform: "feishu" });
+      hub.send.mockImplementation(async (_text, opts) => {
+        opts.onDelta("Hel", "Hel");
+        opts.onDelta("lo", "Hello");
+        return bridgeReply("Hello");
+      });
+
+      bm._handleMessage("feishu", {
+        sessionKey: "fs_dm_owner123@hana",
+        text: "hi",
+        userId: "owner123",
+        chatId: "oc_chat",
+        agentId: "hana",
+      });
+
+      await vi.advanceTimersByTimeAsync(2100);
+      await vi.waitFor(() => expect(feishuAdapter.sendReply).toHaveBeenCalledWith("oc_chat", "Hello"));
+
+      expect(feishuAdapter.finishStreamReply).not.toHaveBeenCalled();
+      expect(bridgeDebugMock.error).toHaveBeenCalledWith(
+        "bridge",
+        expect.stringContaining("platform=feishu mode=edit_message chatId=oc_chat stage=update error=update denied"),
+      );
+    });
+
+    it("logs CardKit start and fallback-send failures", async () => {
+      const { bm, hub, engine } = createMocks();
+      engine.getBridgeReceiptEnabled.mockReturnValue(false);
+      const feishuAdapter = {
+        richStreamingCapabilities: {
+          mode: "cardkit_stream",
+          scopes: ["dm"],
+          minIntervalMs: 0,
+          maxChars: 150_000,
+          requiresRichStreaming: true,
+          receiptMode: "fold_into_stream",
+        },
+        startRichStreamReply: vi.fn().mockRejectedValue(new Error("CardKit start denied")),
+        updateRichStreamReply: (vi.fn().mockResolvedValue as any)(),
+        finishRichStreamReply: (vi.fn().mockResolvedValue as any)(),
+        sendReply: vi.fn().mockRejectedValue(new Error("plain send denied")),
+        sendBlockReply: (vi.fn().mockResolvedValue as any)(),
+        stop: vi.fn(),
+      };
+      bm._platforms.set("feishu:hana", { adapter: feishuAdapter, status: "connected", agentId: "hana", platform: "feishu" });
+      hub.send.mockImplementation(async (_text, opts) => {
+        opts.onDelta("Hel", "Hel");
+        return bridgeReply("Hello");
+      });
+
+      bm._handleMessage("feishu", {
+        sessionKey: "fs_dm_owner123@hana",
+        text: "hi",
+        userId: "owner123",
+        chatId: "oc_chat",
+        agentId: "hana",
+      });
+
+      await vi.advanceTimersByTimeAsync(2100);
+      await vi.waitFor(() => expect(feishuAdapter.sendReply).toHaveBeenCalledWith("oc_chat", "Hello"));
+
+      expect(bridgeDebugMock.error).toHaveBeenCalledWith(
+        "bridge",
+        expect.stringContaining("platform=feishu mode=cardkit_stream chatId=oc_chat stage=start error=CardKit start denied"),
+      );
+      expect(bridgeDebugMock.error).toHaveBeenCalledWith(
+        "bridge",
+        expect.stringContaining("platform=feishu mode=cardkit_stream chatId=oc_chat stage=finish:fallback error=plain send denied"),
+      );
     });
 
     it("folds Feishu waiting receipts into the edit-message stream lifecycle", async () => {

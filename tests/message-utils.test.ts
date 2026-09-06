@@ -40,6 +40,9 @@ describe("TOOL_ARG_SUMMARY_KEYS", () => {
     expect(Array.isArray(TOOL_ARG_SUMMARY_KEYS)).toBe(true);
     expect(TOOL_ARG_SUMMARY_KEYS).toContain("file_path");
     expect(TOOL_ARG_SUMMARY_KEYS).toContain("command");
+    expect(TOOL_ARG_SUMMARY_KEYS).toContain("cmd");
+    expect(TOOL_ARG_SUMMARY_KEYS).toContain("chars");
+    expect(TOOL_ARG_SUMMARY_KEYS).toContain("process_id");
     expect(TOOL_ARG_SUMMARY_KEYS).toContain("url");
   });
 });
@@ -157,6 +160,25 @@ describe("extractTextContent", () => {
     expect(result.toolUses[0].id).toBe("call_read_1");
     expect(result.toolUses[0].name).toBe("read_file");
     expect(result.toolUses[0].args).toEqual({ file_path: "/tmp/test.txt" });
+  });
+
+  it("content block 数组提取 exec_command / write_stdin 命令摘要", () => {
+    const content = [
+      { type: "toolCall", id: "call_exec_1", name: "exec_command", arguments: { cmd: "npm test", secret: "nope" } },
+      { type: "tool_use", id: "call_stdin_1", name: "write_stdin", input: { process_id: "term_1", chars: "q\n", secret: "nope" } },
+    ];
+    const result = extractTextContent(content);
+    expect(result.toolUses).toHaveLength(2);
+    expect(result.toolUses[0]).toMatchObject({
+      id: "call_exec_1",
+      name: "exec_command",
+      args: { cmd: "npm test" },
+    });
+    expect(result.toolUses[1]).toMatchObject({
+      id: "call_stdin_1",
+      name: "write_stdin",
+      args: { chars: "q\n", process_id: "term_1" },
+    });
   });
 
   it("tool_use block 无摘要字段时 args 为 undefined", () => {
@@ -309,6 +331,59 @@ describe("loadSessionHistoryMessages", () => {
     ]);
   });
 
+  it("read-time projects only known legacy Hana tool failures", async () => {
+    const sessionPath = path.join(tmpDir, "legacy-tool-outcomes.jsonl");
+    fs.writeFileSync(sessionPath, [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "known",
+          isError: false,
+          content: [{ type: "text", text: "context changed" }],
+          details: { errorCode: "TOOL_SESSION_CONTEXT_CHANGED_BEFORE_EXECUTION" },
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: "plugin-warning",
+          isError: false,
+          content: [{ type: "text", text: "completed with diagnostics" }],
+          details: { error: "recoverable warning" },
+        },
+      }),
+      "",
+    ].join("\n"), "utf-8");
+
+    const result = await loadSessionHistoryMessages({}, sessionPath);
+
+    expect(result[0].isError).toBe(true);
+    expect(result[1].isError).toBe(false);
+  });
+
+  it("projects legacy reminder-prefixed JSONL user messages without internal reminder text", async () => {
+    const sessionPath = path.join(tmpDir, "legacy-reminder.jsonl");
+    fs.writeFileSync(sessionPath, [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "user",
+          content: [{
+            type: "text",
+            text: "[hana_reminder at 2026-07-05 14:05]\n- Plugin demo loaded\n[/hana_reminder]\n\nhello",
+          }],
+        },
+      }),
+      "",
+    ].join("\n"), "utf-8");
+
+    const result = await loadSessionHistoryMessages({}, sessionPath);
+
+    expect(result[0].content).toEqual([{ type: "text", text: "hello" }]);
+  });
+
   it("只恢复当前 leaf 所在分支上的消息", async () => {
     const sessionDir = path.join(tmpDir, "sessions");
     const manager = SessionManager.create(tmpDir, sessionDir);
@@ -328,6 +403,42 @@ describe("loadSessionHistoryMessages", () => {
       { id: userA, role: "user", text: "old prompt" },
       { id: expect.any(String), role: "user", text: "new prompt" },
       { id: expect.any(String), role: "assistant", text: "new answer" },
+    ]);
+  });
+
+  it("当当前分支只有隐藏提交时不回退到物理文件中的旧消息", async () => {
+    const sessionDir = path.join(tmpDir, "sessions-empty-active-branch");
+    const manager = SessionManager.create(tmpDir, sessionDir);
+    manager.appendMessage({ role: "user", content: "abandoned prompt" } as any);
+    manager.appendMessage({ role: "assistant", content: "abandoned answer" } as any);
+    manager.resetLeaf();
+    manager.appendCustomEntry("hana-session-branch-reset", { sourceEntryId: "old-user" });
+
+    const result = await loadSessionHistoryMessages({}, manager.getSessionFile());
+
+    expect(result).toEqual([]);
+  });
+
+  it("uses the persisted current branch when the physical tail is a discarded sibling", async () => {
+    const sessionDir = path.join(tmpDir, "persisted-branch-sessions");
+    const manager = SessionManager.create(tmpDir, sessionDir);
+    const userId = manager.appendMessage({ role: "user", content: [{ type: "text", text: "prompt" }] } as any);
+    const selectedAnswerId = manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "selected answer" }] } as any);
+    manager.branch(userId);
+    manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "discarded physical tail" }] } as any);
+    const sessionPath = manager.getSessionFile();
+    const openSessionManagerAtCurrentBranch = vi.fn(() => {
+      const reopened = SessionManager.open(sessionPath, sessionDir);
+      reopened.branch(selectedAnswerId);
+      return reopened;
+    });
+
+    const result = await loadSessionHistoryMessages({ openSessionManagerAtCurrentBranch }, sessionPath);
+
+    expect(openSessionManagerAtCurrentBranch).toHaveBeenCalledWith(sessionPath, path.dirname(sessionPath));
+    expect(result.map((message) => message.content?.[0]?.text)).toEqual([
+      "prompt",
+      "selected answer",
     ]);
   });
 

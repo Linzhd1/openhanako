@@ -7,29 +7,32 @@ export const codeTheme = EditorView.theme({
     overflow: 'auto',
     fontFamily: 'var(--font-mono)',
     lineHeight: '1.7',
-    padding: 'var(--space-lg) 0',
+    padding: 'var(--space-24) 0',
   },
   '.cm-content': {
     width: '100%',
-    padding: '0 var(--space-md)',
+    padding: '0 var(--space-16)',
   },
 });
 
 export const markdownTheme = EditorView.theme({
-  '&': { fontSize: 'var(--editor-markdown-font-size)' },
+  '&': {
+    fontSize: 'var(--editor-markdown-font-size)',
+    '--editor-markdown-content-inset-x': 'max(var(--editor-markdown-content-padding-x), var(--editor-markdown-block-rail-space, 0px))',
+  },
   '&.cm-focused': { outline: 'none' },
   '.cm-scroller': {
     overflow: 'auto',
     fontFamily: 'var(--editor-markdown-font-family, var(--font-serif))',
     lineHeight: 'var(--editor-markdown-line-height)',
-    padding: 'calc(var(--space-xl) + var(--space-lg)) 0 var(--space-md)',
+    padding: 'calc(var(--space-40) + var(--space-24)) 0 var(--preview-markdown-editor-bottom-space, var(--space-16))',
   },
   '&.cm-markdown-has-top-cover .cm-scroller': {
     paddingTop: '0',
   },
   '.cm-content': {
     width: '100%',
-    padding: '0 var(--editor-markdown-content-padding-x)',
+    padding: '0 var(--editor-markdown-content-inset-x)',
   },
   '.cm-line': {
     maxWidth: 'var(--editor-markdown-content-width)',
@@ -38,6 +41,10 @@ export const markdownTheme = EditorView.theme({
   },
   '.cm-line.cm-markdown-cover-line': {
     maxWidth: 'none',
+  },
+  '.cm-line.cm-unconfirmed-heading-line *': {
+    fontSize: 'var(--editor-markdown-font-size)',
+    fontWeight: 'inherit',
   },
   '.cm-activeLine': { backgroundColor: 'transparent' },
   '.cm-activeLineGutter': { backgroundColor: 'transparent' },
@@ -53,7 +60,7 @@ export const markdownTheme = EditorView.theme({
   '.cm-math-block-widget': {
     display: 'block',
     overflowX: 'auto',
-    padding: 'var(--space-xs) 0',
+    padding: 'var(--space-4) 0',
     borderRadius: 'var(--radius-sm)',
     cursor: 'text',
   },
@@ -67,7 +74,7 @@ export const markdownTheme = EditorView.theme({
     minHeight: '160px',
     maxHeight: '720px',
     margin: '0 auto',
-    paddingBottom: 'var(--space-lg)',
+    paddingBottom: 'var(--space-24)',
     boxSizing: 'content-box',
     overflow: 'hidden',
     backgroundColor: 'transparent',
@@ -78,9 +85,9 @@ export const markdownTheme = EditorView.theme({
     marginTop: '0',
   },
   '.cm-markdown-cover.cm-markdown-cover-bleed-x': {
-    marginLeft: 'calc(0px - var(--editor-markdown-content-padding-x))',
-    marginRight: 'calc(0px - var(--editor-markdown-content-padding-x))',
-    width: 'calc(100% + var(--editor-markdown-content-padding-x) + var(--editor-markdown-content-padding-x))',
+    marginLeft: 'calc(0px - var(--editor-markdown-content-inset-x))',
+    marginRight: 'calc(0px - var(--editor-markdown-content-inset-x))',
+    width: 'calc(100% + var(--editor-markdown-content-inset-x) + var(--editor-markdown-content-inset-x))',
   },
   '.cm-markdown-cover::after': {
     content: '""',
@@ -112,7 +119,7 @@ export const markdownTheme = EditorView.theme({
     position: 'absolute',
     left: '0',
     right: '0',
-    bottom: 'var(--space-lg)',
+    bottom: 'var(--space-24)',
     height: '10px',
     cursor: 'ns-resize',
   },

@@ -62,6 +62,7 @@ vi.mock("../core/llm-utils.js", () => ({
 
 // Import AFTER vi.mock calls so the mocks take effect.
 import { AgentManager } from "../core/agent-manager.ts";
+import { resolvePersonaSource } from "../core/persona-source.ts";
 
 // ── Test suite ─────────────────────────────────────────────────
 describe("AgentManager.createAgent default skills.enabled", () => {
@@ -70,6 +71,7 @@ describe("AgentManager.createAgent default skills.enabled", () => {
   let productDir;
   let mgr;
   let skillsMock;
+  let prefsMock;
 
   function seedTemplate(enabledLiteral = '["skill-creator"]') {
     fs.mkdirSync(path.join(productDir, "yuan"), { recursive: true });
@@ -99,11 +101,7 @@ describe("AgentManager.createAgent default skills.enabled", () => {
       productDir,
       userDir: tempDir,
       channelsDir: tempDir,
-      getPrefs: () => ({
-        getPrimaryAgent: () => null,
-        getPreferences: () => ({}),
-        savePrimaryAgent: vi.fn(),
-      }),
+      getPrefs: () => prefsMock,
       getModels: () => ({
         resolveModelWithCredentials: vi.fn(),
         defaultModel: { id: "test-model", provider: "test-provider" },
@@ -144,6 +142,11 @@ describe("AgentManager.createAgent default skills.enabled", () => {
       },
       syncAgentSkills: vi.fn(),
     };
+    prefsMock = {
+      getPrimaryAgent: vi.fn(() => null),
+      getPreferences: vi.fn(() => ({})),
+      savePrimaryAgent: vi.fn(),
+    };
 
     mgr = makeMgr();
   });
@@ -165,6 +168,43 @@ describe("AgentManager.createAgent default skills.enabled", () => {
     const cfgPath = path.join(agentsDir, newId, "config.yaml");
     const cfg = YAML.load(fs.readFileSync(cfgPath, "utf-8"));
     expect(cfg.skills.enabled).toEqual(["pdf", "docx"]);
+  });
+
+  it("does not copy the user's name into the new agent's config", async () => {
+    // 名字的正源是全局 preferences。新 agent 抄一份下来，用户改名后就会留下
+    // 一个对不上的旧副本，而副本还会盖过全局值。
+    mgr._agents.set("hana", { id: "hana", userName: "阿黎" });
+    mgr._activeAgentId = "hana";
+
+    const { id: newId } = await mgr.createAgent({ name: "TestAgent", yuan: "hanako" });
+
+    const cfg = YAML.load(fs.readFileSync(path.join(agentsDir, newId, "config.yaml"), "utf-8"));
+    expect(cfg.user).toBeUndefined();
+  });
+
+  it.each([
+    "明",
+    "agent😀",
+    "agent name",
+    "agent.name",
+    "agent/name",
+    "agent\\name",
+    "",
+    "___",
+    "---",
+    "CON",
+  ])("rejects invalid explicit agent id %j before creating any files", async (id) => {
+    await expect(mgr.createAgent({
+      name: "Ming",
+      id,
+      yuan: "ming",
+    })).rejects.toMatchObject({
+      code: "INVALID_AGENT_ID",
+      statusCode: 400,
+    });
+
+    expect(fs.readdirSync(agentsDir)).toEqual([]);
+    expect(skillsMock.syncAgentSkills).not.toHaveBeenCalled();
   });
 
   it("falls back to seeded template default when snapshot is empty", async () => {
@@ -205,20 +245,49 @@ describe("AgentManager.createAgent default skills.enabled", () => {
     expect(cfg.models.chat).toEqual({ id: "test-model", provider: "test-provider" });
   });
 
-  it("keeps identity template placeholders for newly created agents", async () => {
+  it("does not seed identity.md/AGENTS.md to disk for newly created agents (lazy materialization)", async () => {
     fs.mkdirSync(path.join(productDir, "identity-templates"), { recursive: true });
     fs.writeFileSync(
       path.join(productDir, "identity-templates", "hanako.md"),
       "# {{agentName}}\n\n{{userName}}的个人助手。\n",
       "utf-8",
     );
+    fs.mkdirSync(path.join(productDir, "agents-templates"), { recursive: true });
+    fs.writeFileSync(
+      path.join(productDir, "agents-templates", "hanako.md"),
+      "AGENTS.md template\n",
+      "utf-8",
+    );
 
     const { id: newId } = await mgr.createAgent({ name: "TemplateAgent", yuan: "hanako" });
 
-    const identity = fs.readFileSync(path.join(agentsDir, newId, "identity.md"), "utf-8");
+    // identity.md / AGENTS.md 不再在创建时落盘：未定制人格靠运行时回落到
+    // lib 模板（core/persona-source.ts），不是靠此刻就把模板拷进 agentDir。
+    expect(fs.existsSync(path.join(agentsDir, newId, "identity.md"))).toBe(false);
+    expect(fs.existsSync(path.join(agentsDir, newId, "AGENTS.md"))).toBe(false);
+
+    // 运行时回落链仍必须解析到同一份模板内容（带原始占位符，留给
+    // system-prompt 组装阶段渲染，不在这里提前替换）。
+    const { content: identity, fromTemplate: identityFromTemplate } = resolvePersonaSource({
+      agentDir: path.join(agentsDir, newId),
+      productDir,
+      yuanType: "hanako",
+      locale: "zh-CN",
+      kind: "identity",
+    });
+    expect(identityFromTemplate).toBe(true);
     expect(identity).toContain("# {{agentName}}");
     expect(identity).toContain("{{userName}}的个人助手");
-    expect(identity).not.toContain("TemplateAgent的个人助手");
+
+    const { content: agentsMd, fromTemplate: agentsMdFromTemplate } = resolvePersonaSource({
+      agentDir: path.join(agentsDir, newId),
+      productDir,
+      yuanType: "hanako",
+      locale: "zh-CN",
+      kind: "agents",
+    });
+    expect(agentsMdFromTemplate).toBe(true);
+    expect(agentsMd).toContain("AGENTS.md template");
   });
 
   it("defaults patrol to disabled with a 31 minute interval for newly created agents", async () => {
@@ -254,8 +323,8 @@ describe("AgentManager.createAgent default skills.enabled", () => {
       enabledSkills: ["card-skill"],
       initialFiles: {
         identity: "Imported identity",
-        ishiki: "Imported ishiki",
-        publicIshiki: "Imported public ishiki",
+        agents: "Imported persona",
+        publicAgents: "Imported public persona",
       },
       initialMemory: {
         compiled: {
@@ -275,8 +344,8 @@ describe("AgentManager.createAgent default skills.enabled", () => {
     const cfg = YAML.load(fs.readFileSync(cfgPath, "utf-8"));
     expect(cfg.skills.enabled).toEqual(["card-skill"]);
     expect(fs.readFileSync(path.join(agentsDir, newId, "identity.md"), "utf-8")).toBe("Imported identity");
-    expect(fs.readFileSync(path.join(agentsDir, newId, "ishiki.md"), "utf-8")).toBe("Imported ishiki");
-    expect(fs.readFileSync(path.join(agentsDir, newId, "public-ishiki.md"), "utf-8")).toBe("Imported public ishiki");
+    expect(fs.readFileSync(path.join(agentsDir, newId, "AGENTS.md"), "utf-8")).toBe("Imported persona");
+    expect(fs.readFileSync(path.join(agentsDir, newId, "AGENTS.public.md"), "utf-8")).toBe("Imported public persona");
     expect(fs.readFileSync(path.join(memoryDir, "today.md"), "utf-8")).toBe("今天迁移角色卡。");
     expect(fs.readFileSync(path.join(memoryDir, "memory.md"), "utf-8")).toContain("用户长期关注本地优先迁移。");
     expect(seed.imported.packageName).toBe("imported-package.zip");
@@ -310,5 +379,105 @@ describe("AgentManager.createAgent default skills.enabled", () => {
 
     expect(agents.find(a => a.id === "memory-off").memoryMasterEnabled).toBe(false);
     expect(agents.find(a => a.id === "memory-on").memoryMasterEnabled).toBe(true);
+    expect(agents.find(a => a.id === "memory-on").avatarRevision).toBeNull();
+  });
+
+  it("falls back to the template identity summary in the agent list when identity.md is not seeded", async () => {
+    fs.mkdirSync(path.join(productDir, "identity-templates"), { recursive: true });
+    fs.writeFileSync(
+      path.join(productDir, "identity-templates", "hanako.md"),
+      "# {{agentName}}\n\nA quiet template summary line.\n",
+      "utf-8",
+    );
+    // 惰性材料化后新建 agent 不会有 identity.md 落盘；花名册摘要必须走同一条
+    // 回落链解析出模板内容，不能因为 fs.readFileSync 抛 ENOENT 就留空。
+    fs.mkdirSync(path.join(agentsDir, "no-identity-file"), { recursive: true });
+    fs.writeFileSync(
+      path.join(agentsDir, "no-identity-file", "config.yaml"),
+      "agent:\n  name: NoIdentityFile\n  yuan: hanako\n",
+      "utf-8",
+    );
+    expect(fs.existsSync(path.join(agentsDir, "no-identity-file", "identity.md"))).toBe(false);
+
+    const agents = mgr.listAgents();
+    const entry = agents.find(a => a.id === "no-identity-file");
+
+    expect(entry.identity).not.toBe("");
+    expect(entry.identity).toContain("A quiet template summary line.");
+  });
+
+  it("returns a stable avatar revision and changes it only when avatar metadata changes", () => {
+    const agentId = "avatar-agent";
+    const agentDir = path.join(agentsDir, agentId);
+    const avatarDir = path.join(agentDir, "avatars");
+    const avatarPath = path.join(avatarDir, "agent.png");
+    fs.mkdirSync(avatarDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "config.yaml"), "agent:\n  name: Avatar Agent\n", "utf-8");
+    fs.writeFileSync(avatarPath, Buffer.from("first-avatar"));
+    fs.utimesSync(avatarPath, new Date(1_700_000_000_000), new Date(1_700_000_000_000));
+
+    const first = mgr.listAgents().find(agent => agent.id === agentId);
+    const firstStat = fs.statSync(avatarPath);
+    expect(first.hasAvatar).toBe(true);
+    expect(first.avatarRevision).toBe(`${firstStat.mtimeMs}-${firstStat.size}`);
+
+    mgr.invalidateAgentListCache();
+    const unchanged = mgr.listAgents().find(agent => agent.id === agentId);
+    expect(unchanged.avatarRevision).toBe(first.avatarRevision);
+
+    fs.writeFileSync(avatarPath, Buffer.from("second-avatar-is-larger"));
+    fs.utimesSync(avatarPath, new Date(1_700_000_001_000), new Date(1_700_000_001_000));
+    mgr.invalidateAgentListCache();
+    const changed = mgr.listAgents().find(agent => agent.id === agentId);
+    expect(changed.avatarRevision).not.toBe(first.avatarRevision);
+  });
+
+  it("filters legacy non-ASCII agent directories from runtime discovery without deleting them", async () => {
+    const legacyDir = path.join(agentsDir, "明");
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, "config.yaml"), "agent:\n  name: Legacy Ming\n", "utf-8");
+
+    expect(mgr.listAgents()).toEqual([]);
+    await expect(mgr.ensureAgentRuntime("明")).rejects.toMatchObject({ code: "INVALID_AGENT_ID" });
+    expect(fs.existsSync(path.join(legacyDir, "config.yaml"))).toBe(true);
+  });
+
+  it("keeps safe legacy uppercase and underscore agent ids discoverable", () => {
+    const legacyId = "Legacy_AGENT-1";
+    const legacyDir = path.join(agentsDir, legacyId);
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, "config.yaml"), "agent:\n  name: Legacy Agent\n", "utf-8");
+
+    expect(mgr.listAgents().map(agent => agent.id)).toEqual([legacyId]);
+  });
+
+  it("rejects an invalid primary agent id before writing preferences", () => {
+    const invalidId = "中文助手";
+    const invalidDir = path.join(agentsDir, invalidId);
+    fs.mkdirSync(invalidDir, { recursive: true });
+    fs.writeFileSync(path.join(invalidDir, "config.yaml"), "agent:\n  name: Invalid\n", "utf-8");
+
+    let caught;
+    try {
+      mgr.setPrimaryAgent(invalidId);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toMatchObject({
+      code: "INVALID_AGENT_ID",
+      statusCode: 400,
+    });
+    expect(prefsMock.savePrimaryAgent).not.toHaveBeenCalled();
+  });
+
+  it("persists an existing safe ASCII primary agent id", () => {
+    const agentId = "Legacy_AGENT-1";
+    const agentDir = path.join(agentsDir, agentId);
+    fs.mkdirSync(agentDir, { recursive: true });
+    fs.writeFileSync(path.join(agentDir, "config.yaml"), "agent:\n  name: Legacy\n", "utf-8");
+
+    mgr.setPrimaryAgent(agentId);
+
+    expect(prefsMock.savePrimaryAgent).toHaveBeenCalledWith(agentId);
   });
 });

@@ -4,9 +4,11 @@ import path from "path";
 import { execFileSync } from "child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  buildAnydocRuntimeSmokeScript,
   buildBetterSqliteRuntimeSmokeScript,
   buildExternalPackage,
   buildJiebaRuntimeSmokeScript,
+  collectBareImportPackageNames,
   collectInstalledOptionalDependencyDirs,
   readPackageJsonWithRetry,
   verifyExternalEntrypoints,
@@ -27,6 +29,22 @@ afterEach(() => {
 });
 
 describe("build-server external dependency packaging", () => {
+  it("collects bare static import package names from the emitted server bundle", () => {
+    const packages = collectBareImportPackageNames([
+      "import fs from 'node:fs';",
+      "import './local.js';",
+      "import { completeSimple } from '@earendil-works/pi-ai/compat';",
+      "import '@earendil-works/pi-agent-core';",
+      "import qrcode from 'qrcode';",
+    ].join("\n"));
+
+    expect(packages).toEqual([
+      "@earendil-works/pi-agent-core",
+      "@earendil-works/pi-ai",
+      "qrcode",
+    ]);
+  });
+
   it("pins server externals and selected runtime transitives to the root lock versions", () => {
     const rootPkg = {
       name: "hanako",
@@ -157,6 +175,55 @@ describe("build-server external dependency packaging", () => {
 
     expect(() => execFileSync(process.execPath, [scriptPath], { cwd: outDir }))
       .not.toThrow();
+  });
+
+  it("generates an anydoc smoke script that converts bytes through a dynamic import", () => {
+    const outDir = makeTempDir();
+    const packageDir = path.join(outDir, "node_modules", "@firecrawl", "anydoc");
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({ type: "module" }));
+    // The stub asserts the call shape the packaged runtime depends on: the
+    // source bytes arrive intact and signature-less CSV is named explicitly.
+    fs.writeFileSync(path.join(packageDir, "index.js"), [
+      "module.exports.toMarkdownBytes = async (bytes, format) => {",
+      "  if (format !== 'csv') throw new Error('unexpected format');",
+      "  const text = Buffer.from(bytes).toString('utf8');",
+      "  if (text !== 'a,b\\n1,2') throw new Error('unexpected bytes');",
+      "  return '| a | b |\\n| --- | --- |\\n| 1 | 2 |\\n';",
+      "};",
+    ].join("\n"));
+    fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
+      name: "@firecrawl/anydoc",
+      main: "index.js",
+    }));
+
+    const scriptPath = path.join(outDir, ".anydoc-smoke.mjs");
+    fs.writeFileSync(scriptPath, buildAnydocRuntimeSmokeScript());
+
+    expect(() => execFileSync(process.execPath, [scriptPath], { cwd: outDir }))
+      .not.toThrow();
+  });
+
+  it("generates an anydoc smoke script that fails when the native binding cannot load", () => {
+    const outDir = makeTempDir();
+    const packageDir = path.join(outDir, "node_modules", "@firecrawl", "anydoc");
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, "package.json"), JSON.stringify({ type: "module" }));
+    // What a packaged server missing its platform binary actually does: the
+    // napi loader throws while resolving the addon, so the build must stop.
+    fs.writeFileSync(path.join(packageDir, "index.js"), [
+      "throw new Error('Failed to load native binding');",
+    ].join("\n"));
+    fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
+      name: "@firecrawl/anydoc",
+      main: "index.js",
+    }));
+
+    const scriptPath = path.join(outDir, ".anydoc-smoke.mjs");
+    fs.writeFileSync(scriptPath, buildAnydocRuntimeSmokeScript());
+
+    expect(() => execFileSync(process.execPath, [scriptPath], { cwd: outDir, stdio: "pipe" }))
+      .toThrow();
   });
 
   it("fails fast when an installed external package export resolves to a missing file", () => {

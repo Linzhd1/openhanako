@@ -21,6 +21,10 @@ const hanaFetchMock = vi.fn(async (url: string, init?: RequestInit) => {
     const body = JSON.parse(String(init.body || '{}'));
     return new Response(JSON.stringify({ ok: true, value: body.value }));
   }
+  if (url === '/api/experiments/session.instant_simple_compaction' && init?.method === 'PATCH') {
+    const body = JSON.parse(String(init.body || '{}'));
+    return new Response(JSON.stringify({ ok: true, value: body.value }));
+  }
   if (url === '/api/experiments/provider.deepseek_roleplay_reasoning_patch' && init?.method === 'PATCH') {
     const body = JSON.parse(String(init.body || '{}'));
     return new Response(JSON.stringify({ ok: true, value: body.value }));
@@ -48,6 +52,20 @@ const hanaFetchMock = vi.fn(async (url: string, init?: RequestInit) => {
           },
         },
         {
+          id: 'session.instant_simple_compaction',
+          titleKey: 'settings.experiments.instantSimpleCompaction.title',
+          descriptionKey: 'settings.experiments.instantSimpleCompaction.description',
+          owner: 'session',
+          value: false,
+          status: 'alpha',
+          risk: 'medium',
+          restartPolicy: 'immediate',
+          valueSchema: {
+            type: 'boolean',
+            presentation: { type: 'toggle' },
+          },
+        },
+        {
           id: 'provider.deepseek_roleplay_reasoning_patch',
           titleKey: 'settings.experiments.deepseekRoleplay.title',
           descriptionKey: 'settings.experiments.deepseekRoleplay.description',
@@ -61,16 +79,9 @@ const hanaFetchMock = vi.fn(async (url: string, init?: RequestInit) => {
             presentation: { type: 'toggle' },
           },
         },
-        {
-          id: 'memory.cache_snapshot_reflection',
-          titleKey: 'settings.experiments.cacheSnapshot.title',
-          descriptionKey: 'settings.experiments.cacheSnapshot.description',
-          owner: 'memory',
-          value: 'off',
-          status: 'beta',
-          risk: 'medium',
-          restartPolicy: 'new_session',
-        },
+        // memory.editable_facts 已毕业转正（不再是实验），registry 目前没有
+        // 存活的 owner: "memory" 实验；memory.cache_snapshot_reflection 也已退休，
+        // 不会出现在 /api/experiments 里。
       ],
     }));
   }
@@ -93,23 +104,20 @@ describe('ExperimentsTab', () => {
     vi.clearAllMocks();
   });
 
-  it('uses cache memory as the section title and keeps the cache intro above the card body', async () => {
-    const { container } = render(React.createElement(ExperimentsTab));
+  it('shows the memory section empty state now that editable facts has graduated and cache snapshot is retired', async () => {
+    render(React.createElement(ExperimentsTab));
 
     expect(screen.getByText('settings.experiments.memoryTitle')).toBeTruthy();
-    expect(await screen.findByText('settings.experiments.cacheSnapshot.description')).toBeTruthy();
+    expect(await screen.findByText('settings.experiments.empty')).toBeTruthy();
     expect(screen.getByText('settings.computerUse.title')).toBeTruthy();
     expect(screen.queryByText('settings.experiments.description')).toBeNull();
 
-    expect(screen.getByText('settings.experiments.cacheSnapshot.title')).toBeTruthy();
-
-    const body = Array.from(container.querySelectorAll('[class*="sectionBody"]'))
-      .find((sectionBody) => sectionBody.textContent?.includes('settings.experiments.cacheSnapshot.title'));
-    expect(body?.textContent).toContain('settings.experiments.cacheSnapshot.title');
-    expect(body?.textContent).not.toContain('settings.experiments.cacheSnapshot.description');
+    expect(screen.queryByText('settings.experiments.editableMemory.title')).toBeNull();
+    expect(screen.queryByText('settings.experiments.cacheSnapshot.title')).toBeNull();
+    expect(screen.queryByText('settings.experiments.cacheSnapshot.observeOnly')).toBeNull();
   });
 
-  it('renders the three-mode compaction selector in experiments', async () => {
+  it('keeps the compaction selector to three persistent modes', async () => {
     render(React.createElement(ExperimentsTab));
 
     await waitFor(() => {
@@ -121,6 +129,7 @@ describe('ExperimentsTab', () => {
     expect(screen.getByTitle('settings.experiments.compaction.auto')).toBeTruthy();
 
     fireEvent.click(screen.getByTitle('settings.experiments.compaction.auto'));
+    expect(screen.queryByRole('option', { name: 'settings.experiments.compaction.lossyLocal' })).toBeNull();
     fireEvent.click(screen.getByRole('option', { name: 'settings.experiments.compaction.piCompatible' }));
 
     await waitFor(() => {
@@ -129,6 +138,27 @@ describe('ExperimentsTab', () => {
         expect.objectContaining({
           method: 'PATCH',
           body: JSON.stringify({ value: 'pi_compatible' }),
+        }),
+      );
+    });
+  });
+
+  it('renders instant simple compaction as an independent capability toggle', async () => {
+    render(React.createElement(ExperimentsTab));
+
+    const toggle = await screen.findByRole('switch', {
+      name: 'settings.experiments.instantSimpleCompaction.title',
+    });
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(hanaFetchMock).toHaveBeenCalledWith(
+        '/api/experiments/session.instant_simple_compaction',
+        expect.objectContaining({
+          method: 'PATCH',
+          body: JSON.stringify({ value: true }),
         }),
       );
     });

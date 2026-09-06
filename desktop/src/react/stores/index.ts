@@ -10,6 +10,7 @@ import { createDeskSlice, type DeskSlice } from './desk-slice';
 import { createModelSlice, type ModelSlice } from './model-slice';
 import { createInputSlice, type InputSlice } from './input-slice';
 import { createChatSlice, type ChatSlice } from './chat-slice';
+import { createChatFindSlice, type ChatFindSlice } from './chat-find-slice';
 import { createToastSlice, type ToastSlice } from './toast-slice';
 import { createPreviewSlice, type PreviewSlice } from './preview-slice';
 import { createBrowserSlice, type BrowserSlice } from './browser-slice';
@@ -23,6 +24,8 @@ import { createSelectionSlice, type SelectionSlice } from './selection-slice';
 import { createSubagentPreviewSlice, type SubagentPreviewSlice } from './subagent-preview-slice';
 import { createComputerOverlaySlice, type ComputerOverlaySlice } from './computer-overlay-slice';
 import { createScreenshotSlice, type ScreenshotSlice } from './screenshot-slice';
+import { createSidebarUiSlice, type SidebarUiSlice } from './sidebar-ui-slice';
+import { createFileHistorySlice, type FileHistorySlice } from './file-history-slice';
 import { configureMessageLiveVersionSessionKeyResolver } from './message-live-version';
 
 export type StoreState = ConnectionSlice &
@@ -36,6 +39,7 @@ export type StoreState = ConnectionSlice &
   ModelSlice &
   InputSlice &
   ChatSlice &
+  ChatFindSlice &
   ToastSlice &
   PreviewSlice &
   BrowserSlice &
@@ -48,7 +52,9 @@ export type StoreState = ConnectionSlice &
   SelectionSlice &
   SubagentPreviewSlice &
   ComputerOverlaySlice &
-  ScreenshotSlice;
+  ScreenshotSlice &
+  SidebarUiSlice &
+  FileHistorySlice;
 
 export const useStore = create<StoreState>()((set, _get, _api) => ({
   ...createConnectionSlice(set, _get),
@@ -62,6 +68,7 @@ export const useStore = create<StoreState>()((set, _get, _api) => ({
   ...createModelSlice(set),
   ...createInputSlice(set),
   ...createChatSlice(set, _get),
+  ...createChatFindSlice(set, _get),
   ...createToastSlice(set, _get),
   ...createPreviewSlice(set),
   ...createBrowserSlice(set),
@@ -75,6 +82,8 @@ export const useStore = create<StoreState>()((set, _get, _api) => ({
   ...createSubagentPreviewSlice(set),
   ...createComputerOverlaySlice(set),
   ...createScreenshotSlice(set),
+  ...createSidebarUiSlice(set, _get),
+  ...createFileHistorySlice(set, _get),
 }));
 
 configureMessageLiveVersionSessionKeyResolver((sessionPath) => (
@@ -94,6 +103,7 @@ export type {
   ModelSlice,
   InputSlice,
   ChatSlice,
+  ChatFindSlice,
   ToastSlice,
   PreviewSlice,
   BrowserSlice,
@@ -107,4 +117,6 @@ export type {
   SubagentPreviewSlice,
   ComputerOverlaySlice,
   ScreenshotSlice,
+  SidebarUiSlice,
+  FileHistorySlice,
 };

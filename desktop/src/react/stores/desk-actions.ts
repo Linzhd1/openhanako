@@ -15,9 +15,14 @@ import {
   readingPositionsFromPersistedWorkspaceUiState,
   schedulePersistCurrentWorkspaceUiState,
 } from './workspace-ui-state-actions';
-import { hasServerConnection } from '../services/server-connection';
+import {
+  hasServerConnection,
+  isLocalOwnerConnection,
+  resolveServerConnection,
+} from '../services/server-connection';
 import { isWebRuntime } from '../utils/platform-runtime';
 import { mergeWorkspaceHistory, normalizeWorkspacePath, removeWorkspaceHistoryEntries } from '../../../../shared/workspace-history.ts';
+import { pendingNewSessionIdentityPatch } from './session-actions';
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- store setState 回调及 IPC callback data */
 
@@ -51,6 +56,15 @@ function activeDeskMountId(s: ReturnType<typeof useStore.getState>, overrideMoun
   return normalizeMountId(s.deskWorkspaceMountId);
 }
 
+function canUseNativeDeskPath(s: ReturnType<typeof useStore.getState>): boolean {
+  const connection = resolveServerConnection(s);
+  return !connection || isLocalOwnerConnection(connection);
+}
+
+function shouldUseWorkbenchDeskAction(s: ReturnType<typeof useStore.getState>): boolean {
+  return isWebRuntime() || !!activeDeskMountId(s) || !canUseNativeDeskPath(s);
+}
+
 function activeDeskRoot(s: ReturnType<typeof useStore.getState>, overrideDir?: string | null): string | undefined {
   return overrideDir !== undefined
     ? (overrideDir || undefined)
@@ -64,10 +78,126 @@ function defaultDeskRoot(s: ReturnType<typeof useStore.getState>): string | unde
     || undefined;
 }
 
+async function responseJsonOrEmpty(res: any): Promise<any> {
+  if (!res || typeof res.json !== 'function') return {};
+  try {
+    return await res.json();
+  } catch (err) {
+    if (res.status === 404) return {};
+    throw err;
+  }
+}
+
+function routeErrorCode(data: any): string {
+  if (!data || typeof data !== 'object') return '';
+  if (typeof data.code === 'string') return data.code;
+  const error = data.error;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object') {
+    if (typeof error.code === 'string') return error.code;
+    if (typeof error.message === 'string') return error.message;
+  }
+  return '';
+}
+
+function routeErrorMessage(data: any): string {
+  if (!data || typeof data !== 'object') return 'desk request failed';
+  if (typeof data.error === 'string') return data.error;
+  if (data.error && typeof data.error === 'object') {
+    if (typeof data.error.message === 'string') return data.error.message;
+    if (typeof data.error.code === 'string') return data.error.code;
+  }
+  if (typeof data.message === 'string') return data.message;
+  return 'desk request failed';
+}
+
+function isMissingLocalDeskRootResponse(res: any, data: any): boolean {
+  if (res?.status === 403) return false;
+  if (res?.status === 404) return true;
+  return routeErrorCode(data) === 'resource_not_found';
+}
+
+async function pruneStaleLocalDeskRoot(dir: string): Promise<void> {
+  const normalized = normalizeFolder(dir);
+  if (!normalized) return;
+
+  useStore.setState((state: any) => {
+    const patch: Record<string, any> = {
+      cwdHistory: removeWorkspaceHistoryEntries(state.cwdHistory, [normalized]),
+    };
+    if (normalizeFolder(state.selectedFolder) === normalized) {
+      patch.selectedFolder = null;
+    }
+    if (normalizeFolder(state.deskBasePath) === normalized) {
+      Object.assign(patch, {
+        deskBasePath: '',
+        deskCurrentPath: '',
+        deskFiles: [],
+        deskTreeFilesByPath: {},
+        deskExpandedPaths: [],
+        deskSelectedPath: '',
+        deskWorkspaceMountId: null,
+        deskWorkspaceLabel: null,
+        deskWorkspaceNativeRoot: null,
+      });
+    }
+    return patch;
+  });
+
+  const s = useStore.getState();
+  if (!hasServerConnection(s)) return;
+  const url = recentWorkspacesUrl(s);
+  if (!url) {
+    console.warn('[workspace] prune stale history skipped: no current agent to record it against');
+    return;
+  }
+  try {
+    const res = await hanaFetch(url, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: normalized }),
+    });
+    const data = await responseJsonOrEmpty(res);
+    if (Array.isArray(data.cwd_history)) {
+      useStore.setState({
+        cwdHistory: removeWorkspaceHistoryEntries(
+          mergeWorkspaceHistory(data.cwd_history, []),
+          [normalized],
+        ),
+      });
+    }
+  } catch (err) {
+    console.error('[workspace] prune stale history failed:', err);
+  }
+}
+
 function selectedDeskAgentId(s: ReturnType<typeof useStore.getState>): string | null {
   return typeof s.selectedAgentId === 'string' && s.selectedAgentId.trim()
     ? s.selectedAgentId.trim()
     : null;
+}
+
+/**
+ * The agent whose recent-workspace list the desk is currently showing.
+ *
+ * `cwdHistory` in this store is never a mixed list: it is replaced wholesale
+ * with the incoming agent's history by the same agent-switch handler that sets
+ * `currentAgentId`, so the two always describe the same agent. Recording or
+ * dropping a recent workspace therefore has to name that agent — otherwise the
+ * server would pick one for us, and with two clients open on two agents it
+ * would sometimes pick the other one.
+ */
+function deskHistoryAgentId(s: ReturnType<typeof useStore.getState>): string | null {
+  return typeof s.currentAgentId === 'string' && s.currentAgentId.trim()
+    ? s.currentAgentId.trim()
+    : null;
+}
+
+/** Build a recent-workspace URL for one agent, or null when no agent is known yet. */
+function recentWorkspacesUrl(s: ReturnType<typeof useStore.getState>, suffix = ''): string | null {
+  const agentId = deskHistoryAgentId(s);
+  if (!agentId) return null;
+  return `/api/config/workspaces/recent${suffix}?agentId=${encodeURIComponent(agentId)}`;
 }
 
 function addSelectedDeskAgentParam(params: URLSearchParams, s: ReturnType<typeof useStore.getState>): void {
@@ -162,7 +292,7 @@ export async function applyStudioWorkspace(workspace: Pick<StudioWorkspace, 'mou
   void activateWorkspaceDesk(null, { mountId, label, nativeRootPath, reload: false });
   const s = useStore.getState();
   if (!s.pendingNewSession) {
-    useStore.setState({ currentSessionPath: null, pendingNewSession: true });
+    useStore.setState({ currentSessionPath: null, ...pendingNewSessionIdentityPatch() });
     clearChat();
     useStore.getState().requestInputFocus();
   }
@@ -408,9 +538,14 @@ export async function loadDeskFiles(subdir?: string, overrideDir?: string | null
     if (curPath) params.set('subdir', curPath);
     const qs = params.toString() ? `?${params}` : '';
     const res = await hanaFetch(`${mountId ? '/api/workbench/files' : '/api/desk/files'}${qs}`);
-    const data = await res.json();
+    const data = await responseJsonOrEmpty(res);
     if (myVersion !== _deskLoadVersion) return;
-    if (data.error) throw new Error(String(data.error));
+    if (!mountId && dir && isMissingLocalDeskRootResponse(res, data)) {
+      await pruneStaleLocalDeskRoot(dir);
+      updateDeskContextBtn();
+      return;
+    }
+    if (data.error) throw new Error(routeErrorMessage(data));
     const st = useStore.getState();
     st.setDeskFiles(data.files || []);
     st.setDeskTreeFiles('', data.files || []);
@@ -531,14 +666,14 @@ async function blobToBase64(blob: Blob): Promise<string> {
   return btoa(binary);
 }
 
-export async function loadDeskTreeFiles(subdir = '', options: { force?: boolean; overrideDir?: string | null; overrideMountId?: string | null } = {}): Promise<void> {
+export async function loadDeskTreeFiles(subdir = '', options: { force?: boolean; overrideDir?: string | null; overrideMountId?: string | null } = {}): Promise<boolean> {
   const s = useStore.getState();
-  if (!hasServerConnection(s)) return;
+  if (!hasServerConnection(s)) return false;
   const mountId = activeDeskMountId(s, options.overrideMountId);
   const dir = mountId ? undefined : activeDeskRoot(s, options.overrideDir);
   const normalizedSubdir = normalizeSubdir(subdir);
   const cached = s.deskTreeFilesByPath?.[normalizedSubdir];
-  if (cached && !options.force) return;
+  if (cached && !options.force) return true;
 
   const key = deskTreeLoadKey(mountId ? studioWorkspaceKey(mountId) : dir, normalizedSubdir);
   const myVersion = (_deskTreeLoadVersion.get(key) || 0) + 1;
@@ -556,7 +691,7 @@ export async function loadDeskTreeFiles(subdir = '', options: { force?: boolean;
     const qs = params.toString() ? `?${params}` : '';
     const res = await hanaFetch(`${mountId ? '/api/workbench/files' : '/api/desk/files'}${qs}`);
     const data = await res.json();
-    if (_deskTreeLoadVersion.get(key) !== myVersion) return;
+    if (_deskTreeLoadVersion.get(key) !== myVersion) return false;
     if (data.error) throw new Error(String(data.error));
     const st = useStore.getState();
     if (mountId) {
@@ -572,9 +707,11 @@ export async function loadDeskTreeFiles(subdir = '', options: { force?: boolean;
     }
     st.setDeskTreeFiles(normalizedSubdir, data.files || []);
     if (!normalizedSubdir) st.setDeskFiles(data.files || []);
+    return true;
   } catch (err) {
     console.error('[desk-tree] load failed:', err);
-    if (_deskTreeLoadVersion.get(key) !== myVersion) return;
+    if (_deskTreeLoadVersion.get(key) !== myVersion) return false;
+    return false;
   }
 }
 
@@ -1011,7 +1148,7 @@ export async function deskRenameTreeItem(sourceSubdir: string, oldName: string, 
 
 export async function deskTrashTreeItems(items: DeskTreeMoveItem[]): Promise<boolean> {
   const s = useStore.getState();
-  if (isWebRuntime() || activeDeskMountId(s)) {
+  if (shouldUseWorkbenchDeskAction(s)) {
     return deskSafeDeleteMobileWorkbenchItems(items);
   }
   const trashItem = window.platform?.trashItem;
@@ -1191,7 +1328,7 @@ export async function applyFolder(folder: string): Promise<void> {
   void activateWorkspaceDesk(normalized, { mountId: null, reload: false });
   const s = useStore.getState();
   if (!s.pendingNewSession) {
-    useStore.setState({ currentSessionPath: null, pendingNewSession: true });
+    useStore.setState({ currentSessionPath: null, ...pendingNewSessionIdentityPatch() });
     clearChat();
     useStore.getState().requestInputFocus();
   }
@@ -1202,8 +1339,13 @@ export async function applyFolder(folder: string): Promise<void> {
 async function persistWorkspaceHistory(folder: string): Promise<void> {
   const s = useStore.getState();
   if (!hasServerConnection(s)) return;
+  const url = recentWorkspacesUrl(s);
+  if (!url) {
+    console.warn('[workspace] persist history skipped: no current agent to record it against');
+    return;
+  }
   try {
-    const res = await hanaFetch('/api/config/workspaces/recent', {
+    const res = await hanaFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: folder }),
@@ -1226,8 +1368,13 @@ export async function removeRecentWorkspace(folder: string): Promise<void> {
   }));
   const s = useStore.getState();
   if (!hasServerConnection(s)) return;
+  const url = recentWorkspacesUrl(s);
+  if (!url) {
+    console.warn('[workspace] remove recent history skipped: no current agent to record it against');
+    return;
+  }
   try {
-    const res = await hanaFetch('/api/config/workspaces/recent', {
+    const res = await hanaFetch(url, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: normalized }),
@@ -1246,8 +1393,13 @@ export async function clearRecentWorkspaces(): Promise<void> {
   useStore.setState({ cwdHistory: [] });
   const s = useStore.getState();
   if (!hasServerConnection(s)) return;
+  const url = recentWorkspacesUrl(s, '/all');
+  if (!url) {
+    console.warn('[workspace] clear recent history skipped: no current agent to clear it for');
+    return;
+  }
   try {
-    const res = await hanaFetch('/api/config/workspaces/recent/all', {
+    const res = await hanaFetch(url, {
       method: 'DELETE',
     });
     const data = await res.json();
